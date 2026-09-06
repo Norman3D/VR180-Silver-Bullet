@@ -815,6 +815,7 @@ fn export_fisheye_inner(
             // slow" report).
             let iter = crate::fisheye_decode::SegmentedD3d11SharedDualStreamIter::new(
                 &cfg.segments, swap, u32::MAX, u32::MAX,
+                ctx.as_ref().and_then(crate::interop_windows::vulkan_device_luid),
             );
             match (ctx, iter) {
                 (Some(ctx), Ok(iter)) => {
@@ -893,6 +894,7 @@ fn export_fisheye_inner(
                 let swap = cfg.source_kind.dual_stream_iter_swap(cfg.fisheye_swap_eyes);
                 crate::fisheye_decode::SegmentedD3d11SharedDualStreamIter::new(
                     &cfg.segments, swap, u32::MAX, u32::MAX,
+                    ctx.as_ref().and_then(crate::interop_windows::vulkan_device_luid),
                 ).map(crate::fisheye_decode::ZcFisheyeSource::Dual)
             };
             match (ctx, iter) {
@@ -1610,7 +1612,9 @@ fn export_eac_inner(
             );
             // Segmented iterator chains a merged recording's GS01…/GS02…/… on
             // the fast path (globalized pts → stab index stays continuous).
-            let iter = crate::fisheye_decode::SegmentedD3d11SharedStreamPairIter::new(&cfg.segments);
+            let iter = crate::fisheye_decode::SegmentedD3d11SharedStreamPairIter::new(
+                &cfg.segments, ctx.as_ref().and_then(crate::interop_windows::vulkan_device_luid),
+            );
             match (ctx, iter) {
                 (Some(ctx), Ok(iter)) => {
                     if matches!(cfg.encoder, EncoderBackend::HevcNvenc) {
