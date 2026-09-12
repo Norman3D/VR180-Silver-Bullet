@@ -237,6 +237,29 @@ pub fn export_path_note() -> Option<String> {
     EXPORT_PATH_NOTE.lock().unwrap().clone()
 }
 
+/// RAII guard that shows a finalize-phase note ("muxing audio…") in the
+/// export bar for the two-pass paths — the bar otherwise sits at 100%
+/// while the whole encoded video is re-read and re-written around the
+/// audio (minutes at ProRes bitrates). Quiet (no warn — it's a phase,
+/// not a problem); restores the previous note on drop.
+struct FinalizePhaseNote(Option<String>);
+impl FinalizePhaseNote {
+    fn new() -> Self {
+        let mut slot = EXPORT_PATH_NOTE.lock().unwrap();
+        let prev = slot.clone();
+        *slot = Some(match &prev {
+            Some(p) => format!("{p} · muxing audio…"),
+            None => "finalizing — muxing audio onto the video…".into(),
+        });
+        Self(prev)
+    }
+}
+impl Drop for FinalizePhaseNote {
+    fn drop(&mut self) {
+        *EXPORT_PATH_NOTE.lock().unwrap() = self.0.take();
+    }
+}
+
 /// Available bytes on the filesystem holding `dir`, via `df -kP`
 /// (POSIX one-line-per-fs output). Best-effort — `None` on any failure.
 fn fs_avail_bytes(dir: &std::path::Path) -> Option<u64> {
@@ -387,6 +410,7 @@ fn finalize_eac_audio(
     offset_s: f64,
     dur_s: f64,
 ) -> Result<()> {
+    let _phase = FinalizePhaseNote::new();
     let (audio_src, audio_tmp) = eac_audio_source(cfg);
     let drop_tmp = |t: &Option<PathBuf>| { if let Some(p) = t { std::fs::remove_file(p).ok(); } };
     let out = &cfg.output_path;
@@ -467,6 +491,7 @@ fn finalize_with_audio(
     audio_offset_s: f64,
     video_dur_s: f64,
 ) -> Result<()> {
+    let _phase = FinalizePhaseNote::new();
     match crate::audio::mux_video_with_passthrough_audio(
         audio_src, video_tmp, final_out,
         audio_offset_s, Some(video_dur_s),
@@ -1587,7 +1612,13 @@ fn export_eac_inner(
 
     let sbs_w = cfg.eye_w * 2;
     let sbs_h = cfg.eye_h;
-    let video_tmp = video_only_temp_path(&cfg.output_path);
+    // One-pass: encode STRAIGHT to the final file and mux the source's
+    // stereo audio inline — no `.video.tmp` + full re-mux copy (which at
+    // ProRes bitrates dwarfed the encode itself). Ambisonic / APAC keep
+    // the temp+finalize path (they need post-encode steps).
+    let one_pass = one_pass_audio_eligible(&cfg);
+    let video_tmp = if one_pass { cfg.output_path.clone() }
+                    else { video_only_temp_path(&cfg.output_path) };
     let mut encoder = open_h265_encoder(
         &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
         cfg.encoder, cfg.bit_depth, cfg.prores_profile,
@@ -1603,6 +1634,32 @@ fn export_eac_inner(
     if trim_in_frame > 0 {
         decoder.seek(trim_in_frame as f64 * dt)?;
     }
+
+    // Inline audio passthrough (must be attached before the first frame).
+    // The audio window is clipped to the video's expected length: per_eye
+    // covers the whole chain when stabilizing; otherwise (empty per_eye)
+    // probe the chain — per_eye.len() would clip the audio to nothing.
+    let one_pass_audio_tmp = if one_pass {
+        let (asrc, atmp) = eac_audio_source(&cfg);
+        let total_video_frames = if per_eye.is_empty() {
+            if cfg.segments.len() > 1 {
+                cfg.segments.iter().map(|s| chain_segment_frames(s, cfg.fps)).sum::<usize>()
+            } else {
+                crate::decode::probe_video(&cfg.source_path)
+                    .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+                    .unwrap_or(0)
+            }
+        } else { per_eye.len() };
+        let dur = trim_out_frame
+            .map(|o| (o.saturating_sub(trim_in_frame)) as f64 * dt)
+            .unwrap_or((total_video_frames.saturating_sub(trim_in_frame as usize)) as f64 * dt);
+        if let Err(e) = encoder.attach_audio_passthrough(
+            &asrc, trim_in_frame as f64 * dt, dur,
+        ) {
+            tracing::warn!("one-pass audio attach failed: {e} — video-only output");
+        }
+        atmp
+    } else { None };
 
     let color_plan = cfg.color_stack.clone();
     let color_any = color_plan.any_active();
@@ -1684,10 +1741,15 @@ fn export_eac_inner(
     // mux copies the source's first audio track (GoPro `.360` carries AAC);
     // multi-segment uses an ffconcat playlist so the chain's audio is one
     // continuous timeline the global (trim_in, dur) window cuts from.
-    finalize_eac_audio(
-        &cfg, &video_tmp,
-        trim_in_frame as f64 * dt, written as f64 * dt,
-    )?;
+    if one_pass {
+        // Audio already muxed inline — drop the playlist temp, if any.
+        if let Some(t) = one_pass_audio_tmp { std::fs::remove_file(t).ok(); }
+    } else {
+        finalize_eac_audio(
+            &cfg, &video_tmp,
+            trim_in_frame as f64 * dt, written as f64 * dt,
+        )?;
+    }
     finalize_metadata(
         &cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp, cfg.apmp_baseline_mm,
     )?;
@@ -1982,7 +2044,14 @@ fn export_eac_gpu_resident(
     let mut iter = iter;
     if t_in > 0.001 { iter.seek(t_in)?; }
 
-    let video_tmp = video_only_temp_path(&cfg.output_path);
+    // One-pass (readback tail only): encode straight to the final file with
+    // the stereo audio muxed inline — no `.video.tmp` + full re-mux copy,
+    // which at ProRes bitrates took longer than the encode. The NVENC tail
+    // (CudaNvencEncoder) and ambisonic/APAC keep the temp+finalize path.
+    let one_pass = !nvenc_tail && one_pass_audio_eligible(&cfg);
+    let video_tmp = if one_pass { cfg.output_path.clone() }
+                    else { video_only_temp_path(&cfg.output_path) };
+    let one_pass_audio = if one_pass { Some(eac_audio_source(&cfg)) } else { None };
 
     // ── Encode tail, by backend (mirrors the OSV arms) ────────────────
     // NVENC: ring of CUDA-shared P010 frames — main composes frame N+k
@@ -2053,11 +2122,21 @@ fn export_eac_gpu_resident(
         let enc_video_tmp = video_tmp.clone();
         let (enc_backend, enc_fps, enc_bitrate, enc_bd, enc_prores) =
             (cfg.encoder, cfg.fps, cfg.bitrate_kbps, cfg.bit_depth, cfg.prores_profile);
+        // Inline audio: (source, offset, clip) for the encode thread to
+        // attach before the first frame (see one_pass above).
+        let enc_audio = one_pass_audio.as_ref().map(|(asrc, _)| {
+            (asrc.clone(), t_in, total_frames_to_write as f64 / cfg.fps as f64)
+        });
         let handle = std::thread::spawn(move || -> Result<u64> {
             let mut encoder = open_h265_encoder(
                 &enc_video_tmp, sbs_w, sbs_h, enc_fps, enc_bitrate,
                 enc_backend, enc_bd, enc_prores,
             )?;
+            if let Some((asrc, off, dur)) = enc_audio {
+                if let Err(e) = encoder.attach_audio_passthrough(&asrc, off, dur) {
+                    tracing::warn!("one-pass audio attach failed: {e} — video-only output");
+                }
+            }
             // Report the encoder's native input so the main thread produces
             // the matching layout. On create-failure we never send → main's
             // recv errs and the pipeline winds down; the error surfaces at
@@ -2261,9 +2340,17 @@ fn export_eac_gpu_resident(
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err(Error::Ffmpeg("gpu-resident EAC encode thread panicked".into())),
     }
-    // Audio + metadata: same finalize as the portable EAC path (handles the
-    // GoPro ambisonic / APAC tracks + multi-segment ffconcat).
-    finalize_eac_audio(&cfg, &video_tmp, trim_in_frame as f64 * dt, written as f64 * dt)?;
+    // Audio + metadata. One-pass (readback tail, stereo): audio was muxed
+    // inline straight into the final file — just drop the playlist temp.
+    // Otherwise (NVENC tail, ambisonic/APAC): same finalize as the portable
+    // EAC path (handles the GoPro ambisonic / APAC tracks + ffconcat).
+    if one_pass {
+        if let Some((_, atmp)) = one_pass_audio {
+            if let Some(t) = atmp { std::fs::remove_file(t).ok(); }
+        }
+    } else {
+        finalize_eac_audio(&cfg, &video_tmp, trim_in_frame as f64 * dt, written as f64 * dt)?;
+    }
     finalize_metadata(
         &cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp, cfg.apmp_baseline_mm,
     )?;
@@ -2714,7 +2801,13 @@ fn export_fisheye_osv_zerocopy_d3d11(
 
     let sbs_w = cfg.eye_w * 2;
     let sbs_h = cfg.eye_h;
-    let video_tmp = video_only_temp_path(&cfg.output_path);
+    // One-pass: encode straight to the final file with the stereo audio
+    // muxed inline — no `.video.tmp` + full re-mux copy (at ProRes
+    // bitrates the copy took longer than the encode).
+    let one_pass = one_pass_audio_eligible(&cfg);
+    let video_tmp = if one_pass { cfg.output_path.clone() }
+                    else { video_only_temp_path(&cfg.output_path) };
+    let one_pass_audio = if one_pass { Some(eac_audio_source(&cfg)) } else { None };
 
     let dt = 1.0 / cfg.fps as f64;
     let color_plan = cfg.color_stack.clone();
@@ -2788,11 +2881,21 @@ fn export_fisheye_osv_zerocopy_d3d11(
     let enc_video_tmp = video_tmp.clone();
     let (enc_backend, enc_fps, enc_bitrate, enc_bd, enc_prores) =
         (cfg.encoder, cfg.fps, cfg.bitrate_kbps, cfg.bit_depth, cfg.prores_profile);
+    // Inline audio: (source, offset, clip) — attached before the first
+    // frame on the encode thread (see one_pass above).
+    let enc_audio = one_pass_audio.as_ref().map(|(asrc, _)| {
+        (asrc.clone(), t_in, total_frames_to_write as f64 / cfg.fps as f64)
+    });
     let encode_handle = std::thread::spawn(move || -> Result<u64> {
         let mut encoder = open_h265_encoder(
             &enc_video_tmp, sbs_w, sbs_h, enc_fps, enc_bitrate,
             enc_backend, enc_bd, enc_prores,
         )?;
+        if let Some((asrc, off, dur)) = enc_audio {
+            if let Err(e) = encoder.attach_audio_passthrough(&asrc, off, dur) {
+                tracing::warn!("one-pass audio attach failed: {e} — video-only output");
+            }
+        }
         // Report the encoder's native input so the main thread produces the
         // matching layout. On create-failure we never send → main's recv
         // errs and the pipeline winds down, surfacing the error at the join.
@@ -3046,13 +3149,20 @@ fn export_fisheye_osv_zerocopy_d3d11(
         Err(_) => return Err(Error::Ffmpeg("zc export: encode thread panicked".into())),
     }
 
-    // Multi-segment: the audio source is an ffconcat playlist so a merged
-    // recording keeps its FULL audio (source_path alone = segment 0 only).
-    let (audio_src, audio_tmp) = eac_audio_source(&cfg);
-    let mux = finalize_with_audio(&audio_src, &video_tmp, &cfg.output_path,
-        t_in, frame_idx as f64 * dt);
-    if let Some(p) = &audio_tmp { std::fs::remove_file(p).ok(); }
-    mux?;
+    if one_pass {
+        // Audio already muxed inline — drop the playlist temp, if any.
+        if let Some((_, atmp)) = one_pass_audio {
+            if let Some(t) = atmp { std::fs::remove_file(t).ok(); }
+        }
+    } else {
+        // Multi-segment: the audio source is an ffconcat playlist so a merged
+        // recording keeps its FULL audio (source_path alone = segment 0 only).
+        let (audio_src, audio_tmp) = eac_audio_source(&cfg);
+        let mux = finalize_with_audio(&audio_src, &video_tmp, &cfg.output_path,
+            t_in, frame_idx as f64 * dt);
+        if let Some(p) = &audio_tmp { std::fs::remove_file(p).ok(); }
+        mux?;
+    }
     finalize_metadata(
         &cfg.output_path,
         cfg.inject_youtube_vr180,

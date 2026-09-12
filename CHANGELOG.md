@@ -52,6 +52,13 @@
   fast export paths require it), and when an export does land on a slow
   path the export bar says why (e.g. "CPU export path — ProRes GPU
   encoder unavailable") instead of just being slow.
+- **Exports no longer stall at 100%**: stereo-audio exports on the
+  Windows GPU and CPU paths now mux the audio inline while encoding,
+  straight into the final file — previously the whole encoded video was
+  rewritten afterwards to add the audio, which at ProRes bitrates could
+  take longer than the encode itself. Paths that still need the second
+  pass (ambisonic / APAC / hardware H.265) now show "muxing audio…" in
+  the export bar instead of sitting silently at 100%.
 
 ### Since 2.0.0
 - Seamless auto-update (2.1.0), `.360` lens calibration override, ProRes

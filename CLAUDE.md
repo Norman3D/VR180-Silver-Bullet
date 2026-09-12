@@ -135,6 +135,15 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    `fisheye_export::{set,append,}export_path_note`. NOT verifiable on this
    box: the DX12-fallback branch itself (Vulkan is always present here)
    and a genuine `prores_ks_vulkan` init failure — both code-reviewed only.
+   FOLLOW-UP (same day): the "stalls at 100%" report — the two-pass
+   temp+re-mux finalize rewrote the whole encoded video to add audio
+   (longer than the encode at ProRes bitrates). The one-pass inline-audio
+   mechanism (`attach_audio_passthrough`, built for the macOS VT + portable
+   fisheye paths) is now wired into the Windows OSV zc d3d11 arm, the
+   `.360` GPU readback tail and the portable EAC loop (stereo only —
+   `one_pass_audio_eligible`); video out byte-identical, chain/trim audio
+   re-verified. NVENC tails + ambisonic/APAC keep two-pass and show a
+   "muxing audio…" phase note (`FinalizePhaseNote`) in the export bar.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
