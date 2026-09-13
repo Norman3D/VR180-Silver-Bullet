@@ -2044,14 +2044,21 @@ fn export_eac_gpu_resident(
     let mut iter = iter;
     if t_in > 0.001 { iter.seek(t_in)?; }
 
-    // One-pass (readback tail only): encode straight to the final file with
-    // the stereo audio muxed inline — no `.video.tmp` + full re-mux copy,
-    // which at ProRes bitrates took longer than the encode. The NVENC tail
-    // (CudaNvencEncoder) and ambisonic/APAC keep the temp+finalize path.
-    let one_pass = !nvenc_tail && one_pass_audio_eligible(&cfg);
+    // One-pass: encode straight to the final file with the stereo audio
+    // muxed inline — no `.video.tmp` + full re-mux copy, which at ProRes
+    // bitrates took longer than the encode. Both tails carry it (NVENC via
+    // `CudaNvencEncoder`'s InlineAudio, ProRes/libx265 via the shared
+    // `attach_audio_passthrough`); ambisonic/APAC keep temp+finalize.
+    let one_pass = one_pass_audio_eligible(&cfg);
     let video_tmp = if one_pass { cfg.output_path.clone() }
                     else { video_only_temp_path(&cfg.output_path) };
     let one_pass_audio = if one_pass { Some(eac_audio_source(&cfg)) } else { None };
+    // (source, offset, clip) for whichever encode thread engages — the
+    // source is the ffconcat chain playlist for a merged recording, so
+    // multi-segment audio is one continuous timeline the window cuts from.
+    let enc_audio = one_pass_audio.as_ref().map(|(asrc, _)| {
+        (asrc.clone(), t_in, total_frames_to_write as f64 / cfg.fps as f64)
+    });
 
     // ── Encode tail, by backend (mirrors the OSV arms) ────────────────
     // NVENC: ring of CUDA-shared P010 frames — main composes frame N+k
@@ -2089,10 +2096,11 @@ fn export_eac_gpu_resident(
         tracing::info!("export_eac (GPU-resident): {RING}-slot shared P010 ring ready");
         let (enc_tx, enc_rx) = std::sync::mpsc::sync_channel::<EncMsg>(RING - 2);
         let (efps, ebr, etmp) = (cfg.fps, cfg.bitrate_kbps, video_tmp.clone());
+        let nv_audio = enc_audio.clone();
         let handle = std::thread::spawn(move || -> Result<u64> {
             let _cuda = cudarc::driver::CudaDevice::new(0)
                 .map_err(|e| Error::Ffmpeg(format!("encode-thread cuda ctx: {e:?}")))?;
-            let mut encoder = CudaNvencEncoder::new(&etmp, sbs_w, sbs_h, efps, ebr)?;
+            let mut encoder = CudaNvencEncoder::new(&etmp, sbs_w, sbs_h, efps, ebr, nv_audio)?;
             let mut n: u64 = 0;
             while let Ok(m) = enc_rx.recv() {
                 unsafe { encoder.encode_cuda_planes(m.y_ptr, m.y_pitch, m.uv_ptr, m.uv_pitch)?; }
@@ -2122,17 +2130,13 @@ fn export_eac_gpu_resident(
         let enc_video_tmp = video_tmp.clone();
         let (enc_backend, enc_fps, enc_bitrate, enc_bd, enc_prores) =
             (cfg.encoder, cfg.fps, cfg.bitrate_kbps, cfg.bit_depth, cfg.prores_profile);
-        // Inline audio: (source, offset, clip) for the encode thread to
-        // attach before the first frame (see one_pass above).
-        let enc_audio = one_pass_audio.as_ref().map(|(asrc, _)| {
-            (asrc.clone(), t_in, total_frames_to_write as f64 / cfg.fps as f64)
-        });
+        let rb_audio = enc_audio.clone();
         let handle = std::thread::spawn(move || -> Result<u64> {
             let mut encoder = open_h265_encoder(
                 &enc_video_tmp, sbs_w, sbs_h, enc_fps, enc_bitrate,
                 enc_backend, enc_bd, enc_prores,
             )?;
-            if let Some((asrc, off, dur)) = enc_audio {
+            if let Some((asrc, off, dur)) = rb_audio {
                 if let Err(e) = encoder.attach_audio_passthrough(&asrc, off, dur) {
                     tracing::warn!("one-pass audio attach failed: {e} — video-only output");
                 }
@@ -3250,7 +3254,14 @@ fn export_fisheye_osv_gpu_resident(
         (total_clip_frames as f64 - t_in * cfg.fps as f64).round().max(0.0) as u64
     };
 
-    let video_tmp = video_only_temp_path(&cfg.output_path);
+    // One-pass: encode straight to the final file with the audio muxed
+    // inline by the NVENC muxer (`CudaNvencEncoder`'s InlineAudio) — the
+    // source is the ffconcat chain playlist for a merged recording, so
+    // multi-segment audio is one continuous timeline the window cuts from.
+    let one_pass = one_pass_audio_eligible(&cfg);
+    let video_tmp = if one_pass { cfg.output_path.clone() }
+                    else { video_only_temp_path(&cfg.output_path) };
+    let one_pass_audio = if one_pass { Some(eac_audio_source(&cfg)) } else { None };
     // Ring of shared P010 frames: the main thread composes frame N+k while the
     // encode thread is still feeding NVENC frame N. RING slots + a bounded
     // channel of depth RING-2 keep main from overwriting an in-flight slot.
@@ -3268,10 +3279,13 @@ fn export_fisheye_osv_gpu_resident(
     struct EncMsg { y_ptr: u64, y_pitch: usize, uv_ptr: u64, uv_pitch: usize }
     let (enc_tx, enc_rx) = std::sync::mpsc::sync_channel::<EncMsg>(RING - 2);
     let (efps, ebr, etmp) = (cfg.fps, cfg.bitrate_kbps, video_tmp.clone());
+    let nv_audio = one_pass_audio.as_ref().map(|(asrc, _)| {
+        (asrc.clone(), t_in, total_frames_to_write as f64 / cfg.fps as f64)
+    });
     let encode_handle = std::thread::spawn(move || -> Result<u64> {
         let _cuda = cudarc::driver::CudaDevice::new(0)
             .map_err(|e| Error::Ffmpeg(format!("encode-thread cuda ctx: {e:?}")))?;
-        let mut encoder = CudaNvencEncoder::new(&etmp, sbs_w, sbs_h, efps, ebr)?;
+        let mut encoder = CudaNvencEncoder::new(&etmp, sbs_w, sbs_h, efps, ebr, nv_audio)?;
         let mut n: u64 = 0;
         while let Ok(m) = enc_rx.recv() {
             unsafe { encoder.encode_cuda_planes(m.y_ptr, m.y_pitch, m.uv_ptr, m.uv_pitch)?; }
@@ -3462,12 +3476,19 @@ fn export_fisheye_osv_gpu_resident(
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err(Error::Ffmpeg("gpu-resident encode thread panicked".into())),
     }
-    // Multi-segment: ffconcat playlist keeps a merged recording's FULL audio.
-    let (audio_src, audio_tmp) = eac_audio_source(&cfg);
-    let mux = finalize_with_audio(&audio_src, &video_tmp, &cfg.output_path,
-        t_in, frame_idx as f64 * dt);
-    if let Some(p) = &audio_tmp { std::fs::remove_file(p).ok(); }
-    mux?;
+    if one_pass {
+        // Audio already muxed inline — drop the playlist temp, if any.
+        if let Some((_, atmp)) = one_pass_audio {
+            if let Some(t) = atmp { std::fs::remove_file(t).ok(); }
+        }
+    } else {
+        // Multi-segment: ffconcat playlist keeps a merged recording's FULL audio.
+        let (audio_src, audio_tmp) = eac_audio_source(&cfg);
+        let mux = finalize_with_audio(&audio_src, &video_tmp, &cfg.output_path,
+            t_in, frame_idx as f64 * dt);
+        if let Some(p) = &audio_tmp { std::fs::remove_file(p).ok(); }
+        mux?;
+    }
     finalize_metadata(&cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp, cfg.apmp_baseline_mm)?;
     tracing::info!(
         "fisheye_export (GPU-resident): done, {} frames in {:.2?} ({:.1} fps)",

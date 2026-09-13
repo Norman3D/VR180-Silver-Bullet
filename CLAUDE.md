@@ -144,6 +144,16 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    `one_pass_audio_eligible`); video out byte-identical, chain/trim audio
    re-verified. NVENC tails + ambisonic/APAC keep two-pass and show a
    "muxing audio…" phase note (`FinalizePhaseNote`) in the export bar.
+   NEXT DAY: the NVENC tails are one-pass too — `CudaNvencEncoder` gained
+   `InlineAudio` (raw-FFI twin of `AudioPassthrough`, keep in lockstep;
+   audio as a `new()` param since its header isn't deferred) + the
+   duration=1 / dts=pts packet fix from `drain_packets` (NVENC leaves
+   duration 0 → track a frame short; the old re-mux masked it). Verified
+   one-pass on .360 + OSV, single AND 2-segment chains (ffconcat playlist
+   = continuous chain audio, windows cut mid-chain), 30/30 frames
+   byte-identical to the two-pass reference. Still two-pass: ambisonic /
+   APAC — and the macOS EAC VT arm (`export_eac_zerocopy_vt`), which is
+   mac-side work if wanted (the mac OSV VT arm was already one-pass).
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

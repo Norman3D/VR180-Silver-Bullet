@@ -90,7 +90,9 @@ unsafe fn dtod_2d_async(
 
 /// `hevc_nvenc` driven from CUDA hardware frames. The composited P010 stays in
 /// VRAM end-to-end; this struct owns the ffmpeg CUDA hwdevice, the input frame
-/// pool, the encoder, and the output muxer (video-only — caller muxes audio).
+/// pool, the encoder, and the output muxer. With `audio` attached at create,
+/// the source's audio is muxed inline (one pass, straight to the final file);
+/// without it the output is video-only and the caller muxes audio afterwards.
 pub struct CudaNvencEncoder {
     octx: *mut ffmpeg::ffi::AVFormatContext,
     enc: *mut ffmpeg::ffi::AVCodecContext,
@@ -100,8 +102,28 @@ pub struct CudaNvencEncoder {
     stream_index: i32,
     time_base: ffmpeg::ffi::AVRational,
     frame_count: i64,
+    audio: Option<InlineAudio>,
     pub width: u32,
     pub height: u32,
+}
+
+/// One-pass inline audio for the CUDA/NVENC muxer — the raw-FFI twin of
+/// `encode.rs::AudioPassthrough` (same trim / rebase / video-paced pump
+/// semantics; keep them in lockstep). Packets are pulled from `a_in` and
+/// interleaved with the video, rebased onto the trim window
+/// `[offset_s, offset_s + dur_s)`.
+struct InlineAudio {
+    a_in: ffmpeg::format::context::Input,
+    a_idx: usize,
+    out_a_idx: usize,
+    in_tb: ffmpeg::Rational,
+    offset_s: f64,
+    dur_s: f64,
+    off_ticks: i64,
+    /// A packet read but not yet due (held until the video catches up).
+    pending: Option<ffmpeg::Packet>,
+    finished: bool,
+    written: u64,
 }
 
 // The raw pointers are only ever touched on the single export thread that owns
@@ -110,14 +132,42 @@ unsafe impl Send for CudaNvencEncoder {}
 
 impl CudaNvencEncoder {
     /// `bitrate_kbps` is the VBR target. `bit_depth` must be 10 (Main10 / P010).
+    ///
+    /// `audio`: optional one-pass inline audio — `(source, offset_s, dur_s)`.
+    /// The source's first audio stream is muxed into THIS output during
+    /// encode (trim window kept, rebased to 0), so the caller writes the
+    /// final file directly instead of a video temp + re-mux. A source with
+    /// no audio stream degrades to video-only with an info log.
     pub fn new(
         path: &std::path::Path,
         width: u32,
         height: u32,
         fps: f32,
         bitrate_kbps: u32,
+        audio: Option<(std::path::PathBuf, f64, f64)>,
     ) -> Result<Self> {
         crate::decode::init();
+        // Open the audio source FIRST (safe ffmpeg-next types) so its stream
+        // can be added to the muxer before the header is written.
+        let audio_in: Option<(ffmpeg::format::context::Input, usize, f64, f64)> =
+            match audio {
+                Some((src, offset_s, dur_s)) => {
+                    let a_in = crate::audio::open_input_concat_aware(&src)
+                        .map_err(|e| Error::Ffmpeg(format!("open audio src {src:?}: {e}")))?;
+                    match a_in.streams()
+                        .filter(|s| s.parameters().medium() == ffmpeg::media::Type::Audio)
+                        .map(|s| s.index()).next()
+                    {
+                        Some(i) => Some((a_in, i, offset_s, dur_s)),
+                        None => {
+                            tracing::info!(
+                                "one-pass audio: no audio in {src:?} — video-only output");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
         unsafe {
             let (num, den) = approx_rational(fps);
             let time_base = ffmpeg::ffi::AVRational { num: den, den: num }; // 1/fps style
@@ -226,6 +276,34 @@ impl CudaNvencEncoder {
             (*st).time_base = time_base;
             let stream_index = (*st).index;
 
+            // Inline audio stream — must be added BEFORE the header. Params
+            // copied from the source; codec_tag cleared so the muxer picks
+            // the right MP4 tag; >2ch "ambisonic" layouts normalized to the
+            // plain N-channel layout the muxer accepts (stereo never hits it).
+            let inline_audio = audio_in.map(|(a_in, a_idx, offset_s, dur_s)| {
+                let in_tb = a_in.stream(a_idx).unwrap().time_base();
+                let src_params = a_in.stream(a_idx).unwrap().parameters();
+                let ast = ffmpeg::ffi::avformat_new_stream(octx, ptr::null());
+                ffmpeg::ffi::avcodec_parameters_copy(
+                    (*ast).codecpar, src_params.as_ptr());
+                (*(*ast).codecpar).codec_tag = 0;
+                let nch = (*(*ast).codecpar).ch_layout.nb_channels;
+                if nch >= 3 {
+                    ffmpeg::ffi::av_channel_layout_uninit(&mut (*(*ast).codecpar).ch_layout);
+                    ffmpeg::ffi::av_channel_layout_default(&mut (*(*ast).codecpar).ch_layout, nch);
+                }
+                (*ast).time_base = in_tb.into();
+                let off_ticks = (offset_s * in_tb.denominator() as f64
+                    / in_tb.numerator() as f64).round() as i64;
+                tracing::info!(
+                    "one-pass audio: source audio muxed inline (offset {offset_s:.2}s, dur {dur_s:.2}s)");
+                InlineAudio {
+                    a_in, a_idx, out_a_idx: (*ast).index as usize, in_tb,
+                    offset_s, dur_s, off_ticks,
+                    pending: None, finished: false, written: 0,
+                }
+            });
+
             if ffmpeg::ffi::avio_open(&mut (*octx).pb, out_c.as_ptr(), ffmpeg::ffi::AVIO_FLAG_WRITE) < 0 {
                 return Err(Error::Ffmpeg("avio_open failed".into()));
             }
@@ -235,7 +313,7 @@ impl CudaNvencEncoder {
 
             Ok(Self {
                 octx, enc, hw_device_ref, hw_frames_ref, stream, stream_index,
-                time_base, frame_count: 0, width, height,
+                time_base, frame_count: 0, audio: inline_audio, width, height,
             })
         }
     }
@@ -305,19 +383,87 @@ impl CudaNvencEncoder {
                 break; // EAGAIN / EOF / error → done for now
             }
             (*pkt).stream_index = self.stream_index;
+            // NVENC leaves duration = 0; movenc takes the LAST sample's stts
+            // delta from pkt->duration, so the track came up one frame short
+            // (the two-pass remux used to repair this on re-read — one-pass
+            // must write it right). CFR with pts == frame index → one tick
+            // of the encoder time base (1/fps) is exact. Same fix as the
+            // shared H265Encoder's drain_packets.
+            if (*pkt).duration == 0 {
+                (*pkt).duration = 1;
+            }
+            if (*pkt).dts == ffmpeg::ffi::AV_NOPTS_VALUE {
+                (*pkt).dts = (*pkt).pts;
+            }
             let st_tb = (**(*self.octx).streams.add(self.stream_index as usize)).time_base;
             ffmpeg::ffi::av_packet_rescale_ts(pkt, self.time_base, st_tb);
+            // Video timestamp on the OUTPUT timeline — paces the inline audio.
+            let v_time_s = if (*pkt).pts != ffmpeg::ffi::AV_NOPTS_VALUE {
+                Some((*pkt).pts as f64 * st_tb.num as f64 / st_tb.den as f64)
+            } else { None };
             ffmpeg::ffi::av_interleaved_write_frame(self.octx, pkt);
             ffmpeg::ffi::av_packet_unref(pkt);
+            if let Some(t) = v_time_s {
+                self.pump_audio(t)?;
+            }
         }
         ffmpeg::ffi::av_packet_free(&mut pkt);
         Ok(())
     }
 
-    /// Flush the encoder and write the trailer. Leaves a complete video file.
+    /// Write source audio packets due by `until_s` (output-timeline seconds),
+    /// interleaving with the encoded video so the muxer buffer stays bounded.
+    /// `f64::INFINITY` flushes all remaining audio. Same semantics as
+    /// `encode.rs::pump_audio_inner` — keep them in lockstep.
+    unsafe fn pump_audio(&mut self, until_s: f64) -> Result<()> {
+        use ffmpeg::packet::Mut as _; // Packet::as_mut_ptr
+        let octx = self.octx;
+        let ap = match self.audio.as_mut() { Some(a) => a, None => return Ok(()) };
+        if ap.finished { return Ok(()); }
+        let in_per_s = ap.in_tb.numerator() as f64 / ap.in_tb.denominator() as f64;
+        let out_tb_raw = (**(*octx).streams.add(ap.out_a_idx)).time_base;
+        let out_tb = ffmpeg::Rational::new(out_tb_raw.num, out_tb_raw.den);
+        loop {
+            let mut pkt = match ap.pending.take() {
+                Some(p) => p,
+                None => {
+                    let mut got = None;
+                    for (s, p) in ap.a_in.packets() {
+                        if s.index() == ap.a_idx { got = Some(p); break; }
+                    }
+                    match got { Some(p) => p, None => { ap.finished = true; return Ok(()); } }
+                }
+            };
+            let t = pkt.dts().or(pkt.pts()).unwrap_or(0);
+            let src_s = t as f64 * in_per_s;
+            if src_s < ap.offset_s - 1e-6 { continue; }        // before trim_in → drop
+            let out_s = src_s - ap.offset_s;
+            if out_s >= ap.dur_s { ap.finished = true; return Ok(()); } // past trim_out
+            if out_s > until_s + 0.5 { ap.pending = Some(pkt); return Ok(()); } // not due yet
+            if let Some(pts) = pkt.pts() { pkt.set_pts(Some((pts - ap.off_ticks).max(0))); }
+            if let Some(dts) = pkt.dts() { pkt.set_dts(Some((dts - ap.off_ticks).max(0))); }
+            pkt.set_stream(ap.out_a_idx);
+            pkt.set_position(-1);
+            pkt.rescale_ts(ap.in_tb, out_tb);
+            let r = ffmpeg::ffi::av_interleaved_write_frame(octx, pkt.as_mut_ptr());
+            if r < 0 {
+                return Err(Error::Ffmpeg(format!("write audio packet: {r}")));
+            }
+            ap.written += 1;
+        }
+    }
+
+    /// Flush the encoder and write the trailer. Leaves a complete file
+    /// (video-only, or video+audio when inline audio was attached).
     pub fn finish(&mut self) -> Result<()> {
         unsafe {
             self.drain(true)?;
+            // Flush any audio past the last video packet's time (the trailing
+            // ~frame of audio) before the trailer. No-op without inline audio.
+            self.pump_audio(f64::INFINITY)?;
+            if let Some(ap) = self.audio.as_ref() {
+                tracing::info!("one-pass audio: {} packets muxed inline", ap.written);
+            }
             ffmpeg::ffi::av_write_trailer(self.octx);
             ffmpeg::ffi::avio_closep(&mut (*self.octx).pb);
         }
