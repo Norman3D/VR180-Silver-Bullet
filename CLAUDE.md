@@ -151,9 +151,11 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    duration 0 → track a frame short; the old re-mux masked it). Verified
    one-pass on .360 + OSV, single AND 2-segment chains (ffconcat playlist
    = continuous chain audio, windows cut mid-chain), 30/30 frames
-   byte-identical to the two-pass reference. Still two-pass: ambisonic /
-   APAC — and the macOS EAC VT arm (`export_eac_zerocopy_vt`), which is
-   mac-side work if wanted (the mac OSV VT arm was already one-pass).
+   byte-identical to the two-pass reference. The macOS EAC VT arm
+   (`export_eac_zerocopy_vt`) followed the next day — same gate, inline
+   attach before the first frame, chain-probed duration when per_eye is
+   empty; verified on a trimmed `.360` window (2–5 s: 90 frames + 3.0 s
+   AAC muxed inline, no temp). Still two-pass everywhere: ambisonic / APAC.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

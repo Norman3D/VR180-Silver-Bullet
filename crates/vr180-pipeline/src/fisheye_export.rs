@@ -1817,7 +1817,15 @@ fn export_eac_zerocopy_vt(
     let dt = 1.0 / cfg.fps as f64;
     let trim_in_frame = cfg.trim_in_s.map(|t| (t.max(0.0) * cfg.fps as f64).round() as u32).unwrap_or(0);
     let trim_out_frame = cfg.trim_out_s.map(|t| (t * cfg.fps as f64).round() as u32);
-    let video_tmp = video_only_temp_path(&cfg.output_path);
+    // One-pass: encode STRAIGHT to the final file and mux the source's
+    // stereo audio inline — no `.video.tmp` + full re-mux copy (which at
+    // ProRes bitrates dwarfed the encode itself). Ambisonic / APAC keep
+    // the temp+finalize path (they need post-encode steps). Same posture
+    // as the OSV VT arm and the portable EAC loop; this arm was the last
+    // stereo path still doing two passes.
+    let one_pass = one_pass_audio_eligible(&cfg);
+    let video_tmp = if one_pass { cfg.output_path.clone() }
+                    else { video_only_temp_path(&cfg.output_path) };
 
     let is_prores_vt = matches!(cfg.encoder, EncoderBackend::ProResVideoToolbox);
     let ten_bit = cfg.bit_depth == 10 || is_prores_vt;
@@ -1831,11 +1839,37 @@ fn export_eac_zerocopy_vt(
         H265Encoder::create_zero_copy_vt(
             &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps)?
     };
+    // Inline audio passthrough (must be attached before the first frame).
+    // The audio window is clipped to the video's expected length: per_eye
+    // covers the whole chain when stabilizing; otherwise (empty per_eye)
+    // probe the chain — per_eye.len() would clip the audio to nothing.
+    let one_pass_audio_tmp = if one_pass {
+        let (asrc, atmp) = eac_audio_source(&cfg);
+        let total_video_frames = if per_eye.is_empty() {
+            if cfg.segments.len() > 1 {
+                cfg.segments.iter().map(|s| chain_segment_frames(s, cfg.fps)).sum::<usize>()
+            } else {
+                crate::decode::probe_video(&cfg.source_path)
+                    .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+                    .unwrap_or(0)
+            }
+        } else { per_eye.len() };
+        let dur = trim_out_frame
+            .map(|o| (o.saturating_sub(trim_in_frame)) as f64 * dt)
+            .unwrap_or((total_video_frames.saturating_sub(trim_in_frame as usize)) as f64 * dt);
+        if let Err(e) = encoder.attach_audio_passthrough(
+            &asrc, trim_in_frame as f64 * dt, dur,
+        ) {
+            tracing::warn!("one-pass audio attach failed: {e} — video-only output");
+        }
+        atmp
+    } else { None };
     tracing::info!(
-        "export_eac (zc): VT zero-copy ENGAGED — {} ({}x{}, trim {}..{})",
+        "export_eac (zc): VT zero-copy ENGAGED — {} ({}x{}, trim {}..{}, audio {})",
         if is_prores_vt { "ProRes-VT P210 (4:2:2)" } else if ten_bit { "HEVC Main10 P010" } else { "HEVC Main BGRA" },
         sbs_w, sbs_h, trim_in_frame,
         trim_out_frame.map(|f| f.to_string()).unwrap_or_else(|| "end".into()),
+        if one_pass { "one-pass inline" } else { "two-pass finalize" },
     );
 
     // Precise seek to trim-in (run-in discarded inside the iterator).
@@ -1961,10 +1995,15 @@ fn export_eac_zerocopy_vt(
     }
 
     encoder.finish()?;
-    finalize_eac_audio(
-        &cfg, &video_tmp,
-        trim_in_frame as f64 * dt, written as f64 * dt,
-    )?;
+    if one_pass {
+        // Audio already muxed inline — drop the playlist temp, if any.
+        if let Some(t) = one_pass_audio_tmp { std::fs::remove_file(t).ok(); }
+    } else {
+        finalize_eac_audio(
+            &cfg, &video_tmp,
+            trim_in_frame as f64 * dt, written as f64 * dt,
+        )?;
+    }
     finalize_metadata(
         &cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp, cfg.apmp_baseline_mm,
     )?;

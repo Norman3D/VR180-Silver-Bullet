@@ -53,8 +53,9 @@
   path the export bar says why (e.g. "CPU export path — ProRes GPU
   encoder unavailable") instead of just being slow.
 - **Exports no longer stall at 100%**: stereo-audio exports on every
-  Windows path — hardware H.265 (NVENC) included — now mux the audio
-  inline while encoding, straight into the final file (merged
+  path on both platforms — Windows hardware H.265 (NVENC) and the macOS
+  GoPro `.360` zero-copy arm included — now mux the audio inline while
+  encoding, straight into the final file (merged
   multi-segment recordings too) — previously the whole encoded video was
   rewritten afterwards to add the audio, which at ProRes bitrates could
   take longer than the encode itself. Paths that still need the second
