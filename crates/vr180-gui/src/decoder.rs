@@ -3585,21 +3585,21 @@ fn seed_eac_detected_calib(control: &DecoderControl, geoc: &vr180_core::geoc::Ge
 /// Project an already-assembled native EAC cross into a full-resolution
 /// SBS still for the zoom magnifier, using the SAME stab/RS/view-adjust/
 /// color/compose path as the live preview — just at `detail_eye` output
-/// resolution. Called only from the paused branch of `run_zero_copy`, so
-/// it never interacts with playback pacing or frame advance.
-#[cfg(target_os = "macos")]
+/// resolution. Called only from the paused branch of the zero-copy
+/// preview workers (macOS `run_zero_copy`, Windows `run_eac_zerocopy`),
+/// so it never interacts with playback pacing or frame advance.
 fn render_zoom_detail(
     pipeline: &Device,
     control: &DecoderControl,
     per_eye: &[((EquirectRotation, EquirectRsParams), (EquirectRotation, EquirectRsParams))],
-    cross: &(u32, wgpu::Texture, wgpu::Texture),
+    cross_a: &wgpu::Texture,
+    cross_b: &wgpu::Texture,
     abs_frame_idx: u32,
     timestamp_s: f64,
     detail_eye: u32,
     geoc: Option<&vr180_core::geoc::Geoc>,
     tx: &Sender<DecodedFrame>,
 ) -> anyhow::Result<()> {
-    let (_, cross_a, cross_b) = cross;
     let ((rl, sl), (rr, sr)) = per_eye.get(abs_frame_idx as usize).copied()
         .unwrap_or((
             (EquirectRotation::IDENTITY, EquirectRsParams::DISABLED),
@@ -3941,9 +3941,10 @@ fn run_zero_copy(
                         let have_cross = cached_cross.as_ref()
                             .map(|(i, _, _)| *i == abs).unwrap_or(false);
                         if have_cross && (abs, cached_gen) != last_detail_key && throttle_ok {
+                            let (_, ca, cb) = cached_cross.as_ref().unwrap();
                             if let Err(e) = render_zoom_detail(
                                 &pipeline, &control, &per_eye,
-                                cached_cross.as_ref().unwrap(), abs,
+                                ca, cb, abs,
                                 time_offset + frame_idx as f64 * dt, detail_eye,
                                 geoc.as_ref(), tx)
                             {
@@ -4051,6 +4052,20 @@ fn run_eac_zerocopy(
     }
 
     let mut held_pair: Option<SharedEacPair> = None;
+
+    // ── Native-res zoom still (the .360 equivalent of the fisheye
+    //    `DetailCache`; mirrors the macOS `run_zero_copy` block). When the
+    //    UI is paused + zoomed it sets `control.want_detail`; we then ALSO
+    //    project the frame's already-assembled native cross at full source
+    //    resolution and ship it on `detail_tx` for the magnifier — the
+    //    live preview keeps its capped working size. Without this the
+    //    Windows `.360` magnifier silently showed the low-res preview
+    //    (the UI polled `detail_frame_rx` and nothing ever arrived).
+    let detail_tx = control.detail_tx.lock().clone();
+    let detail_eye = dims.cross_w().min(4096);
+    let mut last_detail_key: (u32, u64) = (u32::MAX, u64::MAX);
+    let mut last_detail_at: Option<std::time::Instant> = None;
+    const DETAIL_THROTTLE: std::time::Duration = std::time::Duration::from_millis(120);
 
     'main: loop {
         let stay_on_pair = control.paused.load(Ordering::SeqCst) && held_pair.is_some();
@@ -4193,6 +4208,31 @@ fn run_eac_zerocopy(
                 if control.settings_generation.load(Ordering::SeqCst) != cached_gen {
                     force_render_next = true;
                     break;
+                }
+                // Native-res zoom still for the magnifier — this frame's
+                // native crosses (`cross_a`/`cross_b`) are still in scope,
+                // so this is a re-projection, not a re-decode. One render
+                // per (frame, settings-gen), throttled so a zoomed
+                // slider-drag stays fluid. Best-effort: errors are logged,
+                // never propagated (must not kill playback). Same shape as
+                // the macOS `run_zero_copy` pause branch.
+                if let Some(tx) = detail_tx.as_ref() {
+                    if control.want_detail.load(Ordering::SeqCst) {
+                        let throttle_ok = last_detail_at
+                            .map(|t| t.elapsed() >= DETAIL_THROTTLE).unwrap_or(true);
+                        if (absolute_frame_idx, cached_gen) != last_detail_key && throttle_ok {
+                            if let Err(e) = render_zoom_detail(
+                                &pipeline, &control, &per_eye,
+                                &cross_a, &cross_b, absolute_frame_idx,
+                                frame_t_abs, detail_eye,
+                                geoc.as_ref(), tx)
+                            {
+                                tracing::debug!("decoder (eac/zc): zoom detail failed: {e}");
+                            }
+                            last_detail_key = (absolute_frame_idx, cached_gen);
+                            last_detail_at = Some(std::time::Instant::now());
+                        }
+                    }
                 }
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     match cmd {
