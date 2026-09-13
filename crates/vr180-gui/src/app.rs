@@ -4382,7 +4382,7 @@ impl App {
         rfd::FileDialog::new()
             .add_filter(
                 "All supported video",
-                &["360", "osv", "OSV", "braw", "BRAW",
+                &["360", "osv", "OSV", "insv", "INSV", "braw", "BRAW",
                   "mp4", "MP4", "mov", "MOV"],
             )
             .add_filter("DJI Osmo 360 (.osv)", &["osv", "OSV"])
