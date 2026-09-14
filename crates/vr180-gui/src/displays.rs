@@ -24,6 +24,13 @@ pub struct DisplayInfo {
     pub origin: egui::Pos2,
     /// Size in logical points.
     pub size: egui::Vec2,
+    /// Top-left origin in PHYSICAL virtual-desktop pixels. On Windows with
+    /// mixed per-monitor DPI the logical `origin` is ambiguous (winit
+    /// resolves it against whichever monitor's scale it happens to use at
+    /// creation), so cross-monitor placement corrects itself against this
+    /// after the window exists. On macOS it equals `origin` (CG points ARE
+    /// the placement space) and is unused.
+    pub origin_px: egui::Pos2,
     /// Size in physical pixels.
     pub pixel_w: u32,
     pub pixel_h: u32,
@@ -80,6 +87,7 @@ mod platform {
                 name: format!("Display {id}"),
                 origin: egui::pos2(b.origin.x as f32, b.origin.y as f32),
                 size: egui::vec2(b.size.width as f32, b.size.height as f32),
+                origin_px: egui::pos2(b.origin.x as f32, b.origin.y as f32),
                 pixel_w: d.pixels_wide() as u32,
                 pixel_h: d.pixels_high() as u32,
                 is_primary: d.is_main(),
@@ -143,6 +151,7 @@ mod platform {
                 name: r.name,
                 origin: egui::pos2(r.rect.left as f32 / primary_scale, r.rect.top as f32 / primary_scale),
                 size: egui::vec2(w as f32 / primary_scale, h as f32 / primary_scale),
+                origin_px: egui::pos2(r.rect.left as f32, r.rect.top as f32),
                 pixel_w: w, pixel_h: h,
                 is_primary: r.primary,
             }
@@ -171,7 +180,8 @@ mod tests {
             assert!(ds[0].is_primary);
         }
         let mk = |w, h, p| DisplayInfo { name: String::new(), origin: egui::Pos2::ZERO,
-            size: egui::vec2(w as f32, h as f32), pixel_w: w, pixel_h: h, is_primary: p };
+            size: egui::vec2(w as f32, h as f32), origin_px: egui::Pos2::ZERO,
+            pixel_w: w, pixel_h: h, is_primary: p };
         let fake = vec![mk(3024, 1964, true), mk(2560, 1440, false), mk(7680, 2160, false), mk(3840, 1080, false)];
         assert_eq!(pick_3d_display(&fake), Some(3), "exact 3840×1080 wins");
         assert_eq!(pick_3d_display(&fake[..3]), Some(2), "other 32:9 screens qualify");

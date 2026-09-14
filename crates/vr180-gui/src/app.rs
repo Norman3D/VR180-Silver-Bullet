@@ -4518,6 +4518,37 @@ impl App {
         let mut close = false;
         let mut toggle_fullscreen = false;
         ctx.show_viewport_immediate(id, builder, |ctx, _class| {
+            // Windows, mixed per-monitor DPI: the builder's logical position
+            // is resolved against the wrong monitor's scale at creation (the
+            // window landed on the MAIN screen when the primary ran at 200%),
+            // so correct the placement afterwards against the window's OWN
+            // reported scale, in physical pixels. Converges in ≤2 frames:
+            // the first move lands the window on the target screen (its
+            // scale then becomes the target's), the next pass fixes the
+            // size under that scale and then matches exactly. No-op once
+            // the physical rect is right; macOS keeps the builder placement
+            // (CG points are the native space there — never entered).
+            #[cfg(target_os = "windows")]
+            if let Some(d) = &target {
+                let (cur, ppp) = ctx.input(|i| {
+                    let vp = i.viewport();
+                    let ppp = vp.native_pixels_per_point.unwrap_or_else(|| i.pixels_per_point());
+                    (vp.outer_rect.zip(vp.inner_rect), ppp)
+                });
+                if let Some((outer, inner)) = cur {
+                    let pos_ok = (outer.min.x * ppp - d.origin_px.x).abs() <= 1.5
+                        && (outer.min.y * ppp - d.origin_px.y).abs() <= 1.5;
+                    let size_ok = (inner.width() * ppp - d.pixel_w as f32).abs() <= 1.5
+                        && (inner.height() * ppp - d.pixel_h as f32).abs() <= 1.5;
+                    if !pos_ok || !size_ok {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                            egui::pos2(d.origin_px.x / ppp, d.origin_px.y / ppp)));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                            egui::vec2(d.pixel_w as f32 / ppp, d.pixel_h as f32 / ppp)));
+                        ctx.request_repaint();
+                    }
+                }
+            }
             if ctx.input(|i| i.viewport().close_requested()) { close = true; }
             ctx.input(|i| {
                 if i.key_pressed(egui::Key::Escape) { close = true; }
