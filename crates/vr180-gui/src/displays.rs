@@ -62,6 +62,17 @@ pub fn all_displays() -> Vec<DisplayInfo> {
 /// as 5120×1440 / 7680×2160). `None` when no such screen is connected — a
 /// normal external monitor does NOT qualify: the caller then opens the
 /// movable fallback window instead of taking over someone's desktop.
+/// macOS "Displays have separate Spaces" (System Settings ▸ Desktop & Dock),
+/// the default. With it ON every display carries its own menu bar and a
+/// plain borderless window gets pushed below it, so the 3D output must use
+/// native fullscreen there (its own Space on that display only). With it
+/// OFF native fullscreen takes over the whole desktop and flips between
+/// Spaces, so the output uses a borderless window covering the screen.
+/// `false` on other platforms (no such concept).
+pub fn displays_have_separate_spaces() -> bool {
+    platform::displays_have_separate_spaces()
+}
+
 pub fn pick_3d_display(displays: &[DisplayInfo]) -> Option<usize> {
     displays.iter().position(|d| !d.is_primary && d.pixel_w == 3840 && d.pixel_h == 1080)
         .or_else(|| displays.iter().position(|d| !d.is_primary && d.is_wide_sbs()))
@@ -83,22 +94,44 @@ mod platform {
         ids.into_iter().map(|id| {
             let d = CGDisplay::new(id);
             let b = d.bounds();
+            // `pixels_wide()` reports the mode's POINT size (1800 on a
+            // "more space" MacBook screen); the framebuffer pixel size comes
+            // from the display mode — that is what "3840×1080" means for
+            // the glasses and what the preview eye width should match.
+            let (pw, ph) = d.display_mode()
+                .map(|m| (m.pixel_width() as u32, m.pixel_height() as u32))
+                .unwrap_or((d.pixels_wide() as u32, d.pixels_high() as u32));
             DisplayInfo {
                 name: format!("Display {id}"),
                 origin: egui::pos2(b.origin.x as f32, b.origin.y as f32),
                 size: egui::vec2(b.size.width as f32, b.size.height as f32),
                 origin_px: egui::pos2(b.origin.x as f32, b.origin.y as f32),
-                pixel_w: d.pixels_wide() as u32,
-                pixel_h: d.pixels_high() as u32,
+                pixel_w: pw,
+                pixel_h: ph,
                 is_primary: d.is_main(),
             }
         }).collect()
+    }
+
+    /// `defaults read com.apple.spaces spans-displays` is 1 when the
+    /// displays SHARE one Space (the setting off); missing or 0 → separate
+    /// Spaces (the default).
+    pub fn displays_have_separate_spaces() -> bool {
+        let out = std::process::Command::new("defaults")
+            .args(["read", "com.apple.spaces", "spans-displays"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() != "1",
+            _ => true,
+        }
     }
 }
 
 #[cfg(target_os = "windows")]
 mod platform {
     use super::DisplayInfo;
+
+    pub fn displays_have_separate_spaces() -> bool { false }
     use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT};
     use windows_sys::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
@@ -163,6 +196,7 @@ mod platform {
 mod platform {
     use super::DisplayInfo;
     pub fn all_displays() -> Vec<DisplayInfo> { Vec::new() }
+    pub fn displays_have_separate_spaces() -> bool { false }
 }
 
 #[cfg(test)]

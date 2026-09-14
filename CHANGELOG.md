@@ -24,7 +24,10 @@
   renders at half the screen width so a 16:9 reframed eye fills its half
   1:1 (other aspects are letterboxed inside each half). `Esc` closes it.
   With no such screen connected a movable window opens instead — drag it
-  onto the 3D screen and press `F` for fullscreen.
+  onto the 3D screen and press `F` for fullscreen. macOS: honours
+  "Displays have separate Spaces" (native fullscreen on the glasses when
+  on, a borderless window at the screen bounds when off — each is the
+  only mode that works under that setting).
 
 ### Reframed (Flat 3D) export bitrate
 - Reframed exports now have their **own H.265 bitrate** (10–300 Mbps),

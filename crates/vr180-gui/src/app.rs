@@ -853,6 +853,10 @@ struct ThreeDDisplay {
     target: Option<usize>,
     /// Current fullscreen state (`F` toggles it in the output window).
     fullscreen: bool,
+    /// Auto-placed output uses NATIVE fullscreen (macOS with separate
+    /// Spaces per display — a borderless window would sit under that
+    /// display's menu bar) instead of a borderless window at the bounds.
+    native_fullscreen: bool,
     /// Settings changed on enable, restored on disable.
     restore_preview_w: Option<u32>,
     restore_preview_mode: Option<crate::decoder::PreviewMode>,
@@ -4441,7 +4445,8 @@ impl App {
         let d = &mut self.three_d;
         d.displays = displays;
         d.target = target;
-        d.fullscreen = false;
+        d.native_fullscreen = target.is_some() && crate::displays::displays_have_separate_spaces();
+        d.fullscreen = d.native_fullscreen;
         d.restore_preview_mode = None;
         d.restore_preview_w = None;
         // Stereo needs the plain L|R compose — anaglyph / overlay / single
@@ -4464,9 +4469,10 @@ impl App {
         }
         d.enabled = true;
         match target {
-            Some(t) => tracing::info!("3D display: on → {} ({}) at {:?}, {}×{} pt",
+            Some(t) => tracing::info!("3D display: on → {} ({}) at {:?}, {}×{} pt, {}",
                 d.displays[t].label(), d.displays[t].name, d.displays[t].origin,
-                d.displays[t].size.x, d.displays[t].size.y),
+                d.displays[t].size.x, d.displays[t].size.y,
+                if d.native_fullscreen { "native fullscreen (separate Spaces)" } else { "borderless at bounds" }),
             None => tracing::info!("3D display: on — no 3840×1080-class screen connected, windowed fallback"),
         }
         if reload {
@@ -4500,16 +4506,23 @@ impl App {
         let target = self.three_d.target.and_then(|t| self.three_d.displays.get(t).cloned());
         let mut builder = egui::ViewportBuilder::default()
             .with_title(format!("VR180 Silver Bullet — {}", tr("3D display")));
+        let native_fs = self.three_d.native_fullscreen;
         builder = match &target {
-            // A borderless window covering the screen's exact bounds — NOT
-            // native fullscreen: on macOS with "Displays have separate
-            // Spaces" off, native fullscreen makes its own Space and the
-            // desktop keeps flipping between it and the main window.
-            Some(d) => builder
-                .with_position(d.origin)
-                .with_inner_size(d.size)
-                .with_decorations(false)
-                .with_resizable(false),
+            // Placed on the screen's exact bounds. macOS with "Displays have
+            // separate Spaces" ON (the default): native fullscreen — the
+            // display carries its own menu bar and a borderless window gets
+            // pushed under it (short window, letterboxed halves, menu bar
+            // visible). With the setting OFF: a borderless window instead —
+            // native fullscreen there makes its own Space and the desktop
+            // flips between it and the main window.
+            Some(d) => {
+                let b = builder
+                    .with_position(d.origin)
+                    .with_inner_size(d.size)
+                    .with_decorations(false)
+                    .with_resizable(false);
+                if native_fs { b.with_fullscreen(true) } else { b }
+            }
             None => builder.with_inner_size([1280.0, 360.0]),
         };
         let frame = self.current_display.as_ref().map(|d| (d.egui_id, d.width, d.height));
