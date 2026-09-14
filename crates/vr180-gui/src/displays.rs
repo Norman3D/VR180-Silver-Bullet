@@ -94,9 +94,13 @@ mod platform {
     use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT};
     use windows_sys::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
-        MONITORINFOF_PRIMARY,
     };
     use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+
+    /// windows-sys 0.59 puts this in `Win32::UI::WindowsAndMessaging`, a
+    /// feature we don't otherwise need — it's a stable Win32 `#define` (1),
+    /// so declare it locally instead of pulling the whole module in.
+    const MONITORINFOF_PRIMARY: u32 = 1;
 
     struct Raw { rect: RECT, primary: bool, dpi: u32, name: String }
 
