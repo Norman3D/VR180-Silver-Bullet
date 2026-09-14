@@ -28,7 +28,7 @@ rfd = "0.14"
 # Decode the bundled .ico for the live window icon (title bar + taskbar).
 # `ico` pulls in the png/bmp sub-decoders the icon frames use. The .exe's
 # *file* icon is embedded separately at build time (see build.rs).
-image = { version = "0.25", default-features = false, features = ["ico"] }
+image = { version = "0.25", default-features = false, features = ["ico", "jpeg"] }
 
 # Threading + sync.
 parking_lot = "0.12"
@@ -68,3 +68,10 @@ vr180-braw = { workspace = true }
 # Windows host only 鈥?macOS uses the .icns app bundle and never builds this.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+# Display enumeration for the 3D-display output (see src/displays.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.23"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_HiDpi"] }

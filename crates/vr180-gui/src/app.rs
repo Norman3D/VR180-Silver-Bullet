@@ -220,6 +220,10 @@ pub struct App {
     /// settings) it was rendered for; the receiver carries an in-flight
     /// job's result.
     full_res_display: Option<DisplayFrame>,
+    /// External 3D display output (side-by-side monitor / AR glasses).
+    three_d: ThreeDDisplay,
+    /// Last snapshot result for the status bar: (message, when).
+    snapshot_status: Option<(String, std::time::Instant)>,
     /// Key (frame+settings) the current `full_res_display` was rendered for.
     full_res_key: u64,
     /// Key (frame+settings) we currently *want* a still for. While this
@@ -570,6 +574,16 @@ fn tr(en: &'static str) -> &'static str {
         "Fisheye dewarp is off for this side-by-side file (Source ▸ Input) — the lens settings below are not applied." => "此左右格式文件已关闭鱼眼去畸变（素材 ▸ 输入）——下方镜头设置不生效。",
         "Output" => "输出",
         "View" => "视图",
+        "📷 Snapshot" => "📷 截图",
+        "Save this frame as a JPEG in the export folder (S)" => "把当前帧存为 JPEG 到导出文件夹（S）",
+        "Nothing to snapshot yet" => "还没有可截图的画面",
+        "Saved" => "已保存",
+        "Snapshot failed" => "截图失败",
+        "3D display" => "3D 显示器",
+        "Show the stereo pair on a side-by-side 3D monitor or AR glasses that appear as one wide screen (3840×1080): left eye in the left half, right eye in the right. Goes fullscreen on that screen automatically when one is connected; otherwise opens a window to drag onto it (F = fullscreen). Esc closes it." => "在以单个宽屏（3840×1080）形式出现的左右格式 3D 显示器或 AR 眼镜上显示立体画面：左半为左眼，右半为右眼。检测到这样的屏幕时自动在其上全屏；否则打开一个窗口，拖到该屏幕后按 F 全屏。按 Esc 关闭。",
+        "SBS while the 3D display is on" => "3D 显示器开启时固定为 SBS",
+        "3D display — play a clip to see it here" => "3D 显示器——播放素材后在此显示",
+        "Drag this window onto the 3D screen · F = fullscreen · Esc = close" => "把此窗口拖到 3D 屏幕上 · F = 全屏 · Esc = 关闭",
         "Click ▶ Play to start preview." => "点击 ▶ 播放以开始预览。",
         // Source clip list
         "+ Add clips…" => "+ 添加片段…",
@@ -822,6 +836,31 @@ struct DisplayFrame {
     timestamp_s: f64,
 }
 
+/// External **3D display** output: a second, chrome-less viewport that shows
+/// the SBS preview with the left eye in the left half and the right eye in
+/// the right half — the stereo input a side-by-side 3D monitor or AR glasses
+/// (one wide screen such as 3840×1080) take. See `draw_3d_display`.
+#[derive(Default)]
+struct ThreeDDisplay {
+    enabled: bool,
+    displays: Vec<crate::displays::DisplayInfo>,
+    /// Index into `displays` the output sits on; `None` → the windowed
+    /// fallback (drag it onto the 3D screen, `F` = fullscreen).
+    target: Option<usize>,
+    /// Current fullscreen state (`F` toggles it in the output window).
+    fullscreen: bool,
+    /// Settings changed on enable, restored on disable.
+    restore_preview_w: Option<u32>,
+    restore_preview_mode: Option<crate::decoder::PreviewMode>,
+}
+
+/// Largest rect of `aspect` (w/h) centred inside `outer`.
+fn fit_aspect(outer: egui::Rect, aspect: f32) -> egui::Rect {
+    let (ow, oh) = (outer.width(), outer.height());
+    let (w, h) = if ow / oh.max(1e-3) > aspect { (oh * aspect, oh) } else { (ow, ow / aspect.max(1e-3)) };
+    egui::Rect::from_center_size(outer.center(), egui::vec2(w, h))
+}
+
 #[derive(Default)]
 struct FpsStats {
     frames_in_window: u32,
@@ -1048,6 +1087,8 @@ impl App {
             preview_zoom: 1.0,
             preview_center: egui::vec2(0.5, 0.5),
             full_res_display: None,
+            three_d: ThreeDDisplay::default(),
+            snapshot_status: None,
             full_res_key: 0,
             full_res_desired_key: 0,
             full_res_rendered_at: std::time::Instant::now(),
@@ -3747,13 +3788,17 @@ impl eframe::App for App {
         // `&i.modifiers` immutably) and apply them after.
         let mut pending_trim_in:  Option<Option<f64>> = None;
         let mut pending_trim_out: Option<Option<f64>> = None;
+        let mut pending_snapshot = false;
         if !ctx.wants_keyboard_input() {
             ctx.input(|i| {
+                // S — snapshot the frame on screen. (Stop has no hotkey: the
+                // old plain-S stop tore the decoder down mid-session by
+                // accident too easily; the ■ Stop button remains.)
+                if i.key_pressed(egui::Key::S) && i.modifiers.is_none() {
+                    pending_snapshot = true;
+                }
                 if i.key_pressed(egui::Key::Space) {
                     self.toggle_play_pause();
-                }
-                if i.key_pressed(egui::Key::S) && i.modifiers.is_none() {
-                    self.stop_playback();
                 }
                 if i.key_pressed(egui::Key::O)
                     && (i.modifiers.command || i.modifiers.ctrl)
@@ -3773,6 +3818,7 @@ impl eframe::App for App {
         }
         if let Some(t) = pending_trim_in  { self.set_trim_in(t); }
         if let Some(t) = pending_trim_out { self.set_trim_out(t); }
+        if pending_snapshot { self.save_snapshot(); }
 
         // ─── Top toolbar (file + preview-size only; transport is bottom) ─
         egui::TopBottomPanel::top("toolbar")
@@ -3840,7 +3886,7 @@ impl eframe::App for App {
                     egui::ComboBox::from_id_source("preview_w")
                         .selected_text(format!("{}", self.settings.preview_eye_w))
                         .show_ui(ui, |ui| {
-                            for &w in &[512_u32, 768, 1024, 1280, 1536] {
+                            for &w in &[512_u32, 768, 1024, 1280, 1536, 1920] {
                                 ui.selectable_value(&mut self.settings.preview_eye_w, w,
                                     format!("{w}"));
                             }
@@ -3848,6 +3894,8 @@ impl eframe::App for App {
 
                     ui.separator();
                     ui.label(RichText::new(tr("View")).color(Color32::GRAY));
+                    let three_d_on = self.three_d.enabled;
+                    ui.add_enabled_ui(!three_d_on, |ui| {
                     egui::ComboBox::from_id_source("preview_mode_combo")
                         .selected_text(self.settings.preview_mode.as_str())
                         .show_ui(ui, |ui| {
@@ -3861,6 +3909,7 @@ impl eframe::App for App {
                             ui.selectable_value(&mut self.settings.preview_mode,
                                 M::SingleEye, M::SingleEye.as_str());
                         });
+                    }).response.on_disabled_hover_text(tr("SBS while the 3D display is on"));
 
                     // Single-eye: a toggle to switch which eye. Flipping it
                     // only changes which eye renders — the zoom/pan viewpoint
@@ -3873,6 +3922,17 @@ impl eframe::App for App {
                         {
                             self.settings.preview_eye_right = !self.settings.preview_eye_right;
                         }
+                    }
+
+                    // External 3D display output (side-by-side monitor / AR
+                    // glasses). Toggle: opens / closes the output viewport.
+                    ui.separator();
+                    let mut three_d = self.three_d.enabled;
+                    if ui.toggle_value(&mut three_d, tr("3D display"))
+                        .on_hover_text(tr("Show the stereo pair on a side-by-side 3D monitor or AR glasses that appear as one wide screen (3840×1080): left eye in the left half, right eye in the right. Goes fullscreen on that screen automatically when one is connected; otherwise opens a window to drag onto it (F = fullscreen). Esc closes it."))
+                        .changed()
+                    {
+                        if three_d { self.enable_3d_display(); } else { self.disable_3d_display(); }
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4053,6 +4113,13 @@ impl eframe::App for App {
                 ui.separator();
                 ui.label(RichText::new(format!("{:.1} fps", self.fps_stats.last_fps))
                     .small().color(Color32::from_rgb(76, 208, 125)));
+                if let Some((msg, at)) = &self.snapshot_status {
+                    if at.elapsed().as_secs_f32() < 5.0 {
+                        ui.separator();
+                        ui.label(RichText::new(msg.clone()).small().color(Color32::from_rgb(255, 200, 120)));
+                        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                    }
+                }
                 if let Some(clip) = &self.clip {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(format!(
@@ -4072,6 +4139,13 @@ impl eframe::App for App {
                     let label = tr(if self.playing { "Pause" } else { "▶ Play" });
                     if ui.button(label).clicked() { self.toggle_play_pause(); }
                     if ui.button(tr("■ Stop")).clicked() { self.stop_playback(); }
+                    let has_frame = self.current_display.is_some();
+                    if ui.add_enabled(has_frame, egui::Button::new(tr("📷 Snapshot")))
+                        .on_hover_text(tr("Save this frame as a JPEG in the export folder (S)"))
+                        .clicked()
+                    {
+                        self.save_snapshot();
+                    }
                 });
                 ui.separator();
 
@@ -4314,6 +4388,10 @@ impl eframe::App for App {
             }
         });
 
+        // External 3D display (side-by-side monitor / AR glasses) — an
+        // immediate viewport, drawn every frame while enabled.
+        self.draw_3d_display(ctx);
+
         // Push slider edits to the running decoder.
         self.maybe_push_settings();
         // Remember settings across launches (debounced; flushes on close).
@@ -4334,6 +4412,195 @@ impl eframe::App for App {
 impl App {
     /// Source panel = the CLIP LIST (click to select → preview + sidebar
     /// edit that clip's settings) + the active clip's metadata below.
+    /// Turn the external 3D display output on: pick the screen, force the
+    /// plain SBS compose, and render each eye at half that screen's width.
+    fn enable_3d_display(&mut self) {
+        use crate::decoder::PreviewMode;
+        let displays = crate::displays::all_displays();
+        let target = crate::displays::pick_3d_display(&displays);
+        let d = &mut self.three_d;
+        d.displays = displays;
+        d.target = target;
+        d.fullscreen = false;
+        d.restore_preview_mode = None;
+        d.restore_preview_w = None;
+        // Stereo needs the plain L|R compose — anaglyph / overlay / single
+        // eye are alignment aids for the main window only.
+        if self.settings.preview_mode != PreviewMode::Sbs {
+            d.restore_preview_mode = Some(self.settings.preview_mode);
+            self.settings.preview_mode = PreviewMode::Sbs;
+        }
+        // Render each eye at half the screen width so the output is 1:1
+        // (a 768-px preview eye stretched to 1920 px looks soft). The eye
+        // size binds at decoder start, so this reloads the clip.
+        let mut reload = false;
+        if let Some(t) = target {
+            let want = (d.displays[t].pixel_w / 2).clamp(512, 2048);
+            if self.settings.preview_eye_w < want {
+                d.restore_preview_w = Some(self.settings.preview_eye_w);
+                self.settings.preview_eye_w = want;
+                reload = true;
+            }
+        }
+        d.enabled = true;
+        match target {
+            Some(t) => tracing::info!("3D display: on → {} ({}) at {:?}, {}×{} pt",
+                d.displays[t].label(), d.displays[t].name, d.displays[t].origin,
+                d.displays[t].size.x, d.displays[t].size.y),
+            None => tracing::info!("3D display: on — no 3840×1080-class screen connected, windowed fallback"),
+        }
+        if reload {
+            if let Some(p) = self.loaded_path.clone() { self.load_file_inner(p, true); }
+        }
+    }
+
+    fn disable_3d_display(&mut self) {
+        let d = &mut self.three_d;
+        d.enabled = false;
+        if let Some(m) = d.restore_preview_mode.take() { self.settings.preview_mode = m; }
+        let mut reload = false;
+        if let Some(w) = d.restore_preview_w.take() {
+            self.settings.preview_eye_w = w;
+            reload = true;
+        }
+        tracing::info!("3D display: off");
+        if reload {
+            if let Some(p) = self.loaded_path.clone() { self.load_file_inner(p, true); }
+        }
+    }
+
+    /// The external 3D display viewport: a chrome-less window on the chosen
+    /// screen (or a movable fallback) painting the SBS preview texture with
+    /// the left eye fitted into the left half and the right eye into the
+    /// right half. Immediate viewport — it renders as part of this frame, so
+    /// it follows every preview update; not calling it closes the window.
+    fn draw_3d_display(&mut self, ctx: &egui::Context) {
+        if !self.three_d.enabled { return; }
+        let id = egui::ViewportId::from_hash_of("vr180_3d_display");
+        let target = self.three_d.target.and_then(|t| self.three_d.displays.get(t).cloned());
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(format!("VR180 Silver Bullet — {}", tr("3D display")));
+        builder = match &target {
+            // A borderless window covering the screen's exact bounds — NOT
+            // native fullscreen: on macOS with "Displays have separate
+            // Spaces" off, native fullscreen makes its own Space and the
+            // desktop keeps flipping between it and the main window.
+            Some(d) => builder
+                .with_position(d.origin)
+                .with_inner_size(d.size)
+                .with_decorations(false)
+                .with_resizable(false),
+            None => builder.with_inner_size([1280.0, 360.0]),
+        };
+        let frame = self.current_display.as_ref().map(|d| (d.egui_id, d.width, d.height));
+        let windowed = target.is_none();
+        let fullscreen_now = self.three_d.fullscreen;
+        let mut close = false;
+        let mut toggle_fullscreen = false;
+        ctx.show_viewport_immediate(id, builder, |ctx, _class| {
+            if ctx.input(|i| i.viewport().close_requested()) { close = true; }
+            ctx.input(|i| {
+                if i.key_pressed(egui::Key::Escape) { close = true; }
+                // F = native fullscreen, windowed fallback only (the
+                // auto-placed output already covers its screen).
+                if windowed && i.key_pressed(egui::Key::F) && i.modifiers.is_none() { toggle_fullscreen = true; }
+            });
+            if fullscreen_now || !windowed { ctx.set_cursor_icon(egui::CursorIcon::None); }
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.fill(Color32::BLACK))
+                .show(ctx, |ui| {
+                    let full = ui.max_rect();
+                    let half = egui::vec2(full.width() * 0.5, full.height());
+                    let halves = [
+                        egui::Rect::from_min_size(full.min, half),
+                        egui::Rect::from_min_size(egui::pos2(full.min.x + half.x, full.min.y), half),
+                    ];
+                    match frame {
+                        Some((tex, w, h)) if w > 0 && h > 0 => {
+                            // The SBS texture is L|R: each eye is half its
+                            // width. Fit each eye into its half of the screen
+                            // (exact fill for a 16:9 reframed eye on a
+                            // 3840×1080 screen; letterboxed otherwise).
+                            let eye_aspect = (w as f32 * 0.5) / h as f32;
+                            for (i, r) in halves.iter().enumerate() {
+                                let fit = fit_aspect(*r, eye_aspect);
+                                let u0 = i as f32 * 0.5;
+                                let uv = egui::Rect::from_min_max(
+                                    egui::pos2(u0, 0.0), egui::pos2(u0 + 0.5, 1.0));
+                                let sized = egui::load::SizedTexture::new(tex, fit.size());
+                                egui::Image::new(sized).uv(uv).paint_at(ui, fit);
+                            }
+                        }
+                        _ => {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(RichText::new(tr("3D display — play a clip to see it here"))
+                                    .size(16.0).color(Color32::GRAY));
+                            });
+                        }
+                    }
+                    if windowed && !fullscreen_now {
+                        ui.painter().text(
+                            full.left_top() + egui::vec2(10.0, 8.0), egui::Align2::LEFT_TOP,
+                            tr("Drag this window onto the 3D screen · F = fullscreen · Esc = close"),
+                            egui::FontId::proportional(13.0), Color32::from_rgb(200, 200, 200));
+                    }
+                });
+        });
+        if toggle_fullscreen {
+            self.three_d.fullscreen = !self.three_d.fullscreen;
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Fullscreen(self.three_d.fullscreen));
+        }
+        if close { self.disable_3d_display(); }
+    }
+
+    /// Quick snapshot: save the frame on screen as a 92 % JPEG in the export
+    /// output folder (or next to the source when none is set), named
+    /// `<source stem>_frame<N>.jpg`. Uses the native-resolution still when
+    /// one is showing (paused + zoomed), else the live preview texture — so
+    /// the file matches what the preview shows, grade and all.
+    fn save_snapshot(&mut self) {
+        let cur_ts = self.current_display.as_ref().map(|d| d.timestamp_s).unwrap_or(0.0);
+        let full_res_ok = !self.playing && self.full_res_display.as_ref()
+            .map(|d| (d.timestamp_s - cur_ts).abs() < 0.02).unwrap_or(false);
+        let Some(d) = (if full_res_ok { self.full_res_display.as_ref() } else { self.current_display.as_ref() })
+            .map(|d| (d.texture.clone(), d.width, d.height, d.frame_idx))
+        else {
+            self.snapshot_status = Some((tr("Nothing to snapshot yet").to_string(), std::time::Instant::now()));
+            return;
+        };
+        let (tex, w, h, frame_idx) = d;
+        let Some(src) = self.loaded_path.clone() else { return; };
+        let dir = self.batch_out_dir.clone()
+            .or_else(|| src.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let stem = src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "frame".into());
+        let mut path = dir.join(format!("{stem}_frame{frame_idx}.jpg"));
+        let mut n = 2;
+        while path.exists() {
+            path = dir.join(format!("{stem}_frame{frame_idx}-{n}.jpg"));
+            n += 1;
+        }
+        let result = (|| -> anyhow::Result<()> {
+            let rgb = self.pipeline.read_texture_rgb8(&tex, w, h)?;
+            std::fs::create_dir_all(&dir)?;
+            let file = std::io::BufWriter::new(std::fs::File::create(&path)?);
+            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(file, 92);
+            enc.encode(&rgb, w, h, image::ExtendedColorType::Rgb8)?;
+            Ok(())
+        })();
+        let msg = match result {
+            Ok(()) => {
+                tracing::info!("snapshot: {} ({w}×{h})", path.display());
+                format!("{} {}", tr("Saved"), path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default())
+            }
+            Err(e) => {
+                tracing::warn!("snapshot failed: {e:#}");
+                format!("{}: {e}", tr("Snapshot failed"))
+            }
+        };
+        self.snapshot_status = Some((msg, std::time::Instant::now()));
+    }
+
     fn draw_source_panel(&mut self, ui: &mut egui::Ui) {
         let mut select_idx: Option<usize> = None;
         let mut remove_idx: Option<usize> = None;
@@ -5024,7 +5291,15 @@ impl App {
         let stab_paused = is_osv && self.control.as_ref()
             .map(|c| c.imu_progress.pause.load(Ordering::SeqCst)).unwrap_or(false);
         let show_loading = stab_loading && !stab_paused;
-        let quats_ready = !is_osv || self.control.as_ref()
+        // Ready = the decoder says so, OR the full IMU is already cached for
+        // this clip. The cache check keeps the sliders live while the decoder
+        // is stopped (S / Stop tears `control` down) and right after a
+        // restart, instead of graying them until a decoder happens to
+        // re-publish the flag.
+        let quats_cached = is_osv && self.loaded_path.as_ref()
+            .and_then(|p| crate::decoder::cached_dji_imu(p))
+            .map(|imu| !imu.frame_quats.is_empty()).unwrap_or(false);
+        let quats_ready = !is_osv || quats_cached || self.control.as_ref()
             .map(|c| c.imu_ready.load(Ordering::SeqCst)).unwrap_or(false);
         let imu_pct = if show_loading {
             self.control.as_ref().map(|c| c.imu_progress.percent()).unwrap_or(0)

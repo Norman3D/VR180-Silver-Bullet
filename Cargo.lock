@@ -1773,6 +1773,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -4045,6 +4047,7 @@ version = "2.5.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "core-graphics",
  "cpal",
  "crossbeam-channel",
  "eframe",
@@ -4066,6 +4069,7 @@ dependencies = [
  "vr180-fisheye",
  "vr180-pipeline",
  "wgpu",
+ "windows-sys 0.59.0",
  "winresource",
 ]
 

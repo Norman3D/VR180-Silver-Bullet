@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Snapshot
+- **📷 Snapshot** button in the transport bar (`S`; Stop no longer has a
+  hotkey): saves the
+  frame on screen — grade, stabilization, reframe and all — as a 92 %
+  JPEG in the export output folder (next to the source when none is
+  set), named `<source>_frame<N>.jpg`. Uses the native-resolution still
+  when one is showing (paused + zoomed), else the live preview.
+
+### 3D display output (new)
+- **"3D display" toggle** in the toolbar: shows the stereo pair on a
+  side-by-side 3D monitor or AR glasses that appear to the OS as one wide
+  screen (e.g. 3840×1080) — left eye in the left half, right eye in the
+  right, on a chrome-less fullscreen output that follows the live preview
+  (pan / zoom / grade / stabilization included). When a 3840×1080-class
+  side-by-side screen is connected (macOS and Windows) the output goes
+  fullscreen on it automatically; the preview switches to SBS and each eye
+  renders at half the screen width so a 16:9 reframed eye fills its half
+  1:1 (other aspects are letterboxed inside each half). `Esc` closes it.
+  With no such screen connected a movable window opens instead — drag it
+  onto the 3D screen and press `F` for fullscreen.
+
 ### Reframed (Flat 3D) export bitrate
 - Reframed exports now have their **own H.265 bitrate** (10–300 Mbps),
   separate from the VR180 rate, **seeded from a per-size recommendation**
