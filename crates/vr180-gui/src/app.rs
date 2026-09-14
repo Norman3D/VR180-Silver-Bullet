@@ -224,6 +224,8 @@ pub struct App {
     three_d: ThreeDDisplay,
     /// Last snapshot result for the status bar: (message, when).
     snapshot_status: Option<(String, std::time::Instant)>,
+    /// A snapshot waiting for the export-size still of the paused frame.
+    snapshot_pending: Option<SnapshotReq>,
     /// Key (frame+settings) the current `full_res_display` was rendered for.
     full_res_key: u64,
     /// Key (frame+settings) we currently *want* a still for. While this
@@ -578,6 +580,8 @@ fn tr(en: &'static str) -> &'static str {
         "Save this frame as a JPEG in the export folder (S)" => "把当前帧存为 JPEG 到导出文件夹（S）",
         "Nothing to snapshot yet" => "还没有可截图的画面",
         "Saved" => "已保存",
+        "Rendering snapshot" => "正在渲染截图",
+        "preview size — full-size still never arrived" => "预览尺寸——未能获得全尺寸画面",
         "Snapshot failed" => "截图失败",
         "3D display" => "3D 显示器",
         "Show the stereo pair on a side-by-side 3D monitor or AR glasses that appear as one wide screen (3840×1080): left eye in the left half, right eye in the right. Goes fullscreen on that screen automatically when one is connected; otherwise opens a window to drag onto it (F = fullscreen). Esc closes it." => "在以单个宽屏（3840×1080）形式出现的左右格式 3D 显示器或 AR 眼镜上显示立体画面：左半为左眼，右半为右眼。检测到这样的屏幕时自动在其上全屏；否则打开一个窗口，拖到该屏幕后按 F 全屏。按 Esc 关闭。",
@@ -861,6 +865,13 @@ fn fit_aspect(outer: egui::Rect, aspect: f32) -> egui::Rect {
     egui::Rect::from_center_size(outer.center(), egui::vec2(w, h))
 }
 
+/// A snapshot in flight: the still path renders the paused frame at the
+/// export's per-eye size `out`; `poll_snapshot` writes it once it lands.
+struct SnapshotReq {
+    out: (u32, u32),
+    since: std::time::Instant,
+}
+
 #[derive(Default)]
 struct FpsStats {
     frames_in_window: u32,
@@ -1089,6 +1100,7 @@ impl App {
             full_res_display: None,
             three_d: ThreeDDisplay::default(),
             snapshot_status: None,
+            snapshot_pending: None,
             full_res_key: 0,
             full_res_desired_key: 0,
             full_res_rendered_at: std::time::Instant::now(),
@@ -2193,7 +2205,12 @@ impl App {
         let gen = self.control.as_ref()
             .map(|c| c.settings_generation.load(Ordering::SeqCst)).unwrap_or(0);
         let ts_ms = (ts * 1000.0).round() as i64 as u64;
-        let key = ts_ms.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(gen).max(1);
+        // A pending snapshot renders at the export eye size — fold it into
+        // the key so the still re-renders at that size, and back at native
+        // once the snapshot is written.
+        let snap_out = self.snapshot_pending.as_ref().map(|r| r.out);
+        let snap_salt = snap_out.map(|(w, h)| ((w as u64) << 32) | h as u64).unwrap_or(0);
+        let key = (ts_ms.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(gen) ^ snap_salt).max(1);
 
         self.full_res_desired_key = key;
 
@@ -2258,7 +2275,7 @@ impl App {
         let pipeline = self.pipeline.clone(); // Arc — avoids borrowing self twice
         let settings = self.settings.clone();
         let rendered = self.detail_cache.as_mut().unwrap()
-            .render(&pipeline, ts, &settings, 0);
+            .render(&pipeline, ts, &settings, 0, snap_out);
         if rendered.is_none() {
             // Decoding (or a transient failure) — keep the live preview up
             // and poll again shortly.
@@ -3030,6 +3047,7 @@ impl App {
             detected_calib: parking_lot::Mutex::new(None),
             want_detail: std::sync::atomic::AtomicBool::new(false),
             detail_tx: parking_lot::Mutex::new(Some(detail_tx)),
+            detail_out: parking_lot::Mutex::new(None),
             finished: std::sync::atomic::AtomicBool::new(false),
             imu_ready: std::sync::atomic::AtomicBool::new(false),
             imu_progress: Default::default(),
@@ -3296,6 +3314,7 @@ impl App {
     fn wants_full_res_still(&self) -> bool {
         self.preview_zoom > 1.001
             || matches!(self.settings.fisheye_output_mode, crate::decoder::FisheyeOutputMode::Reframe)
+            || self.snapshot_pending.is_some()
     }
 
     /// Diff `self.settings` against `last_pushed_settings`; if changed,
@@ -3756,8 +3775,9 @@ impl eframe::App for App {
         if self.update_installing {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-        // Drive the full-res still for the zoom magnifier.
+        // Drive the full-res still for the zoom magnifier (and snapshots).
         self.poll_full_res(ctx);
+        self.poll_snapshot(ctx);
         // Import merge/individual prompt (shown when a multi-file recording
         // is picked). Modal-ish: it sits on top until resolved.
         self.draw_import_prompt(ctx);
@@ -3818,7 +3838,7 @@ impl eframe::App for App {
         }
         if let Some(t) = pending_trim_in  { self.set_trim_in(t); }
         if let Some(t) = pending_trim_out { self.set_trim_out(t); }
-        if pending_snapshot { self.save_snapshot(); }
+        if pending_snapshot { self.request_snapshot(); }
 
         // ─── Top toolbar (file + preview-size only; transport is bottom) ─
         egui::TopBottomPanel::top("toolbar")
@@ -4144,7 +4164,7 @@ impl eframe::App for App {
                         .on_hover_text(tr("Save this frame as a JPEG in the export folder (S)"))
                         .clicked()
                     {
-                        self.save_snapshot();
+                        self.request_snapshot();
                     }
                 });
                 ui.separator();
@@ -4553,22 +4573,88 @@ impl App {
         if close { self.disable_3d_display(); }
     }
 
-    /// Quick snapshot: save the frame on screen as a 92 % JPEG in the export
-    /// output folder (or next to the source when none is set), named
-    /// `<source stem>_frame<N>.jpg`. Uses the native-resolution still when
-    /// one is showing (paused + zoomed), else the live preview texture — so
-    /// the file matches what the preview shows, grade and all.
-    fn save_snapshot(&mut self) {
-        let cur_ts = self.current_display.as_ref().map(|d| d.timestamp_s).unwrap_or(0.0);
-        let full_res_ok = !self.playing && self.full_res_display.as_ref()
-            .map(|d| (d.timestamp_s - cur_ts).abs() < 0.02).unwrap_or(false);
-        let Some(d) = (if full_res_ok { self.full_res_display.as_ref() } else { self.current_display.as_ref() })
-            .map(|d| (d.texture.clone(), d.width, d.height, d.frame_idx))
-        else {
+    /// Per-eye output size the export would use right now — the same
+    /// derivation as the export config builder: source eye dims (EAC: the
+    /// native cross square), 4096² for the 8K target, or the reframed
+    /// per-eye size. Snapshots render the paused frame at exactly this.
+    fn export_eye_dims(&self) -> (u32, u32) {
+        let Some(clip) = self.clip.as_ref() else { return (0, 0); };
+        let kind = clip.source_kind;
+        let (mut ew, mut eh) = if clip.fisheye_eye_w > 0 {
+            (clip.fisheye_eye_w, clip.fisheye_eye_h)
+        } else if kind.is_eac() {
+            let cross_w = 2 * (clip.width.saturating_sub(1920) / 4) + 1920;
+            (cross_w.max(512), cross_w.max(512))
+        } else {
+            (clip.width.max(512), clip.height.max(512))
+        };
+        if self.export_opts.resolution == ExportResolution::R8k {
+            ew = 4096;
+            eh = 4096;
+        }
+        match self.settings.fisheye_output_mode {
+            crate::decoder::FisheyeOutputMode::Reframe =>
+                self.export_opts.reframe_size.eye_dims(self.settings.reframe_aspect),
+            crate::decoder::FisheyeOutputMode::Fisheye => { let side = ew.min(eh); (side, side) }
+            crate::decoder::FisheyeOutputMode::HalfEquirect => (ew, eh),
+        }
+    }
+
+    /// Snapshot (📷 / `S`): save the frame on screen at the EXPORT's
+    /// resolution — native / 8K for VR180, the chosen per-eye size for
+    /// Reframed — as a 92 % JPEG in the export output folder, named
+    /// `<source stem>_frame<N>.jpg`. The full-size render comes from the
+    /// zoom-still path, which needs the decoder paused on the frame, so a
+    /// snapshot mid-playback pauses there first; `poll_snapshot` writes the
+    /// file when the still lands (or falls back to the preview texture if it
+    /// never does).
+    fn request_snapshot(&mut self) {
+        if self.current_display.is_none() || self.loaded_path.is_none() {
             self.snapshot_status = Some((tr("Nothing to snapshot yet").to_string(), std::time::Instant::now()));
             return;
+        }
+        if self.playing { self.toggle_play_pause(); }
+        let out = self.export_eye_dims();
+        if let Some(c) = &self.control {
+            // EAC: the decoder renders the still — ask for the export size and
+            // bump the generation so it re-renders even on an unchanged frame.
+            *c.detail_out.lock() = Some(out);
+            c.settings_generation.fetch_add(1, Ordering::SeqCst);
+        }
+        self.snapshot_pending = Some(SnapshotReq { out, since: std::time::Instant::now() });
+        self.snapshot_status = Some((format!("{}…", tr("Rendering snapshot")), std::time::Instant::now()));
+    }
+
+    /// Write the pending snapshot once the export-size still of the paused
+    /// frame is showing; after 15 s without one, save the preview texture
+    /// instead and say so.
+    fn poll_snapshot(&mut self, ctx: &egui::Context) {
+        let Some((out, since)) = self.snapshot_pending.as_ref().map(|r| (r.out, r.since)) else { return; };
+        let cur = self.current_display.as_ref().map(|d| (d.timestamp_s, d.frame_idx));
+        let ready = match (&self.full_res_display, cur) {
+            (Some(f), Some((ts, _))) =>
+                (f.timestamp_s - ts).abs() < 0.02 && f.width == out.0 * 2 && f.height == out.1,
+            _ => false,
         };
-        let (tex, w, h, frame_idx) = d;
+        let timed_out = since.elapsed().as_secs_f32() > 15.0;
+        if !ready && !timed_out {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        self.snapshot_pending = None;
+        if let Some(c) = &self.control {
+            *c.detail_out.lock() = None;
+            c.settings_generation.fetch_add(1, Ordering::SeqCst);
+        }
+        let frame = if ready { self.full_res_display.as_ref() } else { self.current_display.as_ref() }
+            .map(|d| (d.texture.clone(), d.width, d.height));
+        let frame_idx = cur.map(|c| c.1).unwrap_or(0);
+        if let Some((tex, w, h)) = frame {
+            self.write_snapshot(tex, w, h, frame_idx, !ready);
+        }
+    }
+
+    fn write_snapshot(&mut self, tex: Arc<wgpu::Texture>, w: u32, h: u32, frame_idx: u32, preview_fallback: bool) {
         let Some(src) = self.loaded_path.clone() else { return; };
         let dir = self.batch_out_dir.clone()
             .or_else(|| src.parent().map(|p| p.to_path_buf()))
@@ -4590,8 +4676,13 @@ impl App {
         })();
         let msg = match result {
             Ok(()) => {
-                tracing::info!("snapshot: {} ({w}×{h})", path.display());
-                format!("{} {}", tr("Saved"), path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default())
+                tracing::info!("snapshot: {} ({w}×{h}, preview_fallback={preview_fallback})", path.display());
+                let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                if preview_fallback {
+                    format!("{} {name} ({w}×{h}, {})", tr("Saved"), tr("preview size — full-size still never arrived"))
+                } else {
+                    format!("{} {name} ({w}×{h})", tr("Saved"))
+                }
             }
             Err(e) => {
                 tracing::warn!("snapshot failed: {e:#}");

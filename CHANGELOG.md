@@ -7,8 +7,11 @@
   hotkey): saves the
   frame on screen — grade, stabilization, reframe and all — as a 92 %
   JPEG in the export output folder (next to the source when none is
-  set), named `<source>_frame<N>.jpg`. Uses the native-resolution still
-  when one is showing (paused + zoomed), else the live preview.
+  set), named `<source>_frame<N>.jpg` (a second shot of the same frame
+  gets `-2`, `-3`, …, so several reframed compositions of one frame all
+  keep). Rendered at the **export's resolution** — native / 8K for
+  VR180, the chosen per-eye size for Reframed — through the full-detail
+  still path; a snapshot mid-playback pauses on that frame first.
 
 ### 3D display output (new)
 - **"3D display" toggle** in the toolbar: shows the stereo pair on a

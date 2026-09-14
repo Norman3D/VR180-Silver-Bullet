@@ -909,6 +909,11 @@ pub struct DecoderControl {
     /// Sender for the native-res zoom stills (see `want_detail`). Installed
     /// by the UI at decoder spawn; `None` for paths that never produce them.
     pub detail_tx: parking_lot::Mutex<Option<Sender<DecodedFrame>>>,
+    /// Snapshot request: render the zoom still at exactly this per-eye size
+    /// (the export's eye dims) instead of native. Read by the EAC decoder's
+    /// detail render; fisheye stills take the same override via
+    /// `DetailCache::render`. `None` = native, as for the magnifier.
+    pub detail_out: parking_lot::Mutex<Option<(u32, u32)>>,
     /// Set true by the spawning thread once `start_decoder` returns (clean
     /// EOS, error, or Stop). The UI watches this so that a decoder which dies
     /// *before* delivering its first frame — e.g. a transient failure on a
@@ -3626,12 +3631,16 @@ fn render_zoom_detail(
     let fisheye_out = matches!(s.fisheye_output_mode, FisheyeOutputMode::Fisheye);
     let (rl, rr) = apply_view_adjust(&s, rl, rr);
     let (lens_l, lens_r) = resolve_eac_lens_pair(&s, geoc);
+    // A pending snapshot asks for the export's exact eye size.
+    let out_override = *control.detail_out.lock();
     let (dl, dr) = if fisheye_out {
-        (pipeline.project_cross_texture_to_fisheye_texture(cross_b, detail_eye, detail_eye, rl, sl, &lens_l)?,
-         pipeline.project_cross_texture_to_fisheye_texture(cross_a, detail_eye, detail_eye, rr, sr, &lens_r)?)
+        let side = out_override.map(|(w, h)| w.min(h)).unwrap_or(detail_eye);
+        (pipeline.project_cross_texture_to_fisheye_texture(cross_b, side, side, rl, sl, &lens_l)?,
+         pipeline.project_cross_texture_to_fisheye_texture(cross_a, side, side, rr, sr, &lens_r)?)
     } else {
         // A reframed view keeps the width and takes its aspect.
-        let (dw, dh) = preview_out_dims(s.fisheye_output_mode, s.reframe_aspect, detail_eye, detail_eye);
+        let (dw, dh) = out_override.unwrap_or_else(||
+            preview_out_dims(s.fisheye_output_mode, s.reframe_aspect, detail_eye, detail_eye));
         (pipeline.project_cross_texture_to_equirect_texture(cross_b, dw, dh, rl, sl, &lens_l)?,
          pipeline.project_cross_texture_to_equirect_texture(cross_a, dw, dh, rr, sr, &lens_r)?)
     };
@@ -4728,13 +4737,15 @@ impl DetailCache {
     ///   • `None` when the frame isn't decoded yet — a background decode is
     ///     (re)requested and the caller keeps the live preview up + retries.
     /// `out_cap` bounds the OUTPUT resolution (source is always native);
-    /// `0` = native full detail.
+    /// `0` = native full detail. `out_eye` renders at exactly that per-eye
+    /// size instead (snapshots at the export size).
     pub fn render(
         &mut self,
         pipeline: &Device,
         timestamp: f64,
         s: &Settings,
         out_cap: u32,
+        out_eye: Option<(u32, u32)>,
     ) -> Option<(wgpu::Texture, u32, u32)> {
         // Pick up any freshly-decoded native pair from the worker.
         while let Ok((ts_ms, pair)) = self.res_rx.try_recv() {
@@ -4770,7 +4781,7 @@ impl DetailCache {
         // Project + color + compose on THIS (main) thread (≈10 ms).
         render_still_from_pair(
             pipeline, self.kind, s, self.fps, pair,
-            imu.as_deref(), self.cached_stab.as_deref(), out_cap,
+            imu.as_deref(), self.cached_stab.as_deref(), out_cap, out_eye,
         ).ok().flatten()
     }
 }
@@ -4913,6 +4924,7 @@ fn render_still_from_pair(
     imu: Option<&vr180_fisheye::DjiOsvImu>,
     stab_rotations: Option<&[EquirectRotation]>,
     out_cap: u32,
+    out_eye: Option<(u32, u32)>,
 ) -> anyhow::Result<Option<(wgpu::Texture, u32, u32)>> {
     let (src_w, src_h) = (pair.eye_w, pair.eye_h);
     let (calib_left, calib_right) =
@@ -4959,7 +4971,9 @@ fn render_still_from_pair(
     let (left_tex, right_tex) = match s.fisheye_output_mode {
         FisheyeOutputMode::HalfEquirect | FisheyeOutputMode::Reframe => {
             // A reframed view keeps the working width and takes its aspect.
-            let (oeq_w, oeq_h) = preview_out_dims(s.fisheye_output_mode, s.reframe_aspect, oeq_w, oeq_h);
+            // A snapshot renders at the export's exact eye size instead.
+            let (oeq_w, oeq_h) = out_eye.unwrap_or_else(||
+                preview_out_dims(s.fisheye_output_mode, s.reframe_aspect, oeq_w, oeq_h));
             if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                 (pipeline.project_fisheye_to_equirect_rs_texture(&pair.left, src_w, src_h, oeq_w, oeq_h, rot_left, calib_left, rs_l, 20)?,
                  pipeline.project_fisheye_to_equirect_rs_texture(&pair.right, src_w, src_h, oeq_w, oeq_h, rot_right, calib_right, rs_r, 21)?)
@@ -4969,6 +4983,7 @@ fn render_still_from_pair(
             }
         }
         FisheyeOutputMode::Fisheye => {
+            let oside = out_eye.map(|(w, h)| w.min(h)).unwrap_or(oside);
             if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                 (pipeline.project_fisheye_to_fisheye_rs_texture(&pair.left, src_w, src_h, oside, oside, rot_left, calib_left, rs_l)?,
                  pipeline.project_fisheye_to_fisheye_rs_texture(&pair.right, src_w, src_h, oside, oside, rot_right, calib_right, rs_r)?)
