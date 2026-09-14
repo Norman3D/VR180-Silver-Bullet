@@ -30,7 +30,7 @@ struct FisheyeCalibUniforms {
     k1: f32, k2: f32, k3: f32, k4: f32,
     theta_trans: f32, theta_max: f32, r_max: f32, k5: f32,
     src_w: f32, src_h: f32, output_hfov_rad: f32, _pad2: f32,
-    p1: f32, p2: f32, xi: f32, _pad4: f32,        // xi > 0 selects the unified camera model
+    p1: f32, p2: f32, xi: f32, src_proj: f32,     // xi > 0 selects the unified camera model; src_proj > 0.5 = half-equirect input (no lens model)
     ta: f32, tb: f32, tc: f32, te: f32,            // UCM tangential: (r²+2x²)(ta + tc r²) + 2xy(tb + te r²)
     s1: f32, s2: f32, s3: f32, s4: f32,            // UCM thin prism: x += s1 r² + s2 r⁴, y += s3 r² + s4 r⁴
 }
@@ -123,7 +123,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // normalized point AFTER the radial KB. p1=p2=0 → identical to before.
     var src_x: f32;
     var src_y: f32;
-    if (cal.xi > 0.0) {
+    if (cal.src_proj > 0.5) {
+        // Half-equirect input (a VR180 SBS file that is already dewarped —
+        // the fisheye dewarp toggle is off): the eye spans 180° × 180°, so
+        // the rotated ray maps straight to (lon, lat) with no lens model.
+        // Identity resample for the default 180° output + identity rotation.
+        let lon = atan2(xn, zn);
+        let lat = asin(clamp(yn, -1.0, 1.0));
+        src_x = (0.5 + lon / PI) * cal.src_w;
+        src_y = (0.5 - lat / PI) * cal.src_h;
+    } else if (cal.xi > 0.0) {
         // Unified camera model (Insta360 factory calibration): the ray is
         // projected onto the plane n = sinθ / (ξ + cosθ); then an even radial
         // polynomial in n² (k1..k5), tangential terms whose strength grows

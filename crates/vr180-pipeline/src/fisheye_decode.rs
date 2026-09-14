@@ -323,6 +323,11 @@ pub struct SbsFisheyeIter {
     eye_h: u32,
     frame_limit: u32,
     frames_yielded: u32,
+    /// Output bit depth (8 = RGBA8, 16 = RGBA64LE). Export passes 16 so a
+    /// 10-bit SBS source keeps its precision through the scaler — and so
+    /// the 16-bit projection kernels get the 8-bytes/px buffer they
+    /// expect (an 8-bit pair fed to them overruns `write_texture`).
+    output_bit_depth: u8,
     /// Frames-per-second from the stream metadata. Used to convert
     /// PTS ticks to seconds when the packet stream lacks pts info.
     time_base_s: f64,
@@ -342,7 +347,21 @@ impl std::fmt::Debug for SbsFisheyeIter {
 impl SbsFisheyeIter {
     /// Open an SBS fisheye file. `hw` controls VideoToolbox decode
     /// (Auto = use VT on macOS if available, fall back to software).
-    pub fn new(path: &Path, _hw: HwDecode, frame_limit: u32) -> Result<Self> {
+    /// Yields 8-bit RGBA pairs (the preview path).
+    pub fn new(path: &Path, hw: HwDecode, frame_limit: u32) -> Result<Self> {
+        Self::new_with_bit_depth(path, hw, frame_limit, 8)
+    }
+
+    /// [`SbsFisheyeIter::new`] with the pair bit depth chosen: 8 (RGBA8)
+    /// or 16 (RGBA64LE, what the export's 10-bit arms consume).
+    pub fn new_with_bit_depth(
+        path: &Path, _hw: HwDecode, frame_limit: u32, output_bit_depth: u8,
+    ) -> Result<Self> {
+        if output_bit_depth != 8 && output_bit_depth != 16 {
+            return Err(Error::Ffmpeg(format!(
+                "SbsFisheyeIter: bit_depth must be 8 or 16, got {output_bit_depth}"
+            )));
+        }
         ffmpeg_init();
         let ictx = ffmpeg_next::format::input(path)
             .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
@@ -382,6 +401,7 @@ impl SbsFisheyeIter {
             ictx, video_idx, decoder, scaler: None,
             eye_w, eye_h,
             frame_limit, frames_yielded: 0,
+            output_bit_depth,
             time_base_s,
         })
     }
@@ -405,7 +425,7 @@ impl FisheyePairIter for SbsFisheyeIter {
                 return Ok(Some(FisheyePair {
                     left, right,
                     eye_w: self.eye_w, eye_h: self.eye_h,
-                    bit_depth: 8,
+                    bit_depth: self.output_bit_depth,
                     pts_s,
                 }));
             }
@@ -427,7 +447,7 @@ impl FisheyePairIter for SbsFisheyeIter {
                         return Ok(Some(FisheyePair {
                             left, right,
                             eye_w: self.eye_w, eye_h: self.eye_h,
-                            bit_depth: 8,
+                            bit_depth: self.output_bit_depth,
                             pts_s,
                         }));
                     }
@@ -452,8 +472,9 @@ impl FisheyePairIter for SbsFisheyeIter {
 }
 
 impl SbsFisheyeIter {
-    /// Scale to RGBA8 and split the frame down the middle. Returns
-    /// (left_rgba, right_rgba), each `eye_w × eye_h × 4`.
+    /// Scale to RGBA8 (or RGBA64LE at `output_bit_depth` 16) and split the
+    /// frame down the middle. Returns (left, right), each
+    /// `eye_w × eye_h × (4 | 8)` bytes.
     fn repack_split(
         &mut self,
         decoded: &mut ffmpeg_next::frame::Video,
@@ -461,6 +482,21 @@ impl SbsFisheyeIter {
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         let frame_w = decoded.width();
         let frame_h = decoded.height();
+        // Same scaler configuration as the dual-stream iterator: 16-bit
+        // output needs the full-accuracy swscale path (BICUBIC +
+        // FULL_CHR_H_INT); 8-bit keeps the fast bilinear one.
+        let is_16bit = self.output_bit_depth == 16;
+        let target_pix_fmt = if is_16bit {
+            ffmpeg_next::format::Pixel::RGBA64LE
+        } else {
+            ffmpeg_next::format::Pixel::RGBA
+        };
+        let scaler_flags = if is_16bit {
+            ffmpeg_next::software::scaling::Flags::BICUBIC
+                | ffmpeg_next::software::scaling::Flags::FULL_CHR_H_INT
+        } else {
+            ffmpeg_next::software::scaling::Flags::FAST_BILINEAR
+        };
         let scaler = match &mut self.scaler {
             Some(s) => s,
             None => {
@@ -468,9 +504,9 @@ impl SbsFisheyeIter {
                     ffmpeg_next::software::scaling::Context::get(
                         decoded.format(),
                         frame_w, frame_h,
-                        ffmpeg_next::format::Pixel::RGBA,
+                        target_pix_fmt,
                         frame_w, frame_h,
-                        ffmpeg_next::software::scaling::Flags::FAST_BILINEAR,
+                        scaler_flags,
                     ).map_err(|e| Error::Ffmpeg(format!("scaler: {e}")))?
                 );
                 self.scaler.as_mut().unwrap()
@@ -486,14 +522,15 @@ impl SbsFisheyeIter {
         let data = rgba_frame.data(0);
         let eye_w = self.eye_w as usize;
         let eye_h = self.eye_h as usize;
-        let mut left = Vec::with_capacity(eye_w * eye_h * 4);
-        let mut right = Vec::with_capacity(eye_w * eye_h * 4);
+        let bpp = if is_16bit { 8 } else { 4 };
+        let mut left = Vec::with_capacity(eye_w * eye_h * bpp);
+        let mut right = Vec::with_capacity(eye_w * eye_h * bpp);
         for y in 0..eye_h {
             let row_start = y * stride;
-            // Each row is 2*eye_w pixels = 8*eye_w bytes.
+            // Each row is 2*eye_w pixels = 2*eye_w*bpp bytes.
             let left_start = row_start;
-            let left_end = row_start + eye_w * 4;
-            let right_end = row_start + 2 * eye_w * 4;
+            let left_end = row_start + eye_w * bpp;
+            let right_end = row_start + 2 * eye_w * bpp;
             left.extend_from_slice(&data[left_start..left_end]);
             right.extend_from_slice(&data[left_end..right_end]);
         }

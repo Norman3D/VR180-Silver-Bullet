@@ -2023,7 +2023,11 @@ struct FisheyeCalibUniforms {
     // k1..k5 then form the even radial polynomial on the UCM plane and the
     // two rows below carry its tangential (ta,tb,tc,te) and thin-prism
     // (s1..s4) terms. 0 → Kannala-Brandt + Brown-Conrady (p1,p2) as before.
-    p1: f32, p2: f32, xi: f32, _pad4: f32,
+    // src_proj > 0.5 bypasses the lens model entirely: the eye image is an
+    // already-dewarped 180°×180° half-equirect (a VR180 SBS file with the
+    // fisheye dewarp turned off) and the rotated ray maps straight to
+    // (lon, lat). Reuses the old `_pad4` slot — layout unchanged.
+    p1: f32, p2: f32, xi: f32, src_proj: f32,
     ta: f32, tb: f32, tc: f32, te: f32,
     s1: f32, s2: f32, s3: f32, s4: f32,
     // vec4 #7 — reframed-view output (proj_mode 1): k of the k-projection
@@ -2099,6 +2103,12 @@ pub struct FisheyeCalib {
     /// horizontal / vertical frame edges.
     pub edge_x: f32,
     pub edge_y: f32,
+    /// Input projection: 0 = fisheye lens model (KB / UCM above), 1 = the
+    /// eye image is already a 180°×180° half-equirect (generic VR180 SBS
+    /// input with the fisheye dewarp off) — the shaders skip the lens model
+    /// and look the rotated ray up by (lon, lat). See
+    /// [`FisheyeCalib::with_equirect_input`].
+    pub src_proj: f32,
 }
 
 /// Defish amount (0..=1) → `k` of the k-projection `r = k·tan(θ/k)`:
@@ -2156,6 +2166,7 @@ impl FisheyeCalib {
             r_max, src_w, src_h,
             output_hfov_rad: std::f32::consts::FRAC_PI_2,
             proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
+            src_proj: 0.0,
         }
     }
 
@@ -2193,6 +2204,7 @@ impl FisheyeCalib {
             src_w, src_h,
             output_hfov_rad: std::f32::consts::FRAC_PI_2,
             proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
+            src_proj: 0.0,
         }
     }
 
@@ -2239,6 +2251,7 @@ impl FisheyeCalib {
             src_w, src_h,
             output_hfov_rad: std::f32::consts::FRAC_PI_2,
             proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
+            src_proj: 0.0,
         }
     }
 
@@ -2267,6 +2280,16 @@ impl FisheyeCalib {
         self.edge_y = ex / aspect_w_over_h.max(0.05);
         self
     }
+
+    /// Treat the eye image as an already-dewarped 180°×180° half-equirect
+    /// instead of a fisheye: the lens fields are ignored and the shaders
+    /// sample by (lon, lat). With the default 180° half-equirect output and
+    /// an identity rotation this is an identity resample; the reframed view
+    /// and the fisheye output target project correctly from it.
+    pub fn with_equirect_input(mut self) -> Self {
+        self.src_proj = 1.0;
+        self
+    }
 }
 
 impl FisheyeCalibUniforms {
@@ -2281,7 +2304,7 @@ impl FisheyeCalibUniforms {
             src_w: c.src_w, src_h: c.src_h,
             output_hfov_rad: c.output_hfov_rad,
             _pad2: 0.0,
-            p1: c.p1, p2: c.p2, xi: c.xi, _pad4: 0.0,
+            p1: c.p1, p2: c.p2, xi: c.xi, src_proj: c.src_proj,
             ta: c.tangential[0], tb: c.tangential[1], tc: c.tangential[2], te: c.tangential[3],
             s1: c.prism[0], s2: c.prism[1], s3: c.prism[2], s4: c.prism[3],
             proj_mode: c.proj_mode, defish_k: c.defish_k, edge_x: c.edge_x, edge_y: c.edge_y,

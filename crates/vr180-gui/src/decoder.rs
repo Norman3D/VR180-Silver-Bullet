@@ -222,6 +222,14 @@ pub struct Settings {
     /// file extension (`.osv` → DJI Osmo 360, `.braw` → Pyxis 12K).
     /// Any other value must match a preset in `vr180_fisheye::presets`.
     pub fisheye_preset: String,
+    /// Generic side-by-side `.mp4` / `.mov` only (`SourceKind::SbsFisheye`).
+    /// `true`: each half is a raw fisheye image — dewarp it with the lens
+    /// settings below. `false` (default): the file is an already-dewarped
+    /// VR180 half-equirect SBS and is used as-is (no lens model), so a
+    /// finished VR180 export can be reframed / re-aligned / re-graded
+    /// without a second dewarp distorting it. Ignored for `.360` / `.osv` /
+    /// `.insv`. Struct-level `#[serde(default)]` → old files load `false`.
+    pub sbs_dewarp_fisheye: bool,
     /// Per-eye manual-override master switch. When OFF, that eye uses the
     /// in-file (OSV protobuf) / preset calibration and ALL the manual
     /// fields below are ignored. When ON, the eye is fully described by
@@ -401,6 +409,7 @@ impl Default for Settings {
             trim_in_s: None,
             trim_out_s: None,
             fisheye_preset: String::new(),
+            sbs_dewarp_fisheye: false,
             fisheye_override_left: false,
             fisheye_override_right: false,
             // Fresh settings never carry stale pre-feature EAC Override
@@ -3478,6 +3487,14 @@ pub(crate) fn resolve_fisheye_calib_pair(
                     s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right),
             )
         }
+    };
+
+    // Generic SBS with the fisheye dewarp off: the halves are already
+    // half-equirect — bypass the lens model (mirrors the export resolver).
+    let (calib_l, calib_r) = if kind == vr180_pipeline::SourceKind::SbsFisheye && !s.sbs_dewarp_fisheye {
+        (calib_l.with_equirect_input(), calib_r.with_equirect_input())
+    } else {
+        (calib_l, calib_r)
     };
 
     // Equidistant FISHEYE output target: set the output half-FOV so the

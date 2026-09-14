@@ -295,6 +295,20 @@ impl ReframeSize {
         let (w, h) = self.eye_dims(aspect);
         format!("{} × {}  ({w} × {h} per eye)", 2 * w, h)
     }
+    /// Recommended H.265 average bitrate (Mbps) for a reframed export of
+    /// this size: ~0.28 bits per pixel per frame over the side-by-side
+    /// frame at 30 fps, ×1.5 at 60 fps (linear between, flat below 30),
+    /// rounded to 5 and kept inside the slider's 10..=300 range. A flat
+    /// rectilinear frame is ordinary video — every pixel is seen and none
+    /// are stretched — so it needs a fraction of the VR180 rate:
+    /// 3840×1080 → 35, 5120×1440 → 60, 7680×2160 → 140 Mbps at 30 fps.
+    fn recommended_bitrate_mbps(self, aspect: crate::decoder::ReframeAspect, fps: f32) -> u32 {
+        let (w, h) = self.eye_dims(aspect);
+        let pixels = (2 * w * h) as f32;
+        let fps_factor = 1.0 + 0.5 * ((fps - 30.0) / 30.0).clamp(0.0, 1.0);
+        let mbps = pixels * 30.0 * 0.28 * fps_factor / 1.0e6;
+        (((mbps / 5.0).round() as u32) * 5).clamp(10, 300)
+    }
 }
 
 impl ExportCodec {
@@ -335,8 +349,18 @@ struct ExportOptions {
     codec: ExportCodec,
     /// Output resolution target (Native / 8192×4096).
     resolution: ExportResolution,
-    /// H.265 average bitrate in Mbps. Range 20..=500.
+    /// H.265 average bitrate in Mbps for VR180 output. Range 20..=500.
     h265_bitrate_mbps: u32,
+    /// H.265 average bitrate in Mbps for REFRAMED (Flat 3D) output. Range
+    /// 10..=300, kept apart from the VR180 rate: a flat rectilinear frame
+    /// needs a fraction of what a half-equirect does, and the two must not
+    /// bleed into each other when the Format switches.
+    reframe_bitrate_mbps: u32,
+    /// `false` → the reframed rate follows the size / aspect / frame-rate
+    /// recommendation (`ReframeSize::recommended_bitrate_mbps`), re-derived
+    /// per clip at export time. A manual slider change pins the value
+    /// (`true`) until "Use recommended" is pressed.
+    reframe_bitrate_custom: bool,
     /// 8 or 10 (Main / Main10) for H.265.
     h265_bit_depth: u8,
     /// H.265 encoder: hardware (NVIDIA NVENC) vs software (libx265).
@@ -363,12 +387,58 @@ struct ExportOptions {
     beyondvr_scale_pct: f32,
 }
 
+#[cfg(test)]
+mod reframe_bitrate_tests {
+    use super::ReframeSize;
+    use crate::decoder::ReframeAspect;
+
+    #[test]
+    fn recommended_rates_match_the_table() {
+        let cases = [
+            (ReframeSize::P1080, ReframeAspect::Square, 30.0, 20),
+            (ReframeSize::P1080, ReframeAspect::Wide,   30.0, 35),
+            (ReframeSize::P1440, ReframeAspect::Square, 30.0, 35),
+            (ReframeSize::P1440, ReframeAspect::Wide,   30.0, 60),
+            (ReframeSize::P2160, ReframeAspect::Square, 30.0, 80),
+            (ReframeSize::P2160, ReframeAspect::Wide,   30.0, 140),
+            (ReframeSize::P1080, ReframeAspect::Wide,   60.0, 50),
+            (ReframeSize::P2160, ReframeAspect::Wide,   60.0, 210),
+            (ReframeSize::P1080, ReframeAspect::Square, 24.0, 20), // flat below 30 fps
+        ];
+        for (sz, aspect, fps, want) in cases {
+            assert_eq!(sz.recommended_bitrate_mbps(aspect, fps), want, "{sz:?} {aspect:?} @ {fps}");
+        }
+        // Always inside the slider's range.
+        for sz in [ReframeSize::P1080, ReframeSize::P1440, ReframeSize::P2160] {
+            for fps in [23.976_f32, 30.0, 50.0, 59.94, 120.0] {
+                let r = sz.recommended_bitrate_mbps(ReframeAspect::Wide, fps);
+                assert!((10..=300).contains(&r) && r % 5 == 0, "{sz:?} @ {fps}: {r}");
+            }
+        }
+    }
+}
+
+impl ExportOptions {
+    /// The H.265 rate an export actually uses: the VR180 slider value, or
+    /// in Reframed mode the reframed rate — the recommendation for this
+    /// size / aspect / `fps` unless the user pinned a custom value.
+    fn effective_h265_mbps(&self, reframe: Option<crate::decoder::ReframeAspect>, fps: f32) -> u32 {
+        match reframe {
+            Some(_) if self.reframe_bitrate_custom => self.reframe_bitrate_mbps,
+            Some(aspect) => self.reframe_size.recommended_bitrate_mbps(aspect, fps),
+            None => self.h265_bitrate_mbps,
+        }
+    }
+}
+
 impl Default for ExportOptions {
     fn default() -> Self {
         Self {
             codec: ExportCodec::H265,
             resolution: ExportResolution::R8k,
             h265_bitrate_mbps: 200,
+            reframe_bitrate_mbps: 35,
+            reframe_bitrate_custom: false,
             h265_bit_depth: 10,
             h265_hardware: true,
             prores_profile: ProResProfile::Standard,
@@ -494,6 +564,10 @@ fn tr(en: &'static str) -> &'static str {
         "View adjust" => "视角调整",
         "View adjustment" => "视角调整",
         "Fisheye lens" => "鱼眼镜头",
+        "Input" => "输入",
+        "Dewarp fisheye input" => "对鱼眼输入去畸变",
+        "On: each half is a raw fisheye image — dewarp it with the Fisheye lens settings. Off (default): the file is already VR180 side-by-side half-equirect and is used as-is." => "开：左右两半是原始鱼眼图像，按“鱼眼镜头”设置去畸变。关（默认）：文件已经是 VR180 左右半等距柱状格式，按原样使用。",
+        "Fisheye dewarp is off for this side-by-side file (Source ▸ Input) — the lens settings below are not applied." => "此左右格式文件已关闭鱼眼去畸变（素材 ▸ 输入）——下方镜头设置不生效。",
         "Output" => "输出",
         "View" => "视图",
         "Click ▶ Play to start preview." => "点击 ▶ 播放以开始预览。",
@@ -533,6 +607,8 @@ fn tr(en: &'static str) -> &'static str {
         "ProRes profile" => "ProRes 配置",
         "VR180 metadata" => "VR180 元数据",
         "H.265 bitrate" => "H.265 码率",
+        "Recommended" => "推荐",
+        "Use recommended" => "使用推荐值",
         "Encoder" => "编码器",
         "10-bit (Main10)" => "10 位 (Main10)",
         "8-bit (Main)" => "8 位 (Main)",
@@ -1286,7 +1362,11 @@ impl App {
         // and is always 10-bit / 12-bit per profile.
         let (bitrate_kbps, bit_depth) = match opts.codec {
             ExportCodec::H265 => (
-                opts.h265_bitrate_mbps.saturating_mul(1000),
+                // Reframed exports take the (much lower) reframed rate,
+                // recommended per clip from its size / aspect / fps unless
+                // the user pinned one; VR180 takes the VR180 slider.
+                opts.effective_h265_mbps(settings.reframe_aspect_if_active(), fps)
+                    .saturating_mul(1000),
                 opts.h265_bit_depth,
             ),
             ExportCodec::ProRes => {
@@ -1334,6 +1414,7 @@ impl App {
             denoise_strength: settings.denoise_strength,
             view_adjust: settings.output_view_adjust(),
             fisheye_preset: settings.fisheye_preset.clone(),
+            sbs_dewarp_fisheye: settings.sbs_dewarp_fisheye,
             fisheye_override_left: settings.fisheye_override_left,
             fisheye_override_right: settings.fisheye_override_right,
             fisheye_fov_deg_left: settings.fisheye_fov_deg_left,
@@ -3242,16 +3323,19 @@ impl App {
             None => tr("next to source").to_string(),
         };
         let has_out_dir = self.batch_out_dir.is_some();
+        let clip_fps = self.clip.as_ref().map(|c| c.fps).unwrap_or(30.0);
         let res_label = match self.settings.reframe_aspect_if_active() {
             Some(aspect) => self.export_opts.reframe_size.label(aspect),
             None => self.export_opts.resolution.label().to_string(),
         };
+        let h265_mbps = self.export_opts.effective_h265_mbps(
+            self.settings.reframe_aspect_if_active(), clip_fps);
         let fmt_label = format!("{} · {}{}{}",
             self.export_opts.codec.label(),
             res_label,
             match self.export_opts.codec {
                 ExportCodec::H265 => format!(" · {} Mbps · {}-bit",
-                    self.export_opts.h265_bitrate_mbps, self.export_opts.h265_bit_depth),
+                    h265_mbps, self.export_opts.h265_bit_depth),
                 ExportCodec::ProRes => format!(" · {}", self.export_opts.prores_profile.label()),
             },
             if self.export_opts.beyondvr_hack && self.settings.reframe_aspect_if_active().is_none() {
@@ -3372,6 +3456,7 @@ impl App {
         // and sliders stay open while you edit them.
         if self.show_export_settings {
             let mut open = true;
+            let clip_fps = self.clip.as_ref().map(|c| c.fps).unwrap_or(30.0);
             egui::Window::new(tr("Export format"))
                 .collapsible(false)
                 .resizable(false)
@@ -3380,7 +3465,7 @@ impl App {
                 .show(ctx, |ui| {
                     ui.set_min_width(360.0);
                     Self::export_options_ui(ui, &mut self.export_opts, "export",
-                        self.settings.reframe_aspect_if_active());
+                        self.settings.reframe_aspect_if_active(), clip_fps);
                 });
             self.show_export_settings = open;
         }
@@ -3392,6 +3477,7 @@ impl App {
     fn export_options_ui(
         ui: &mut egui::Ui, opts: &mut ExportOptions, id_prefix: &str,
         reframe: Option<crate::decoder::ReframeAspect>,
+        fps: f32,
     ) {
         if let Some(aspect) = reframe {
             // Reframed view: the exact viewport at a per-eye size.
@@ -3433,8 +3519,35 @@ impl App {
         match opts.codec {
             ExportCodec::H265 => {
                 ui.label(RichText::new(tr("H.265 bitrate")).strong());
-                ui.add(egui::Slider::new(&mut opts.h265_bitrate_mbps, 20..=500)
-                    .text("Mbps"));
+                if let Some(aspect) = reframe {
+                    // Reframed: its own rate, seeded from the size / aspect /
+                    // frame-rate recommendation until the user pins a value
+                    // (dragging back onto the recommendation un-pins it).
+                    let rec = opts.reframe_size.recommended_bitrate_mbps(aspect, fps);
+                    if !opts.reframe_bitrate_custom {
+                        opts.reframe_bitrate_mbps = rec;
+                    }
+                    if ui.add(egui::Slider::new(&mut opts.reframe_bitrate_mbps, 10..=300)
+                        .text("Mbps")).changed()
+                    {
+                        opts.reframe_bitrate_custom = opts.reframe_bitrate_mbps != rec;
+                    }
+                    let (w, h) = opts.reframe_size.eye_dims(aspect);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!(
+                            "{}: {rec} Mbps · {} × {h} @ {fps:.0} fps", tr("Recommended"), 2 * w,
+                        )).small().color(Color32::GRAY));
+                        if opts.reframe_bitrate_custom
+                            && ui.small_button(tr("Use recommended")).clicked()
+                        {
+                            opts.reframe_bitrate_mbps = rec;
+                            opts.reframe_bitrate_custom = false;
+                        }
+                    });
+                } else {
+                    ui.add(egui::Slider::new(&mut opts.h265_bitrate_mbps, 20..=500)
+                        .text("Mbps"));
+                }
                 ui.add_space(4.0);
                 // 10-bit (Main10) is the default and stays 10-bit
                 // end-to-end; 8-bit (Main) is offered for users who
@@ -4341,6 +4454,22 @@ impl App {
             ui.separator();
         }
         self.draw_source_info(ui);
+
+        // Generic side-by-side .mp4/.mov: raw dual fisheye (needs the lens
+        // dewarp) or an already-dewarped VR180 half-equirect? Off by default
+        // — most SBS files brought in are finished VR180 exports, and
+        // dewarping those a second time distorts them (worst in Reframed).
+        // .360 / .osv / .insv never show this: their lens model is in-file.
+        if matches!(self.clip.as_ref().map(|c| c.source_kind),
+                    Some(vr180_pipeline::SourceKind::SbsFisheye))
+        {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(tr("Input"));
+                ui.checkbox(&mut self.settings.sbs_dewarp_fisheye, tr("Dewarp fisheye input"))
+                    .on_hover_text(tr("On: each half is a raw fisheye image — dewarp it with the Fisheye lens settings. Off (default): the file is already VR180 side-by-side half-equirect and is used as-is."));
+            });
+        }
     }
 
     /// Remove a clip from the list, keeping `active_clip` /
@@ -5122,6 +5251,16 @@ impl App {
         let is_osv = self.clip.as_ref()
             .map(|c| c.source_kind.has_frame_imu())
             .unwrap_or(false);
+        // Generic SBS with the fisheye dewarp off (Source ▸ Input): none of
+        // the lens settings apply — say so and gray the panel out.
+        let sbs_no_dewarp = matches!(self.clip.as_ref().map(|c| c.source_kind),
+                                     Some(vr180_pipeline::SourceKind::SbsFisheye))
+            && !self.settings.sbs_dewarp_fisheye;
+        if sbs_no_dewarp {
+            ui.label(RichText::new(tr("Fisheye dewarp is off for this side-by-side file (Source ▸ Input) — the lens settings below are not applied."))
+                .small().color(Color32::from_rgb(130, 150, 175)));
+            ui.disable();
+        }
         let s = &mut self.settings;
 
         // ── Camera preset — hidden for OSV: the .osv file carries the full

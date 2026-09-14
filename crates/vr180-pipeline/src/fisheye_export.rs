@@ -185,6 +185,14 @@ pub struct FisheyeExportConfig {
     pub fisheye_cx_norm_right: f32,
     pub fisheye_cy_norm_right: f32,
     pub fisheye_swap_eyes: bool,
+    /// Generic side-by-side `.mp4` / `.mov` sources only. `true`: each half
+    /// is a raw fisheye image — dewarp it with the lens fields above.
+    /// `false` (default): the file is an already-dewarped VR180 half-equirect
+    /// SBS and is sampled directly, no lens model (so a finished VR180
+    /// export reframes to Flat 3D without a second dewarp distorting it).
+    /// Ignored for `.360` / `.osv` / `.insv`, whose lens models come from
+    /// the file.
+    pub sbs_dewarp_fisheye: bool,
 
     // ── Trim ──────────────────────────────────────────────────────
     pub trim_in_s: Option<f64>,
@@ -560,8 +568,12 @@ pub(crate) fn fisheye_export_opener(
         Ok(match kind {
             SourceKind::DjiOsv | SourceKind::Insta360Insv => Box::new(DualStreamFisheyeIter::new_with_options(
                 p, crate::decode::HwDecode::Auto, 0, kind.dual_stream_iter_swap(swap_eyes), 0, bd)?),
+            // Bit depth must follow the output codec like the dual-stream
+            // arm above: the 10-bit arms project from RGBA64LE pairs, and an
+            // 8-bit pair there overran `write_texture` (SBS 10-bit exports
+            // failed with a wgpu validation error).
             SourceKind::SbsFisheye => Box::new(
-                SbsFisheyeIter::new(p, crate::decode::HwDecode::Auto, 0)?),
+                SbsFisheyeIter::new_with_bit_depth(p, crate::decode::HwDecode::Auto, 0, bd)?),
             SourceKind::BlackmagicRaw => {
                 let info = vr180_braw::BrawInfo::probe(p)
                     .map_err(|e| Error::Ffmpeg(format!("braw probe: {e}")))?;
@@ -3667,6 +3679,15 @@ pub(crate) fn resolve_calib_pair(
                     cfg.fisheye_cx_norm_right, cfg.fisheye_cy_norm_right, cfg.fisheye_k_right),
             )
         }
+    };
+
+    // Generic SBS with the fisheye dewarp off: the halves are already
+    // half-equirect — bypass the lens model (identity resample for the
+    // default output, a correct (lon, lat) lookup for the reframed view).
+    let (calib_l, calib_r) = if cfg.source_kind == SourceKind::SbsFisheye && !cfg.sbs_dewarp_fisheye {
+        (calib_l.with_equirect_input(), calib_r.with_equirect_input())
+    } else {
+        (calib_l, calib_r)
     };
 
     // Equidistant FISHEYE output target: set the output half-FOV so the

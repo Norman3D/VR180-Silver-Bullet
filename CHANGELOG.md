@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### Reframed (Flat 3D) export bitrate
+- Reframed exports now have their **own H.265 bitrate** (10–300 Mbps),
+  separate from the VR180 rate, **seeded from a per-size recommendation**
+  — about 0.28 bits per pixel per frame at 30 fps, ×1.5 at 60 fps:
+  3840×1080 → 35, 5120×1440 → 60, 7680×2160 → 140 Mbps at 30 fps
+  (20 / 35 / 80 for the 2:1 sizes). The Format window shows the
+  recommendation for the current size and clip frame rate; dragging the
+  slider pins a custom value, "Use recommended" un-pins it. Previously
+  the shared 200 Mbps VR180 default applied to Flat 3D too — 5–15× more
+  than those frames can use.
+
+### Generic side-by-side input
+- **"Dewarp fisheye input" toggle** (Source panel) for plain `.mp4` /
+  `.mov` side-by-side sources. Off by default: the file is taken as an
+  already-dewarped VR180 half-equirect SBS and sampled directly, so a
+  finished VR180 export can be reframed to Flat 3D (or re-aligned /
+  re-graded) without the fisheye dewarp distorting it. Turn it on for raw
+  dual-fisheye SBS recordings, which then use the Fisheye lens settings
+  as before. `.360` / `.osv` / `.insv` are unaffected — their lens model
+  always comes from the file.
+- Fixed: 10-bit (H.265 10-bit / ProRes) exports of a plain side-by-side
+  source failed at the first frame with a wgpu validation error — the
+  SBS decoder always produced 8-bit frames while the 10-bit arms expect
+  16-bit ones. The SBS decoder now follows the output bit depth, so a
+  10-bit SBS source also keeps its precision.
+
 ## 2.5.0
 
 ### Reframed output mode (new)
