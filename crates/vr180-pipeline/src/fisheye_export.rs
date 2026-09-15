@@ -833,8 +833,15 @@ fn export_fisheye_inner(
     // the portable path.
     #[cfg(target_os = "windows")]
     {
+        // Generic SBS (plain .mp4/.mov) rides this arm too since 2.5.x: a
+        // single-stream d3d11va iterator shares the WHOLE converted frame
+        // and the arm splits the halves with two GPU copies — same
+        // projection/color/encode tails. Single-segment only (generic
+        // files don't chain).
+        let src_ok = cfg.source_kind.is_dual_stream()
+            || (cfg.source_kind == SourceKind::SbsFisheye && cfg.segments.len() <= 1);
         let can_try = std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none()
-            && cfg.source_kind.is_dual_stream()
+            && src_ok
             && matches!(cfg.encoder,
                 EncoderBackend::Libx265 | EncoderBackend::HevcNvenc
                 | EncoderBackend::ProResKs)
@@ -844,17 +851,23 @@ fn export_fisheye_inner(
             && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010)
             && cfg.denoise_strength <= 0.0; // denoise needs CPU frames → portable path
         if can_try {
-            // OSV swap-by-default ⊕ user override (matches preview + CPU path).
-            let swap = cfg.source_kind.dual_stream_iter_swap(cfg.fisheye_swap_eyes);
             let ctx = crate::interop_windows::VulkanImportCtx::from_wgpu(
                 &pipeline.adapter, &pipeline.device,
             );
-            // u32::MAX work dims → the iter clamps to native, so the D3D11
-            // P010→RGBA16 convert is 1:1 (full-res export, no quality loss).
-            // Merged recordings chain through the segmented iterator.
-            let iter = crate::fisheye_decode::SegmentedD3d11SharedDualStreamIter::new(
-                &cfg.segments, swap, u32::MAX, u32::MAX,
-            );
+            let iter = if cfg.source_kind == SourceKind::SbsFisheye {
+                crate::fisheye_decode::D3d11SharedSbsIter::new(&cfg.source_path)
+                    .map(crate::fisheye_decode::ZcFisheyeSource::Sbs)
+            } else {
+                // OSV swap-by-default ⊕ user override (matches preview + CPU
+                // path). u32::MAX work dims → the iter clamps to native, so
+                // the D3D11 P010→RGBA16 convert is 1:1 (full-res export, no
+                // quality loss). Merged recordings chain through the
+                // segmented iterator.
+                let swap = cfg.source_kind.dual_stream_iter_swap(cfg.fisheye_swap_eyes);
+                crate::fisheye_decode::SegmentedD3d11SharedDualStreamIter::new(
+                    &cfg.segments, swap, u32::MAX, u32::MAX,
+                ).map(crate::fisheye_decode::ZcFisheyeSource::Dual)
+            };
             match (ctx, iter) {
                 (Some(ctx), Ok(iter)) => {
                     tracing::info!(
@@ -878,8 +891,12 @@ fn export_fisheye_inner(
         } else if std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none() {
             // Landed on the portable serial loop — say WHY (the user-visible
             // symptom is just "export is slow with the GPU idle").
-            let reason = if !cfg.source_kind.is_dual_stream() {
+            let reason = if !cfg.source_kind.is_dual_stream()
+                && cfg.source_kind != SourceKind::SbsFisheye
+            {
                 "no GPU fast path for this source type"
+            } else if cfg.source_kind == SourceKind::SbsFisheye && cfg.segments.len() > 1 {
+                "multi-segment SBS has no GPU fast path"
             } else if !crate::interop_windows::is_vulkan_backend(&pipeline.device) {
                 "DX12 backend (Vulkan unavailable)"
             } else if !pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010) {
@@ -2798,7 +2815,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
     pipeline: Arc<Device>,
     cfg: FisheyeExportConfig,
     ctx: crate::interop_windows::VulkanImportCtx,
-    mut iter: crate::fisheye_decode::SegmentedD3d11SharedDualStreamIter,
+    mut iter: crate::fisheye_decode::ZcFisheyeSource,
     progress_cb: &mut impl FnMut(ExportProgress),
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -2883,7 +2900,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
     // Vulkan device / NVENC's own session), so there's no shared queue to
     // wedge — Lesson #1 stays satisfied. Wall-clock ≈ the slowest stage
     // instead of their sum.
-    use crate::fisheye_decode::SharedFisheyePair;
+    use crate::fisheye_decode::ZcFisheyeFrame;
     // What the main thread hands the encode thread. P010 = the GPU already
     // did RGB→YUV 4:2:0 (NVENC's native input, no swscale); Yuv422 = GPU
     // RGB→YUV 4:2:2 P210 planes (ProRes — deinterleave + >>6 on the encode
@@ -2909,19 +2926,19 @@ fn export_fisheye_osv_zerocopy_d3d11(
             "fisheye_export (zero-copy): prores_ks_vulkan warm = {ok} ({:?})",
             t0.elapsed());
     }
-    let (pair_tx, pair_rx) = std::sync::mpsc::sync_channel::<SharedFisheyePair>(3);
+    let (pair_tx, pair_rx) = std::sync::mpsc::sync_channel::<ZcFisheyeFrame>(3);
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<EncFrame>(2);
     let (fmt_tx, fmt_rx) = std::sync::mpsc::sync_channel::<ZcFeed>(1);
 
     // Decode thread — D3D11 only, never touches wgpu. `iter` was already
-    // trim-seeked above; just pump pairs until EOF, cancel, or the main
+    // trim-seeked above; just pump frames until EOF, cancel, or the main
     // thread drops the receiver (early stop / error).
     let cancel_dec = cancel.clone();
     let mut iter = iter;
     let decode_handle = std::thread::spawn(move || {
         loop {
             if cancel_dec.load(Ordering::SeqCst) { break; }
-            match iter.next_pair() {
+            match iter.next() {
                 Ok(Some(p)) => { if pair_tx.send(p).is_err() { break; } }
                 Ok(None) => break,
                 Err(e) => { tracing::warn!("zc export: decode worker: {e}"); break; }
@@ -3010,18 +3027,19 @@ fn export_fisheye_osv_zerocopy_d3d11(
             tracing::info!("fisheye_export (zero-copy): cancelled at frame {}", frame_idx);
             break;
         }
-        if sp.pts_s.is_finite() && sp.pts_s >= t_out {
-            tracing::info!("fisheye_export (zero-copy): hit trim_out @ {:.3}s", sp.pts_s);
+        let pts_s = sp.pts_s();
+        if pts_s.is_finite() && pts_s >= t_out {
+            tracing::info!("fisheye_export (zero-copy): hit trim_out @ {:.3}s", pts_s);
             break;
         }
         // Drop pre-trim frames (keyframe-backward seek, no decode-forward).
-        if sp.pts_s.is_finite() && sp.pts_s < t_in - 0.5 * dt {
+        if pts_s.is_finite() && pts_s < t_in - 0.5 * dt {
             continue;
         }
 
         // PTS-based stab lookup (same logic as preview + portable path).
-        let stab_idx = if sp.pts_s.is_finite() && sp.pts_s >= 0.0 {
-            (sp.pts_s / dt).round() as usize
+        let stab_idx = if pts_s.is_finite() && pts_s >= 0.0 {
+            (pts_s / dt).round() as usize
         } else { frame_idx as usize };
         let rot = stab_rotations
             .as_ref()
@@ -3050,9 +3068,19 @@ fn export_fisheye_osv_zerocopy_d3d11(
         // pipeline down cleanly rather than unwinding past the join.
         let g0 = std::time::Instant::now();
         let readback: Result<EncFrame> = (|| {
-            // Import both eyes (single-plane RGBA16 aliasing the D3D11 convert).
-            let l_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.left) };
-            let r_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.right) };
+            // Import (single-plane RGBA16 aliasing the D3D11 convert).
+            // Dual-stream sources arrive as two per-eye textures; a generic
+            // SBS frame arrives whole and is split with two GPU copies.
+            let (l_tex, r_tex) = match &sp {
+                ZcFisheyeFrame::Pair(p) => (
+                    unsafe { ctx.import_rgba16(&pipeline.device, &p.left) },
+                    unsafe { ctx.import_rgba16(&pipeline.device, &p.right) },
+                ),
+                ZcFisheyeFrame::Sbs(f) => {
+                    let full = unsafe { ctx.import_rgba16(&pipeline.device, &f.tex) };
+                    pipeline.split_sbs_texture_16(&full, f.eye_w, f.eye_h)?
+                }
+            };
 
             // KB projection (RS variant when stabilizing; same
             // (projection, rs) split as the GPU-resident + macOS p010

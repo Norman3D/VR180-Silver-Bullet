@@ -54,6 +54,12 @@
   SBS decoder always produced 8-bit frames while the 10-bit arms expect
   16-bit ones. The SBS decoder now follows the output bit depth, so a
   10-bit SBS source also keeps its precision.
+- **Windows: side-by-side sources now export on the GPU fast path** —
+  hardware (NVDEC) decode, GPU eye split, projection, color and encode,
+  with the audio muxed inline (measured 5 → 38 fps for a 4K NVENC
+  export, ~7×; ProRes rides the GPU encoder the same way). The preview
+  and any fallback also gain hardware decode, which the SBS decoder
+  previously never used.
 
 ## 2.5.0
 

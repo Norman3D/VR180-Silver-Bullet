@@ -156,6 +156,19 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    attach before the first frame, chain-probed duration when per_eye is
    empty; verified on a trimmed `.360` window (2–5 s: 90 frames + 3.0 s
    AAC muxed inline, no temp). Still two-pass everywhere: ambisonic / APAC.
+   NEXT DAY (2026-09-15): **generic SBS sources get the Windows fast path.**
+   `SbsFisheyeIter` finally honors its hw flag (d3d11va attach + hw-frame
+   download — it had silently software-decoded forever, preview included),
+   and the zc readback arm takes SBS: new `D3d11SharedSbsIter` (single
+   stream, converts the WHOLE frame, precise-seek run-in) yields through
+   `ZcFisheyeSource`/`ZcFisheyeFrame` (the arm's source is now that enum),
+   and the arm splits the halves with `gpu::split_sbs_texture_16` (two DtoD
+   subregion copies) — everything downstream unchanged. Single-segment
+   only; the GPU-resident CUDA/NVENC arm stays dual-stream-only (SBS NVENC
+   rides the readback arm's P010 feed: 5.4 → 38 fps at 4K). Verified: SBS
+   NVENC/ProRes/reframe + trim + one-pass audio, cpu-vs-zc parity 1.03/255,
+   and OSV arm parity byte-stable vs pre-change (same 1.233/255 / max 23).
+   macOS untouched (its SBS sources ride the portable loop as before).
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

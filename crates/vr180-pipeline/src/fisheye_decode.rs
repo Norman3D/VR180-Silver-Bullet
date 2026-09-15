@@ -355,7 +355,7 @@ impl SbsFisheyeIter {
     /// [`SbsFisheyeIter::new`] with the pair bit depth chosen: 8 (RGBA8)
     /// or 16 (RGBA64LE, what the export's 10-bit arms consume).
     pub fn new_with_bit_depth(
-        path: &Path, _hw: HwDecode, frame_limit: u32, output_bit_depth: u8,
+        path: &Path, hw: HwDecode, frame_limit: u32, output_bit_depth: u8,
     ) -> Result<Self> {
         if output_bit_depth != 8 && output_bit_depth != 16 {
             return Err(Error::Ffmpeg(format!(
@@ -382,8 +382,21 @@ impl SbsFisheyeIter {
         let time_base = video.time_base();
         let time_base_s = time_base.numerator() as f64 / time_base.denominator() as f64;
 
-        let codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(video.parameters())
+        #[allow(unused_mut)]
+        let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(video.parameters())
             .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+        // Windows: hardware decode via d3d11va (NVDEC) — the flag was
+        // accepted but silently ignored here, so every generic-SBS source
+        // decoded in software. Decoded frames are GPU-resident; repack_split
+        // downloads them with `download_hw_frame` before the swscale split.
+        #[cfg(target_os = "windows")]
+        if matches!(hw, HwDecode::Auto)
+            && crate::decode::try_enable_d3d11va_decode(&mut codec_ctx)
+        {
+            tracing::info!("SbsFisheyeIter: d3d11va (NVDEC) hardware decode attached");
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = hw;
         let decoder = codec_ctx.decoder().video()
             .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?;
 
@@ -478,8 +491,17 @@ impl SbsFisheyeIter {
     fn repack_split(
         &mut self,
         decoded: &mut ffmpeg_next::frame::Video,
-        _sw_storage: &mut ffmpeg_next::frame::Video,
+        sw_storage: &mut ffmpeg_next::frame::Video,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
+        // d3d11va frames are GPU-resident — download to host (NV12 / P010)
+        // before swscale. Software frames pass through untouched.
+        let decoded: &ffmpeg_next::frame::Video =
+            if decoded.format() == ffmpeg_next::format::Pixel::D3D11 {
+                crate::decode::download_hw_frame(decoded, sw_storage)?;
+                sw_storage
+            } else {
+                decoded
+            };
         let frame_w = decoded.width();
         let frame_h = decoded.height();
         // Same scaler configuration as the dual-stream iterator: 16-bit
@@ -1510,6 +1532,246 @@ impl std::fmt::Debug for SharedEacPair {
             .field("dims", &self.dims)
             .field("pts_s", &self.pts_s)
             .finish_non_exhaustive()
+    }
+}
+
+/// A full converted side-by-side frame from [`D3d11SharedSbsIter`]: ONE
+/// shared RGBA16 texture holding the whole `2·eye_w × eye_h` SBS frame at
+/// native res. The consumer imports it once and splits the halves with two
+/// GPU subregion copies (`gpu::Device::split_sbs_texture_16`) — cheaper and
+/// simpler than a D3D11-side split into two shared textures.
+#[cfg(target_os = "windows")]
+pub struct SharedSbsFrame {
+    pub tex: crate::interop_windows::D3d11SharedTexture,
+    /// Native PER-EYE dims (frame is `2·eye_w × eye_h`).
+    pub eye_w: u32,
+    pub eye_h: u32,
+    /// Presentation timestamp in seconds, `0.0` if unknown.
+    pub pts_s: f64,
+}
+
+// SAFETY: identical reasoning to `SharedFisheyePair` — the COM interfaces are
+// agile and the NT handle is process-global; the consuming thread only
+// imports (Vulkan side) and CloseHandle on drop, never issues D3D11
+// immediate-context calls. Moving across the decode→project boundary is sound.
+#[cfg(target_os = "windows")]
+unsafe impl Send for SharedSbsFrame {}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Debug for SharedSbsFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedSbsFrame")
+            .field("eye_w", &self.eye_w)
+            .field("eye_h", &self.eye_h)
+            .field("pts_s", &self.pts_s)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Windows zero-copy decoder for GENERIC side-by-side sources (plain
+/// `.mp4`/`.mov`, `SourceKind::SbsFisheye`) — the single-stream sibling of
+/// [`D3d11SharedStreamPairIter`]: `d3d11va` (NVDEC) decode, P010 → RGBA16
+/// convert of the WHOLE SBS frame at native res on the D3D11 side, NT-share.
+/// Same precise-seek run-in convention (`skip_until_s`). Requires 4:2:0
+/// HW-decodable input (HEVC/H.264 8/10-bit — what cameras and our own
+/// exports produce); anything else fails `new` and the caller falls back
+/// to the portable path.
+#[cfg(target_os = "windows")]
+pub struct D3d11SharedSbsIter {
+    ictx: ffmpeg_next::format::context::Input,
+    video_idx: usize,
+    decoder: ffmpeg_next::codec::decoder::Video,
+    /// Native PER-EYE dims (decoded frame is `2·eye_w × eye_h`).
+    eye_w: u32,
+    eye_h: u32,
+    converter: Option<crate::interop_windows::P010Converter>,
+    time_base_s: f64,
+    dt_s: f64,
+    /// Precise-seek run-in target — see `D3d11SharedStreamPairIter`.
+    skip_until_s: Option<f64>,
+}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Debug for D3d11SharedSbsIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("D3d11SharedSbsIter")
+            .field("video_idx", &self.video_idx)
+            .field("eye", &(self.eye_w, self.eye_h))
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl D3d11SharedSbsIter {
+    pub fn new(path: &Path) -> Result<Self> {
+        ffmpeg_init();
+        let ictx = ffmpeg_next::format::input(path)
+            .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+        // Largest video stream wins — same selection as `SbsFisheyeIter`
+        // (protects against thumbnail/data streams).
+        let video = ictx
+            .streams()
+            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+            .max_by_key(|s| {
+                let p = s.parameters();
+                unsafe {
+                    let cp = &*p.as_ptr();
+                    (cp.width as u64) * (cp.height as u64)
+                }
+            })
+            .ok_or_else(|| Error::Ffmpeg("no video stream".into()))?;
+        let video_idx = video.index();
+        let time_base = video.time_base();
+        let time_base_s = time_base.numerator() as f64 / time_base.denominator().max(1) as f64;
+        let fr = video.avg_frame_rate();
+        let dt_s = if fr.numerator() > 0 {
+            fr.denominator() as f64 / fr.numerator() as f64
+        } else {
+            1.0 / 30.0
+        };
+
+        let mut codec_ctx =
+            ffmpeg_next::codec::context::Context::from_parameters(video.parameters())
+                .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+        if !crate::decode::try_enable_d3d11va_decode(&mut codec_ctx) {
+            return Err(Error::Ffmpeg(
+                "zero-copy SBS path requires d3d11va hwaccel — setup failed".into()));
+        }
+        let decoder = codec_ctx.decoder().video()
+            .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?;
+        let (fw, fh) = (decoder.width(), decoder.height());
+        if fw % 2 != 0 || fw == 0 || fh == 0 {
+            return Err(Error::Ffmpeg(format!(
+                "SBS frame {fw}x{fh} not splittable (width must be even)")));
+        }
+        tracing::info!(
+            "D3d11SharedSbsIter: {fw}x{fh} SBS ({}x{fh} per eye), d3d11va \
+             P010→RGBA16, no downscale", fw / 2);
+        Ok(Self {
+            ictx, video_idx, decoder,
+            eye_w: fw / 2, eye_h: fh,
+            converter: None,
+            time_base_s, dt_s,
+            skip_until_s: None,
+        })
+    }
+
+    pub fn eye_dims(&self) -> (u32, u32) { (self.eye_w, self.eye_h) }
+    pub fn native_dims(&self) -> (u32, u32) { (self.eye_w, self.eye_h) }
+
+    /// PRECISE seek — see [`D3d11SharedStreamPairIter::seek`].
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        let target_s = target_s.max(0.0);
+        let ts = (target_s * 1_000_000.0) as i64;
+        self.ictx.seek(ts, ..ts)
+            .map_err(|e| Error::Ffmpeg(format!("seek {target_s:.3}s: {e}")))?;
+        self.decoder.flush();
+        self.skip_until_s = Some(target_s);
+        Ok(())
+    }
+
+    /// Pull the next GPU-resident full-SBS frame. `Ok(None)` at EOF.
+    pub fn next_frame(&mut self) -> Result<Option<SharedSbsFrame>> {
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+        loop {
+            let got = if self.decoder.receive_frame(&mut decoded).is_ok() {
+                true
+            } else {
+                // Need more packets; drain at EOF.
+                let mut got = false;
+                loop {
+                    match self.ictx.packets().next() {
+                        Some((stream, packet)) => {
+                            if stream.index() != self.video_idx { continue; }
+                            let _ = self.decoder.send_packet(&packet);
+                            if self.decoder.receive_frame(&mut decoded).is_ok() {
+                                got = true;
+                                break;
+                            }
+                        }
+                        None => {
+                            let _ = self.decoder.send_eof();
+                            got = self.decoder.receive_frame(&mut decoded).is_ok();
+                            break;
+                        }
+                    }
+                }
+                got
+            };
+            if !got { return Ok(None); }
+
+            let pts_s = decoded.pts().unwrap_or(0) as f64 * self.time_base_s;
+            // Precise-seek run-in: decode-and-discard WITHOUT the convert.
+            if let Some(target) = self.skip_until_s {
+                if pts_s < target - 0.5 * self.dt_s { continue; }
+                self.skip_until_s = None;
+            }
+
+            let tex = unsafe {
+                crate::interop_windows::share_eye_converted(
+                    &decoded, &mut self.converter, self.eye_w * 2, self.eye_h)
+            }
+            .ok_or_else(|| Error::Ffmpeg("zero-copy SBS: convert failed".into()))?;
+            return Ok(Some(SharedSbsFrame {
+                tex, eye_w: self.eye_w, eye_h: self.eye_h, pts_s,
+            }));
+        }
+    }
+}
+
+/// The zero-copy fisheye export arm's frame source: dual-stream cameras
+/// (`.osv`/`.insv`, segment-chained) or a generic single-stream SBS file.
+/// One enum instead of a trait so the arm's decode thread stays a plain
+/// owned value.
+#[cfg(target_os = "windows")]
+pub enum ZcFisheyeSource {
+    Dual(SegmentedD3d11SharedDualStreamIter),
+    Sbs(D3d11SharedSbsIter),
+}
+
+#[cfg(target_os = "windows")]
+impl ZcFisheyeSource {
+    pub fn eye_dims(&self) -> (u32, u32) {
+        match self {
+            Self::Dual(i) => i.eye_dims(),
+            Self::Sbs(i) => i.eye_dims(),
+        }
+    }
+    pub fn native_dims(&self) -> (u32, u32) {
+        match self {
+            Self::Dual(i) => i.native_dims(),
+            Self::Sbs(i) => i.native_dims(),
+        }
+    }
+    pub fn seek(&mut self, t: f64) -> Result<()> {
+        match self {
+            Self::Dual(i) => i.seek(t),
+            Self::Sbs(i) => i.seek(t),
+        }
+    }
+    pub fn next(&mut self) -> Result<Option<ZcFisheyeFrame>> {
+        match self {
+            Self::Dual(i) => Ok(i.next_pair()?.map(ZcFisheyeFrame::Pair)),
+            Self::Sbs(i) => Ok(i.next_frame()?.map(ZcFisheyeFrame::Sbs)),
+        }
+    }
+}
+
+/// One frame from [`ZcFisheyeSource`].
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub enum ZcFisheyeFrame {
+    Pair(SharedFisheyePair),
+    Sbs(SharedSbsFrame),
+}
+
+#[cfg(target_os = "windows")]
+impl ZcFisheyeFrame {
+    pub fn pts_s(&self) -> f64 {
+        match self {
+            Self::Pair(p) => p.pts_s,
+            Self::Sbs(f) => f.pts_s,
+        }
     }
 }
 

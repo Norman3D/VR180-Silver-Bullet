@@ -3049,6 +3049,53 @@ impl Device {
         )
     }
 
+    /// Split a full side-by-side `Rgba16Unorm` texture (`2·eye_w × eye_h`)
+    /// into two per-eye textures with GPU subregion copies — the zero-copy
+    /// SBS export arm's bridge from the ONE imported D3D11 frame to the
+    /// per-eye textures every projection kernel takes. Two DtoD copies
+    /// (~1 ms at 8K); no readback, no shader.
+    pub fn split_sbs_texture_16(
+        &self,
+        full: &wgpu::Texture,
+        eye_w: u32,
+        eye_h: u32,
+    ) -> Result<(wgpu::Texture, wgpu::Texture)> {
+        let mk = |label: &str| self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: eye_w, height: eye_h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let left = mk("sbs_split_left");
+        let right = mk("sbs_split_right");
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("sbs_split"),
+        });
+        let mut copy = |dst: &wgpu::Texture, src_x: u32| {
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: full, mip_level: 0,
+                    origin: wgpu::Origin3d { x: src_x, y: 0, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: dst, mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: eye_w, height: eye_h, depth_or_array_layers: 1 },
+            );
+        };
+        copy(&left, 0);
+        copy(&right, eye_w);
+        self.queue.submit(Some(enc.finish()));
+        Ok((left, right))
+    }
+
     /// "BeyondVR Hack" on an RGB8 SBS readback buffer (8-bit CPU-fallback
     /// export paths): scale each half about its own half-center, black
     /// outside. `eye_w` = w/2. Runs AFTER the CPU color roundtrip so the
