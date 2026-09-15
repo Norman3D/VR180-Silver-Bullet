@@ -54,6 +54,12 @@
   SBS decoder always produced 8-bit frames while the 10-bit arms expect
   16-bit ones. The SBS decoder now follows the output bit depth, so a
   10-bit SBS source also keeps its precision.
+- **Failures are now reported instead of looking like success.** An export
+  that lost its decoder mid-run used to finalize a short file and report
+  "done"; it now fails with the reason (cancelling still keeps the partial
+  file, as before). A crash inside the preview decoder no longer leaves
+  Play/Pause toggling a dead worker. And a GPU error is caught and shown
+  as a dismissable warning instead of taking the whole app down.
 - **Windows: hardware decode now checks free GPU memory first, and falls
   back to software when it will not fit.** A hardware video decoder needs
   roughly 240 MB of GPU memory per megapixel of video, so an 8K clip wants

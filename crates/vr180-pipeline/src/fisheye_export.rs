@@ -2262,15 +2262,23 @@ fn export_eac_gpu_resident(
     // ~10 ms dual-stream decode overlaps the GPU compose + NVENC on this thread.
     let (pair_tx, pair_rx) = std::sync::mpsc::sync_channel::<SharedEacPair>(3);
     let cancel_dec = cancel.clone();
-    let decode_handle = std::thread::spawn(move || {
+    let decode_handle = std::thread::spawn(move || -> Result<()> {
         loop {
             if cancel_dec.load(Ordering::SeqCst) { break; }
             match iter.next_pair() {
                 Ok(Some(p)) => { if pair_tx.send(p).is_err() { break; } }
                 Ok(None) => break,
-                Err(e) => { tracing::warn!("gpu-resident EAC decode: {e}"); break; }
+                // A decode failure mid-stream must FAIL the export: finalizing
+                // here would write a short file and report success (silent
+                // data loss in a batch). Cancel / dropped-receiver above are
+                // normal early stops and stay Ok.
+                Err(e) => {
+                    tracing::warn!("gpu-resident EAC decode: {e}");
+                    return Err(e);
+                }
             }
         }
+        Ok(())
     });
 
     let t_start = std::time::Instant::now();
@@ -2402,7 +2410,7 @@ fn export_eac_gpu_resident(
     }
 
     drop(pair_rx);
-    let _ = decode_handle.join();
+    let decode_result = decode_handle.join();
     let enc_result = match tail {
         Tail::Nvenc { ring, enc_tx, handle } => {
             drop(enc_tx); // end the encode thread's recv loop → flush + finish
@@ -2419,6 +2427,20 @@ fn export_eac_gpu_resident(
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err(Error::Ffmpeg("gpu-resident EAC encode thread panicked".into())),
+    }
+    // A mid-stream decode failure must NOT finalize: doing so wrote a short
+    // file and reported success (silent data loss in a batch run). A user
+    // cancel is not a failure — the partial file is kept deliberately.
+    match decode_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            if cancel.load(Ordering::SeqCst) {
+                tracing::info!("export_eac (GPU-resident): cancelled; decode also reported: {e}");
+            } else {
+                return Err(e);
+            }
+        }
+        Err(_) => return Err(Error::Ffmpeg("export_eac (GPU-resident): decode thread panicked".into())),
     }
     // Audio + metadata. One-pass (readback tail, stereo): audio was muxed
     // inline straight into the final file — just drop the playlist temp.
@@ -2943,15 +2965,21 @@ fn export_fisheye_osv_zerocopy_d3d11(
     // thread drops the receiver (early stop / error).
     let cancel_dec = cancel.clone();
     let mut iter = iter;
-    let decode_handle = std::thread::spawn(move || {
+    let decode_handle = std::thread::spawn(move || -> Result<()> {
         loop {
             if cancel_dec.load(Ordering::SeqCst) { break; }
             match iter.next() {
                 Ok(Some(p)) => { if pair_tx.send(p).is_err() { break; } }
                 Ok(None) => break,
-                Err(e) => { tracing::warn!("zc export: decode worker: {e}"); break; }
+                // See the EAC arm: a mid-stream decode failure must fail the
+                // export rather than finalize a truncated file.
+                Err(e) => {
+                    tracing::warn!("zc export: decode worker: {e}");
+                    return Err(e);
+                }
             }
         }
+        Ok(())
     });
 
     // Encode thread — owns the encoder so the NVENC→libx265 fallback (and
@@ -3229,7 +3257,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
     drop(frame_tx);
     drop(pair_rx);
     let enc_result = encode_handle.join();
-    let _ = decode_handle.join();
+    let decode_result = decode_handle.join();
 
     if let Some(e) = main_err {
         return Err(e);
@@ -3238,6 +3266,20 @@ fn export_fisheye_osv_zerocopy_d3d11(
         Ok(Ok(_n)) => {}
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err(Error::Ffmpeg("zc export: encode thread panicked".into())),
+    }
+    // A mid-stream decode failure must NOT finalize: doing so wrote a short
+    // file and reported success (silent data loss in a batch run). A user
+    // cancel is not a failure — the partial file is kept deliberately.
+    match decode_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            if cancel.load(Ordering::SeqCst) {
+                tracing::info!("zc export: cancelled; decode also reported: {e}");
+            } else {
+                return Err(e);
+            }
+        }
+        Err(_) => return Err(Error::Ffmpeg("zc export: decode thread panicked".into())),
     }
 
     if one_pass {
@@ -3393,15 +3435,21 @@ fn export_fisheye_osv_gpu_resident(
     let (pair_tx, pair_rx) = std::sync::mpsc::sync_channel::<SharedFisheyePair>(3);
     let cancel_dec = cancel.clone();
     let mut iter = iter;
-    let decode_handle = std::thread::spawn(move || {
+    let decode_handle = std::thread::spawn(move || -> Result<()> {
         loop {
             if cancel_dec.load(Ordering::SeqCst) { break; }
             match iter.next_pair() {
                 Ok(Some(p)) => { if pair_tx.send(p).is_err() { break; } }
                 Ok(None) => break,
-                Err(e) => { tracing::warn!("gpu-resident decode: {e}"); break; }
+                // See the EAC arm: a mid-stream decode failure must fail the
+                // export rather than finalize a truncated file.
+                Err(e) => {
+                    tracing::warn!("gpu-resident decode: {e}");
+                    return Err(e);
+                }
             }
         }
+        Ok(())
     });
 
     let t_start = std::time::Instant::now();
@@ -3554,7 +3602,7 @@ fn export_fisheye_osv_gpu_resident(
     }
 
     drop(pair_rx);
-    let _ = decode_handle.join();
+    let decode_result = decode_handle.join();
     drop(enc_tx); // end the encode thread's recv loop → it flushes + finishes
     let enc_result = encode_handle.join();
     drop(ring);   // free shared frames only AFTER the encoder is done reading
@@ -3562,6 +3610,20 @@ fn export_fisheye_osv_gpu_resident(
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err(Error::Ffmpeg("gpu-resident encode thread panicked".into())),
+    }
+    // A mid-stream decode failure must NOT finalize: doing so wrote a short
+    // file and reported success (silent data loss in a batch run). A user
+    // cancel is not a failure — the partial file is kept deliberately.
+    match decode_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            if cancel.load(Ordering::SeqCst) {
+                tracing::info!("fisheye_export (GPU-resident): cancelled; decode also reported: {e}");
+            } else {
+                return Err(e);
+            }
+        }
+        Err(_) => return Err(Error::Ffmpeg("fisheye_export (GPU-resident): decode thread panicked".into())),
     }
     if one_pass {
         // Audio already muxed inline — drop the playlist temp, if any.

@@ -216,13 +216,37 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    small card for testing on a big one. Verified: simulated 8 GB card →
    decline logged, export falls to software and COMPLETES (1.6 fps);
    4K SBS / OSV / `.360` unaffected on the 4090 (fast path still engages,
-   same fps). **Still open** (audit found, not yet fixed): a decode-thread
-   error mid-export finalizes and reports `Done` with a truncated file
-   (`fisheye_export.rs` `warn!`-only); a decoder-thread panic skips the
-   `finished` flag and wedges Play/Pause; no `on_uncaptured_error` on either
-   wgpu device (wgpu 29 default is `panic!`); six `.expect()`s in
-   `interop_windows::import_d3d11_handle_to_wgpu` (the real hazard there is
-   cross-adapter on hybrid laptops, not OOM).
+   same fps). FOLLOW-UP (same day) — the three
+   remaining audit items are now FIXED:
+   (a) **Truncated export reported `Done`.** All three zero-copy decode
+   threads (`fisheye_export.rs`: EAC gpu-resident, zc readback, OSV
+   gpu-resident) now return `Result<()>` instead of `warn!`-and-break, and
+   each join result is checked BEFORE finalize. A user cancel is explicitly
+   NOT a failure (the partial file is kept deliberately), and
+   dropped-receiver / EOF stay `Ok`. Note: FFmpeg treats a CORRUPT stream as
+   early EOF (`Ok(None)`), so a damaged input still finalizes short — that is
+   a different condition from the VRAM `Err` this fixes, left as-is.
+   (b) **Decoder-thread panic wedged Play/Pause.** The `finished` +
+   `imu_progress.abort` stores moved into a `SignalFinished` **Drop guard**
+   in `app.rs`, so they run on unwind too (`finished` is the only thing that
+   clears `decoder_alive`). `drain_frames` also distinguishes
+   `TryRecvError::Disconnected` from `Empty` now — they were identical, so a
+   dead worker looked like an idle one.
+   (c) **No `on_uncaptured_error`.** Installed in `gpu::Device::from_existing`
+   — the single funnel for BOTH devices (eframe's shared one and the export's
+   dedicated one), so macOS gets it too. Records to `gpu::last_gpu_error()`,
+   logs at ERROR, and the export bar shows a dismissable "⚠ GPU error" chip.
+   `VR180_WGPU_PANIC=1` restores the panicking default for debugging.
+   PROVEN both ways by `examples/gpu_error_check.rs` (gitignored): forcing a
+   real validation error, the process SURVIVES and records it; with
+   `VR180_WGPU_PANIC=1` the same error panics. Verified the real app records
+   nothing at startup (no spurious chip).
+   Regression sweep after all three: OSV/`.360`/SBS × nvenc/prores/portable
+   all pass at unchanged fps, software-fallback output is pixel-identical to
+   hardware (0.72/255 mean, encoder noise). **Still open:** six `.expect()`s
+   in `interop_windows::import_d3d11_handle_to_wgpu` — the real hazard there
+   is cross-adapter on hybrid laptops, not OOM, and `vulkan_device_luid` has
+   no caller outside an example.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

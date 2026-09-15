@@ -375,6 +375,22 @@ impl Device {
         device: std::sync::Arc<wgpu::Device>,
         queue: std::sync::Arc<wgpu::Queue>,
     ) -> Result<Self> {
+        // wgpu's DEFAULT uncaptured-error handler is `panic!`. Both devices
+        // funnel through here (eframe's shared one and the export's dedicated
+        // one), and we do GPU work on worker threads, where that panic either
+        // kills the app or — worse — unwinds past the bookkeeping that tells
+        // the UI the worker died. Record + log loudly instead, so a GPU error
+        // becomes a visible, recoverable condition rather than a crash.
+        // A genuine validation bug is still obvious: it logs at ERROR and
+        // `last_gpu_error()` surfaces it. `VR180_WGPU_PANIC=1` restores the
+        // panicking behaviour for debugging.
+        if std::env::var_os("VR180_WGPU_PANIC").is_none() {
+            device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
+                let msg = e.to_string();
+                tracing::error!("wgpu uncaptured error: {msg}");
+                *LAST_GPU_ERROR.lock().unwrap() = Some(msg);
+            }));
+        }
         let eac_to_equirect = EacToEquirectPipeline::create(&device);
         let eac_to_equirect_16 = EacToEquirectPipeline::create_16(&device);
         let eac_to_fisheye = EacToEquirectPipeline::create_fisheye(&device);
@@ -8270,4 +8286,23 @@ mod reframe_tests {
         let plain = FisheyeCalibUniforms::from_public(FisheyeCalib::new(1000.0, 1000.0, 960.0, 960.0, [0.0; 4], 1920.0, 1920.0, 900.0));
         assert_eq!(plain.proj_mode, 0.0);
     }
+}
+
+
+// ── Uncaptured wgpu errors ─────────────────────────────────────────────
+//
+// See `Device::from_existing`: we replace wgpu's panicking default handler
+// with one that records the error here, so a GPU fault degrades visibly
+// instead of killing (or wedging) the app.
+
+static LAST_GPU_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// Most recent uncaptured wgpu error, or `None`.
+pub fn last_gpu_error() -> Option<String> {
+    LAST_GPU_ERROR.lock().unwrap().clone()
+}
+
+/// Clear the recorded GPU error (after it has been shown).
+pub fn clear_gpu_error() {
+    *LAST_GPU_ERROR.lock().unwrap() = None;
 }

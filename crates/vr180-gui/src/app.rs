@@ -2392,10 +2392,26 @@ impl App {
         let Some(rx) = &self.frame_rx else { return; };
         let mut newest: Option<DecodedFrame> = None;
         let mut drained = 0u32;
-        while let Ok(f) = rx.try_recv() {
-            self.fps_stats.frames_in_window += 1;
-            newest = Some(f);
-            drained += 1;
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(f) => {
+                    self.fps_stats.frames_in_window += 1;
+                    newest = Some(f);
+                    drained += 1;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                // The worker is gone. `Empty` and `Disconnected` used to look
+                // identical here, so a dead decoder was indistinguishable from
+                // a momentarily idle one.
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if disconnected && self.decoder_alive {
+            tracing::warn!("decoder frame channel disconnected — worker is gone");
         }
         if drained > 0 && self.fps_stats.last_window_start.is_none() {
             tracing::info!("ui drain: first frame received (drained {} on first poll)", drained);
@@ -3065,18 +3081,30 @@ impl App {
         let pipeline = self.pipeline.clone();
         let control_for_thread = control.clone();
         std::thread::spawn(move || {
+            // Signal the UI that this decoder is gone — from a Drop guard, so
+            // it runs even if `start_decoder` PANICS. `finished` is the only
+            // thing that clears `decoder_alive`/`decoder_starting`, so
+            // unwinding past these stores left Play/Pause toggling a dead
+            // worker forever and leaked the background IMU thread + its file
+            // handle. (A wgpu error on the decoder thread is a panic by
+            // default, which is exactly how we found this.)
+            struct SignalFinished(Arc<crate::decoder::DecoderControl>);
+            impl Drop for SignalFinished {
+                fn drop(&mut self) {
+                    use std::sync::atomic::Ordering;
+                    // Abort any in-flight/paused background IMU read so it
+                    // doesn't leak past the decoder's life.
+                    self.0.imu_progress.abort.store(true, Ordering::SeqCst);
+                    self.0.finished.store(true, Ordering::SeqCst);
+                }
+            }
+            let _signal = SignalFinished(control_for_thread.clone());
+
             if let Err(e) = start_decoder(pipeline, cfg, control_for_thread.clone(), frame_tx, cmd_rx) {
                 tracing::error!("decoder error: {e}");
             } else {
                 tracing::info!("decoder thread exited cleanly");
             }
-            // Signal the UI that this decoder is gone. If it never delivered
-            // a frame, `poll_load` uses this to clear `decoder_starting` so a
-            // cold-read failure can't wedge Play permanently.
-            // Abort any in-flight/paused background IMU read so it doesn't leak
-            // its thread + file handle past the decoder's life.
-            control_for_thread.imu_progress.abort.store(true, std::sync::atomic::Ordering::SeqCst);
-            control_for_thread.finished.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         self.frame_rx = Some(frame_rx);
         self.detail_frame_rx = Some(detail_rx);
@@ -3428,6 +3456,7 @@ impl App {
         let mut do_choose_dir = false;
         let mut do_clear_dir = false;
         let mut dismiss_summary = false;
+        let mut dismiss_gpu_error = false;
         let mut toggle_settings = false;
 
         egui::TopBottomPanel::bottom("export_bar").exact_height(40.0).show(ctx, |ui| {
@@ -3505,6 +3534,21 @@ impl App {
                                 dismiss_summary = true;
                             }
                         }
+                        // An uncaptured GPU error used to be a panic; now it
+                        // is recorded and shown here, so a GPU fault is
+                        // visible instead of a silent wedge. Click to dismiss.
+                        if let Some(err) = vr180_pipeline::gpu::last_gpu_error() {
+                            if ui.add(egui::Label::new(RichText::new(
+                                    format!("⚠ {}", tr("GPU error — see the log")))
+                                    .small().color(Color32::from_rgb(230, 120, 120)))
+                                .sense(egui::Sense::click()))
+                                .on_hover_text(format!("{err}
+
+{}", tr("Click to dismiss")))
+                                .clicked() {
+                                dismiss_gpu_error = true;
+                            }
+                        }
                     });
                 }
             });
@@ -3515,6 +3559,7 @@ impl App {
         }
         if do_clear_dir { self.batch_out_dir = None; }
         if dismiss_summary { self.last_batch_summary = None; }
+        if dismiss_gpu_error { vr180_pipeline::gpu::clear_gpu_error(); }
         if toggle_settings { self.show_export_settings = !self.show_export_settings; }
         if do_export_selected { self.export_selected(); }
         if do_export_all { self.start_batch(); }
