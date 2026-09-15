@@ -1581,7 +1581,13 @@ pub struct D3d11SharedSbsIter {
     ictx: ffmpeg_next::format::context::Input,
     video_idx: usize,
     decoder: ffmpeg_next::codec::decoder::Video,
-    /// Native PER-EYE dims (decoded frame is `2·eye_w × eye_h`).
+    /// Native PER-EYE dims (decoded frame is `2·native_eye_w × native_eye_h`).
+    native_eye_w: u32,
+    native_eye_h: u32,
+    /// Working (optionally downscaled) PER-EYE dims — what the shared frame
+    /// actually holds, i.e. a `2·eye_w × eye_h` texture. The export asks for
+    /// native (no downscale); the live preview asks for ~1280 like the
+    /// dual-stream iterator, so the D3D11 convert also does the downscale.
     eye_w: u32,
     eye_h: u32,
     converter: Option<crate::interop_windows::P010Converter>,
@@ -1603,7 +1609,16 @@ impl std::fmt::Debug for D3d11SharedSbsIter {
 
 #[cfg(target_os = "windows")]
 impl D3d11SharedSbsIter {
+    /// Native-resolution (no downscale) — what the export wants.
     pub fn new(path: &Path) -> Result<Self> {
+        Self::new_with_work(path, u32::MAX, u32::MAX)
+    }
+
+    /// `work_w`/`work_h` are the PER-EYE working dims, clamped to native
+    /// (same convention as [`D3d11SharedDualStreamIter::new`]): the D3D11
+    /// P010→RGBA16 convert downscales to `2·work_w × work_h` so the live
+    /// preview doesn't push full 8K frames through the projection.
+    pub fn new_with_work(path: &Path, work_w: u32, work_h: u32) -> Result<Self> {
         ffmpeg_init();
         let ictx = ffmpeg_next::format::input(path)
             .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
@@ -1644,20 +1659,26 @@ impl D3d11SharedSbsIter {
             return Err(Error::Ffmpeg(format!(
                 "SBS frame {fw}x{fh} not splittable (width must be even)")));
         }
+        let (native_eye_w, native_eye_h) = (fw / 2, fh);
+        let eye_w = work_w.clamp(2, native_eye_w);
+        let eye_h = work_h.clamp(2, native_eye_h);
         tracing::info!(
-            "D3d11SharedSbsIter: {fw}x{fh} SBS ({}x{fh} per eye), d3d11va \
-             P010→RGBA16, no downscale", fw / 2);
+            "D3d11SharedSbsIter: {fw}x{fh} SBS (native {native_eye_w}x{native_eye_h} \
+             per eye → work {eye_w}x{eye_h}), d3d11va P010→RGBA16");
         Ok(Self {
             ictx, video_idx, decoder,
-            eye_w: fw / 2, eye_h: fh,
+            native_eye_w, native_eye_h,
+            eye_w, eye_h,
             converter: None,
             time_base_s, dt_s,
             skip_until_s: None,
         })
     }
 
+    /// Working (possibly downscaled) per-eye dims — what `next_frame` yields.
     pub fn eye_dims(&self) -> (u32, u32) { (self.eye_w, self.eye_h) }
-    pub fn native_dims(&self) -> (u32, u32) { (self.eye_w, self.eye_h) }
+    /// Native decoded per-eye dims (before any downscale).
+    pub fn native_dims(&self) -> (u32, u32) { (self.native_eye_w, self.native_eye_h) }
 
     /// PRECISE seek — see [`D3d11SharedStreamPairIter::seek`].
     pub fn seek(&mut self, target_s: f64) -> Result<()> {
@@ -1712,6 +1733,11 @@ impl D3d11SharedSbsIter {
                     &decoded, &mut self.converter, self.eye_w * 2, self.eye_h)
             }
             .ok_or_else(|| Error::Ffmpeg("zero-copy SBS: convert failed".into()))?;
+            // Fence the decode+convert before handing the texture to the
+            // importer — same contract as the dual-stream / EAC iterators.
+            // Without it the consumer can import and sample memory the D3D11
+            // GPU has not finished writing (reads as black / torn).
+            unsafe { tex.wait_gpu_idle(); }
             return Ok(Some(SharedSbsFrame {
                 tex, eye_w: self.eye_w, eye_h: self.eye_h, pts_s,
             }));

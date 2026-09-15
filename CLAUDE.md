@@ -169,6 +169,22 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    NVENC/ProRes/reframe + trim + one-pass audio, cpu-vs-zc parity 1.03/255,
    and OSV arm parity byte-stable vs pre-change (same 1.233/255 / max 23).
    macOS untouched (its SBS sources ride the portable loop as before).
+   SAME DAY: **playback too** — the preview dispatch gated on
+   `is_dual_stream()`, so SBS previews still paid download+swscale+upload
+   every frame (worst at 8K). `run_fisheye_zerocopy` now takes
+   `ZcFisheyeSource` (same enum as the export arm) and `FrameHold` carries
+   the imported full texture for SBS alongside the split halves (deferred
+   drop must outlive the in-flight copy); `D3d11SharedSbsIter::new_with_work`
+   adds the ~1280 preview downscale (native stays the export's default).
+   **Contract bug found + fixed doing this:** the SBS iterator didn't
+   `wait_gpu_idle()` after `share_eye_converted` like the dual-stream / EAC
+   iterators do — the importer could sample memory D3D11 hadn't finished
+   writing. It read as BLACK deterministically in a readback test; the
+   export arm had been hiding it behind the decode→main channel hop (a real
+   latent race, not just a test artifact). Costs ~2% throughput (38→37 fps).
+   Verified by `examples/sbs_zc_check.rs` (gitignored): GPU-left vs CPU-left
+   101/65535 while GPU-left vs CPU-RIGHT is 3122 (31× — split provably not
+   swapped/offset), work-res downscale exact dims + identical mean level.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

@@ -1455,9 +1455,13 @@ fn run_fisheye(
             .features()
             .contains(wgpu::Features::TEXTURE_FORMAT_P010);
         let on_vulkan = vr180_pipeline::interop_windows::is_vulkan_backend(&pipeline.device);
-        if kind.is_dual_stream() && on_vulkan && has_p010 {
-            // XOR with DJI's "swap by default" (matches the CPU worker).
-            let swap = kind.dual_stream_iter_swap(control.settings.read().effective_swap_eyes());
+        // Generic SBS (plain .mp4/.mov) rides this path too: one stream, the
+        // whole converted frame shared, halves split on the GPU. Chaining is
+        // dual-stream-only, so a (rare) multi-segment SBS stays on the CPU
+        // worker.
+        let sbs_ok = kind == vr180_pipeline::SourceKind::SbsFisheye
+            && cfg.segments.len() <= 1;
+        if (kind.is_dual_stream() || sbs_ok) && on_vulkan && has_p010 {
             let ctx = vr180_pipeline::interop_windows::VulkanImportCtx::from_wgpu(
                 &pipeline.adapter, &pipeline.device,
             );
@@ -1467,9 +1471,18 @@ fn run_fisheye(
             // the segmented iterator (previously the zero-copy preview opened
             // only cfg.path — segment 0 — and froze past the first seam).
             let work = eye_w.max(eye_h).max(1280);
-            let iter = vr180_pipeline::fisheye_decode::SegmentedD3d11SharedDualStreamIter::new(
-                &cfg.segments, swap, work, work,
-            );
+            let iter = if sbs_ok {
+                vr180_pipeline::fisheye_decode::D3d11SharedSbsIter::new_with_work(
+                    &cfg.path, work, work,
+                ).map(vr180_pipeline::fisheye_decode::ZcFisheyeSource::Sbs)
+            } else {
+                // XOR with DJI's "swap by default" (matches the CPU worker).
+                let swap = kind.dual_stream_iter_swap(
+                    control.settings.read().effective_swap_eyes());
+                vr180_pipeline::fisheye_decode::SegmentedD3d11SharedDualStreamIter::new(
+                    &cfg.segments, swap, work, work,
+                ).map(vr180_pipeline::fisheye_decode::ZcFisheyeSource::Dual)
+            };
             match (ctx, iter) {
                 (Some(ctx), Ok(iter)) => {
                     tracing::info!(
@@ -1492,8 +1505,8 @@ fn run_fisheye(
         } else {
             tracing::info!(
                 "decoder (fisheye): zero-copy preconditions not met \
-                 (dji_osv={}, vulkan={}, p010={}) — CPU path",
-                kind.is_dual_stream(), on_vulkan, has_p010
+                 (dual_stream={}, sbs={}, vulkan={}, p010={}) — CPU path",
+                kind.is_dual_stream(), sbs_ok, on_vulkan, has_p010
             );
         }
     }
@@ -2326,11 +2339,16 @@ fn run_fisheye(
 struct FrameHold {
     /// Held for its `Drop` (closes NT handles / releases D3D11 textures) and
     /// for `pts_s`. Field is read, so no underscore needed.
-    pair: vr180_pipeline::fisheye_decode::SharedFisheyePair,
-    /// The two eyes' imported RGBA16 textures (D3D11-converted, working-res),
-    /// aliasing the D3D11 memory in `pair`.
+    pair: vr180_pipeline::fisheye_decode::ZcFisheyeFrame,
+    /// The two eyes' RGBA16 textures at working res. Dual-stream sources
+    /// import one per eye (aliasing the D3D11 memory in `pair`); a generic
+    /// SBS frame imports whole and these are the split halves (GPU copies).
     l_tex: wgpu::Texture,
     r_tex: wgpu::Texture,
+    /// SBS only: the imported full-frame alias the halves were copied from.
+    /// Held for the same deferred-drop window as `pair` so the D3D11 memory
+    /// outlives the in-flight split copy.
+    _full_tex: Option<wgpu::Texture>,
 }
 
 /// Push a just-replaced frame onto the retire queue and drop anything older
@@ -2371,15 +2389,15 @@ fn run_fisheye_zerocopy(
     eye_w: u32,
     eye_h: u32,
     ctx: vr180_pipeline::interop_windows::VulkanImportCtx,
-    iter: vr180_pipeline::fisheye_decode::SegmentedD3d11SharedDualStreamIter,
+    iter: vr180_pipeline::fisheye_decode::ZcFisheyeSource,
     frame_tx: Sender<DecodedFrame>,
     cmd_rx: Receiver<DecoderCommand>,
 ) -> anyhow::Result<()> {
-    use vr180_pipeline::fisheye_decode::SharedFisheyePair;
+    use vr180_pipeline::fisheye_decode::ZcFisheyeFrame;
 
     // ── Worker sub-thread: decode + share (D3D11 only, never touches wgpu) ──
     enum IterCmd { Seek(f64) }
-    let (pair_tx, pair_rx) = crossbeam_channel::bounded::<(u64, SharedFisheyePair)>(8);
+    let (pair_tx, pair_rx) = crossbeam_channel::bounded::<(u64, ZcFisheyeFrame)>(8);
     let (iter_cmd_tx, iter_cmd_rx) = crossbeam_channel::bounded::<IterCmd>(8);
     let (dims_tx, dims_rx) = crossbeam_channel::bounded::<(u32, u32)>(1);
 
@@ -2402,9 +2420,9 @@ fn run_fisheye_zerocopy(
                         // (seek lands on the keyframe ≤ t; same as the CPU path).
                         let dtl = 1.0 / (fps.max(1e-3) as f64);
                         for _ in 0..1200 {
-                            match iter.next_pair() {
+                            match iter.next() {
                                 Ok(Some(p)) => {
-                                    if p.pts_s >= t - dtl * 0.5 {
+                                    if p.pts_s() >= t - dtl * 0.5 {
                                         if pair_tx.send((gen, p)).is_err() { return; }
                                         break;
                                     }
@@ -2415,7 +2433,7 @@ fn run_fisheye_zerocopy(
                     }
                 }
             }
-            match iter.next_pair() {
+            match iter.next() {
                 Ok(Some(p)) => { if pair_tx.send((gen, p)).is_err() { break; } }
                 Ok(None) => break,
                 Err(e) => { tracing::warn!("zero-copy decode worker: {e}"); break; }
@@ -2503,8 +2521,8 @@ fn run_fisheye_zerocopy(
     let mut last_iter_end = std::time::Instant::now();
     let mut decode_us: u128;
 
-    let recv_next_pair = |rx: &crossbeam_channel::Receiver<(u64, SharedFisheyePair)>, expected: u64|
-        -> Option<SharedFisheyePair>
+    let recv_next_pair = |rx: &crossbeam_channel::Receiver<(u64, ZcFisheyeFrame)>, expected: u64|
+        -> Option<ZcFisheyeFrame>
     {
         loop {
             match rx.recv() {
@@ -2535,13 +2553,27 @@ fn run_fisheye_zerocopy(
             }
             match p {
                 Some(sp) => {
-                    // Import both eyes → single-plane RGBA16 wgpu textures
-                    // aliasing the D3D11-converted memory.
-                    let l_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.left) };
-                    let r_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.right) };
+                    // Import → single-plane RGBA16 wgpu textures aliasing the
+                    // D3D11-converted memory. Dual-stream sources give one
+                    // texture per eye; a generic SBS frame is one whole
+                    // texture split into halves by two GPU copies (the same
+                    // bridge the zero-copy export arm uses).
+                    let (l_tex, r_tex, full_tex) = match &sp {
+                        ZcFisheyeFrame::Pair(p) => (
+                            unsafe { ctx.import_rgba16(&pipeline.device, &p.left) },
+                            unsafe { ctx.import_rgba16(&pipeline.device, &p.right) },
+                            None,
+                        ),
+                        ZcFisheyeFrame::Sbs(f) => {
+                            let full = unsafe { ctx.import_rgba16(&pipeline.device, &f.tex) };
+                            let (l, r) = pipeline
+                                .split_sbs_texture_16(&full, f.eye_w, f.eye_h)?;
+                            (l, r, Some(full))
+                        }
+                    };
                     let prev = current.take();
                     retire_frame(&mut retire_q, prev);
-                    current = Some(FrameHold { pair: sp, l_tex, r_tex });
+                    current = Some(FrameHold { pair: sp, l_tex, r_tex, _full_tex: full_tex });
                 }
                 None => break 'main,
             }
@@ -2688,8 +2720,8 @@ fn run_fisheye_zerocopy(
 
         // ── Project each eye (P010 planar) + compose SBS ─────────────
         let phase_t0 = std::time::Instant::now();
-        let stab_idx = if fh.pair.pts_s.is_finite() && fh.pair.pts_s >= 0.0 {
-            (fh.pair.pts_s / dt).round() as usize
+        let stab_idx = if fh.pair.pts_s().is_finite() && fh.pair.pts_s() >= 0.0 {
+            (fh.pair.pts_s() / dt).round() as usize
         } else {
             (((time_offset / dt).round() as i64) + frame_idx as i64).max(0) as usize
         };
