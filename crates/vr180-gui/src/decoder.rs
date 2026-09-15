@@ -4894,8 +4894,15 @@ fn open_native_iter(
             let swap = kind.dual_stream_iter_swap(swap_eyes);
             Box::new(DualStreamFisheyeIter::new_with_options(path, HwDecode::Auto, 0, swap, 0, 8)?)
         }
+        // SOFTWARE decode for the still path on purpose: a d3d11va decoder
+        // allocates a DPB texture array sized for the NATIVE frame — measured
+        // ~8 GB on an 8192×4096 SBS clip — and the zero-copy preview already
+        // holds one for this same file. Two is most of a 24 GB card, and the
+        // still decodes one frame per request, so the hwaccel buys little
+        // here. (Dual-stream kinds keep Auto: ~3× smaller frames, and that
+        // path predates this.)
         vr180_pipeline::SourceKind::SbsFisheye =>
-            Box::new(SbsFisheyeIter::new(path, HwDecode::Auto, 0)?),
+            Box::new(SbsFisheyeIter::new(path, HwDecode::Software, 0)?),
         vr180_pipeline::SourceKind::BlackmagicRaw => {
             let info = vr180_braw::BrawInfo::probe(path)
                 .map_err(|e| anyhow::anyhow!("braw probe: {e}"))?;

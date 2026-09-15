@@ -179,6 +179,14 @@ pub struct Device {
     /// eframe's main thread for the shared wgpu device). Keyed by slot, stores
     /// `(w, h, texture)`; reused when dims match.
     rgba16_eq_out_cache: Mutex<HashMap<u32, (u32, u32, wgpu::Texture)>>,
+    /// Reusable per-eye halves for [`Device::split_sbs_texture_16`], keyed by
+    /// per-eye dims. Same reasoning as `rgba16_eq_out_cache`: the zero-copy
+    /// SBS preview splits on the DECODER thread, and a per-frame
+    /// `create_texture` there contends with eframe's main thread on the
+    /// shared device. Safe to overwrite each frame — the previous frame's
+    /// projection reads these before this frame's copy writes them
+    /// (GPU-ordered on one queue) and nothing holds them past compose.
+    sbs_split_cache: Mutex<HashMap<(u32, u32), (wgpu::Texture, wgpu::Texture)>>,
     /// Reusable MAP_READ staging buffers for texture readback, keyed by byte
     /// size. Allocating a fresh 88 MB staging buffer every frame (the P010
     /// Y+UV readback) is a big chunk of the export's per-frame cost —
@@ -469,6 +477,7 @@ impl Device {
             proj_fisheye_rs_cache: Mutex::new(HashMap::new()),
             proj_fisheye_cache: Mutex::new(HashMap::new()),
             rgba16_eq_out_cache: Mutex::new(HashMap::new()),
+            sbs_split_cache: Mutex::new(HashMap::new()),
             readback_staging: Mutex::new(HashMap::new()),
         })
     }
@@ -3060,22 +3069,28 @@ impl Device {
         eye_w: u32,
         eye_h: u32,
     ) -> Result<(wgpu::Texture, wgpu::Texture)> {
-        let mk = |label: &str| self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d { width: eye_w, height: eye_h, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Unorm,
-            // COPY_SRC so a caller can read a half back (readback export
-            // feeds, stills); the projection kernels only sample it.
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let left = mk("sbs_split_left");
-        let right = mk("sbs_split_right");
+        // Reuse the halves across frames (see `sbs_split_cache`) — the live
+        // preview runs this on the decoder thread every frame.
+        let (left, right) = {
+            let mut cache = self.sbs_split_cache.lock().unwrap();
+            cache.entry((eye_w, eye_h)).or_insert_with(|| {
+                let mk = |label: &str| self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d { width: eye_w, height: eye_h, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Unorm,
+                    // COPY_SRC so a caller can read a half back (readback
+                    // export feeds, stills); the kernels only sample it.
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_DST
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                (mk("sbs_split_left"), mk("sbs_split_right"))
+            }).clone()
+        };
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("sbs_split"),
         });
