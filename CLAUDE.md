@@ -243,10 +243,28 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    nothing at startup (no spurious chip).
    Regression sweep after all three: OSV/`.360`/SBS × nvenc/prores/portable
    all pass at unchanged fps, software-fallback output is pixel-identical to
-   hardware (0.72/255 mean, encoder noise). **Still open:** six `.expect()`s
-   in `interop_windows::import_d3d11_handle_to_wgpu` — the real hazard there
-   is cross-adapter on hybrid laptops, not OOM, and `vulkan_device_luid` has
-   no caller outside an example.
+   hardware (0.72/255 mean, encoder noise). SAME DAY: **cross-GPU guard.** The
+   remaining hazard in `import_d3d11_handle_to_wgpu` was never OOM (the import
+   is +0 MiB — it aliases D3D11 memory); it is **adapter mismatch**. ffmpeg's
+   d3d11va device is created with a NULL device name = DXGI adapter 0, while
+   wgpu picks its own adapter, so on a hybrid machine (iGPU + dGPU) the NT
+   handle is meaningless to Vulkan and the import dies on one of six
+   `.expect()`s. `VulkanImportCtx::from_wgpu` now compares
+   `vulkan_device_luid()` against the new `dxgi_default_adapter_luid()` and
+   returns `None` on mismatch — one place, because every zero-copy caller
+   already treats `None` as "no zero-copy" and falls through to the PORTABLE
+   path, which downloads to the CPU and is adapter-agnostic. So a hybrid
+   laptop gets a working (slower) decode instead of a panic, with no new
+   fallback plumbing. (`vulkan_device_luid` previously had no caller outside
+   an example.) PROVEN on this box, which really is hybrid:
+   `examples/luid_check.rs` (gitignored) builds a ctx on every Vulkan adapter
+   — the RTX 4090 (matching DXGI adapter 0) is ACCEPTED, the Intel UHD 770 is
+   REFUSED with the fallback warning. Zero refusals during normal 4090
+   operation; full export matrix unchanged. **Still open (deliberately):** the
+   six `.expect()`s themselves — with the LUID guard in front of them the
+   realistic trigger is gone, and de-panicking them means threading
+   `Option`/`Result` through ~12 call sites in hot loops (they also leak the
+   `VkImage` on the allocate/bind failure paths).
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

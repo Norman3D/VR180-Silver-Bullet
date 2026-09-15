@@ -54,6 +54,11 @@
   SBS decoder always produced 8-bit frames while the 10-bit arms expect
   16-bit ones. The SBS decoder now follows the output bit depth, so a
   10-bit SBS source also keeps its precision.
+- **Laptops with two GPUs no longer crash on the fast path.** When the
+  video decoder and the renderer ended up on different GPUs (common on
+  laptops with both an integrated and a discrete chip), the accelerated
+  path could take the app down. It now detects the mismatch and uses the
+  compatible path instead — slower, but it works.
 - **Failures are now reported instead of looking like success.** An export
   that lost its decoder mid-run used to finalize a short file and report
   "done"; it now fails with the reason (cancelling still keeps the partial
