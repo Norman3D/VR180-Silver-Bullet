@@ -885,7 +885,11 @@ fn export_fisheye_inner(
                         c.is_some(), i.is_ok()
                     );
                     set_export_path_note(Some(
-                        "CPU export path — GPU decode init failed".into()));
+                        // Say WHY: on a small card the usual cause is the
+                        // VRAM pre-flight declining, not a broken driver.
+                        crate::interop_windows::hw_decode_decline_reason()
+                            .map(|r| format!("CPU export path — {r}"))
+                            .unwrap_or_else(|| "CPU export path — GPU decode init failed".into())));
                 }
             }
         } else if std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none() {
@@ -1608,7 +1612,11 @@ fn export_eac_inner(
                         "export_eac: GPU-resident unavailable (vulkan_ctx={}, iter_ok={}) — \
                          falling through to portable path", c.is_some(), i.is_ok());
                     set_export_path_note(Some(
-                        "CPU export path — GPU decode init failed".into()));
+                        // Say WHY: on a small card the usual cause is the
+                        // VRAM pre-flight declining, not a broken driver.
+                        crate::interop_windows::hw_decode_decline_reason()
+                            .map(|r| format!("CPU export path — {r}"))
+                            .unwrap_or_else(|| "CPU export path — GPU decode init failed".into())));
                 }
             }
         } else if std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none()

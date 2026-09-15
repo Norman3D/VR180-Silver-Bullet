@@ -1848,7 +1848,43 @@ pub(crate) fn download_hw_frame(
 pub(crate) fn try_enable_d3d11va_decode(
     dec_ctx: &mut ffmpeg_next::codec::context::Context,
 ) -> bool {
+    try_enable_d3d11va_decode_n(dec_ctx, 1)
+}
+
+/// [`try_enable_d3d11va_decode`] for a source that opens `concurrent_streams`
+/// decoders at once (dual-stream cameras open two), so the VRAM check below
+/// budgets for all of them rather than one at a time.
+///
+/// **The VRAM gate lives here on purpose.** Every hardware attach in the app
+/// funnels through this function, and a d3d11va DPB is huge — ~240 MiB per
+/// megapixel of video (see `interop_windows::decoder_vram_estimate_mib`), so
+/// an 8K source wants ~8 GB. Worse, the pool commits LAZILY: `avcodec_open2`
+/// succeeds and the allocation only fails on the first frame, by which point
+/// FFmpeg has silently swapped to a software pixel format that the zero-copy
+/// importers cannot consume — the user sees a frozen preview or a truncated
+/// export, not a clean fallback. Declining up front converts that into the
+/// behaviour we want: the zero-copy constructors return `Err` (they all
+/// require this to succeed), their callers take the portable path, and the
+/// portable path decodes in software. Slow, but correct on any card.
+#[cfg(target_os = "windows")]
+pub(crate) fn try_enable_d3d11va_decode_n(
+    dec_ctx: &mut ffmpeg_next::codec::context::Context,
+    concurrent_streams: u32,
+) -> bool {
     use ffmpeg_next::ffi::*;
+    // VRAM pre-flight — see the doc comment above.
+    {
+        let (w, h) = unsafe {
+            let raw = dec_ctx.as_ptr();
+            ((*raw).width.max(0) as u32, (*raw).height.max(0) as u32)
+        };
+        if w > 0 && h > 0 {
+            let streams = vec![(w, h); concurrent_streams.max(1) as usize];
+            if !crate::interop_windows::hw_decode_fits(&streams) {
+                return false;
+            }
+        }
+    }
     let mut hw_device: *mut AVBufferRef = std::ptr::null_mut();
     let ret = unsafe {
         av_hwdevice_ctx_create(
@@ -2021,7 +2057,7 @@ impl StreamPairIter {
             #[cfg(target_os = "windows")]
             {
                 if matches!(hw, HwDecode::Auto)
-                    && try_enable_d3d11va_decode(&mut codec_ctx)
+                    && try_enable_d3d11va_decode_n(&mut codec_ctx, 2)
                 {
                     hw_active[i] = true;
                     tracing::info!("StreamPairIter: D3D11VA hw decode active on stream {i}");

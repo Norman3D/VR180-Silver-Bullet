@@ -54,6 +54,16 @@
   SBS decoder always produced 8-bit frames while the 10-bit arms expect
   16-bit ones. The SBS decoder now follows the output bit depth, so a
   10-bit SBS source also keeps its precision.
+- **Windows: hardware decode now checks free GPU memory first, and falls
+  back to software when it will not fit.** A hardware video decoder needs
+  roughly 240 MB of GPU memory per megapixel of video, so an 8K clip wants
+  about 8 GB and a dual-lens camera about 7 GB. On a card that cannot spare
+  that, the app now decodes in software automatically — slower, but it
+  works — instead of the preview silently freezing or an export stopping
+  early. The export bar says why ("not enough GPU memory for hardware
+  decode (7.9 GB needed, 5.9 GB free)"). Cards with room are unaffected.
+  `VR180_NO_HW_DECODE=1` forces software decode; `VR180_FORCE_HW_DECODE=1`
+  skips the check.
 - **Windows: side-by-side sources are now GPU-accelerated end to end** —
   hardware (NVDEC) decode, GPU eye split, projection, color and encode,
   with the audio muxed inline. Exports measured 5 → 37 fps for a 4K

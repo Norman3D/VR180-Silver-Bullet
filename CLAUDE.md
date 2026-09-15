@@ -185,6 +185,44 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    Verified by `examples/sbs_zc_check.rs` (gitignored): GPU-left vs CPU-left
    101/65535 while GPU-left vs CPU-RIGHT is 3122 (31× — split provably not
    swapped/offset), work-res downscale exact dims + identical mean level.
+11. **VRAM gate on hardware decode (Windows, 2026-09-15).** A d3d11va DPB is
+   20 surfaces and the NVIDIA driver commits **~4× the P010 payload per
+   `BIND_DECODER` array slice**, so the cost is **~240 MiB per megapixel per
+   stream** — 8K SBS ~7.9 GB, OSV/`.insv` ~7.0 GB (two streams), `.360`
+   ~5.6 GB, 4K SBS ~2.0 GB. Model verified against measurement within 4% on
+   all four. This has shipped since **v2.0.0 (2026-06-07, `4eb9ba4`)** for
+   OSV and **v2.1.0 (`13098a4`)** for `.360`; generic SBS only joined on
+   2026-09-15 and never shipped. **8 and 12 GB cards were already broken for
+   the flagship formats**, and OSV preview+zoom (13.9 GB) fails even at 16 GB.
+   The failure was NOT graceful: the pool commits LAZILY (`avcodec_open2`
+   succeeds; the allocation only fails on the first frame), so FFmpeg
+   silently swapped to a software pix_fmt the zero-copy importer can't use →
+   `Err` mid-stream → the worker logged one `warn!` and broke → the app
+   logged **"decoder thread exited cleanly"**. A VRAM failure was
+   indistinguishable from EOF: frozen preview, no message. The
+   constructor-keyed fallback at `decoder.rs` could never fire, because the
+   constructor had already returned `Ok`.
+   FIX: a pre-flight budget check inside **`decode.rs::try_enable_d3d11va_decode_n`**
+   — the one function every hardware attach funnels through. It asks DXGI
+   (`interop_windows::vram_headroom_mib`, `IDXGIAdapter3::QueryVideoMemoryInfo`,
+   no new dependency) and declines if `need + 1 GiB reserve` doesn't fit.
+   Declining up front is what makes the EXISTING ladder work: the zero-copy
+   constructors all require this to succeed, so they return `Err` → callers
+   take the portable path → the portable path's own attach also declines →
+   software decode. Dual-stream sites pass `concurrent_streams = 2` so both
+   decoders are budgeted (they commit lazily, so per-stream checks would both
+   pass and then both fail). Env: `VR180_NO_HW_DECODE=1` forces software,
+   `VR180_FORCE_HW_DECODE=1` bypasses, `VR180_VRAM_BUDGET_MIB=6000` fakes a
+   small card for testing on a big one. Verified: simulated 8 GB card →
+   decline logged, export falls to software and COMPLETES (1.6 fps);
+   4K SBS / OSV / `.360` unaffected on the 4090 (fast path still engages,
+   same fps). **Still open** (audit found, not yet fixed): a decode-thread
+   error mid-export finalizes and reports `Done` with a truncated file
+   (`fisheye_export.rs` `warn!`-only); a decoder-thread panic skips the
+   `finished` flag and wedges Play/Pause; no `on_uncaptured_error` on either
+   wgpu device (wgpu 29 default is `panic!`); six `.expect()`s in
+   `interop_windows::import_d3d11_handle_to_wgpu` (the real hazard there is
+   cross-adapter on hybrid laptops, not OOM).
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

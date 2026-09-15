@@ -747,7 +747,7 @@ impl DualStreamFisheyeIter {
                 // downloaded to host memory in `scale_one`.
                 #[cfg(target_os = "windows")]
                 if matches!(hw, HwDecode::Auto)
-                    && crate::decode::try_enable_d3d11va_decode(&mut codec_ctx)
+                    && crate::decode::try_enable_d3d11va_decode_n(&mut codec_ctx, 2)
                 {
                     hw_active[i] = true;
                     tracing::info!(
@@ -1108,7 +1108,7 @@ impl D3d11SharedDualStreamIter {
             let mut codec_ctx =
                 ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
                     .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
-            if !crate::decode::try_enable_d3d11va_decode(&mut codec_ctx) {
+            if !crate::decode::try_enable_d3d11va_decode_n(&mut codec_ctx, 2) {
                 return Err(Error::Ffmpeg(format!(
                     "zero-copy OSV path requires d3d11va hwaccel — setup failed on stream {idx}"
                 )));
@@ -1875,7 +1875,7 @@ impl D3d11SharedStreamPairIter {
             let mut codec_ctx =
                 ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
                     .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
-            if !crate::decode::try_enable_d3d11va_decode(&mut codec_ctx) {
+            if !crate::decode::try_enable_d3d11va_decode_n(&mut codec_ctx, 2) {
                 return Err(Error::Ffmpeg(format!(
                     "zero-copy EAC path requires d3d11va hwaccel — setup failed on stream {idx}"
                 )));

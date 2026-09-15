@@ -968,3 +968,131 @@ impl VulkanImportCtx {
         )
     }
 }
+
+// ── VRAM budget for the hardware-decode fast paths ─────────────────────
+//
+// A d3d11va decoder is expensive out of all proportion to the video: FFmpeg
+// asks for a 20-surface DPB (1 work + 16 HEVC refs + 3), and the NVIDIA
+// driver commits ~4x the pixel payload per `BIND_DECODER` array slice.
+// Measured across seven sources (4K/8K SBS, OSV, .360) within 4%:
+//
+//     ~240 MiB of VRAM per megapixel of decoded video, per decoder
+//
+// so an 8192x4096 SBS clip costs ~7.9 GB and a dual-stream OSV ~7.0 GB
+// (two 3840x3840 decoders). On a 24 GB card that is invisible; on an 8 GB
+// card the pool cannot be allocated at all, and because the pool commits
+// LAZILY — `avcodec_open2` succeeds and the failure only appears on the
+// first frame — an un-gated zero-copy path does not fail cleanly. It ends
+// up decoding to a software pixel format the zero-copy importer cannot
+// use, which surfaces as a frozen preview or a truncated export.
+//
+// Hence: ask DXGI what we can actually commit BEFORE engaging, and let the
+// caller take the software path when it will not fit.
+
+/// MiB of device-local video memory this process can still commit, per DXGI
+/// (`Budget - CurrentUsage`, clamped at 0). `None` if DXGI is unavailable.
+///
+/// The budget is advisory and shared with every other app on the GPU, so
+/// treat it as a guard rail rather than an exact figure.
+pub fn vram_headroom_mib() -> Option<u64> {
+    // Test/override hook: pretend the card has this much headroom. Lets a
+    // big-GPU dev box exercise the small-GPU path (`VR180_VRAM_BUDGET_MIB=6000`
+    // behaves like an 8 GB card with a desktop on it).
+    if let Some(v) = std::env::var("VR180_VRAM_BUDGET_MIB").ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        return Some(v);
+    }
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, IDXGIAdapter3, IDXGIFactory1, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+    };
+    unsafe {
+        let factory = CreateDXGIFactory1::<IDXGIFactory1>().ok()?;
+        let adapter = factory.EnumAdapters(0).ok()?;
+        let adapter3 = adapter.cast::<IDXGIAdapter3>().ok()?;
+        let mut info = Default::default();
+        adapter3
+            .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info)
+            .ok()?;
+        Some(info.Budget.saturating_sub(info.CurrentUsage) / (1024 * 1024))
+    }
+}
+
+/// MiB a d3d11va decode pool will commit for `streams` (one entry per video
+/// stream — dual-stream sources open TWO decoders). See the module note:
+/// ~240 MiB per megapixel, per stream.
+pub fn decoder_vram_estimate_mib(streams: &[(u32, u32)]) -> u64 {
+    const MIB_PER_MEGAPIXEL: f64 = 240.0;
+    let megapixels: f64 = streams
+        .iter()
+        .map(|&(w, h)| (w as f64 * h as f64) / 1.0e6)
+        .sum();
+    (megapixels * MIB_PER_MEGAPIXEL).ceil() as u64
+}
+
+/// Whether a hardware decode of `streams` fits in the current headroom, with
+/// room left for the rest of the app (wgpu preview textures, the compositor,
+/// whatever else the user is running).
+///
+/// `VR180_FORCE_HW_DECODE=1` bypasses the check (for testing, or for a user
+/// who knows their card is fine and dislikes our margin);
+/// `VR180_NO_HW_DECODE=1` forces software everywhere.
+pub fn hw_decode_fits(streams: &[(u32, u32)]) -> bool {
+    hw_decode_fits_inner(streams)
+}
+
+/// Why the last `hw_decode_fits` call declined, for the UI. `None` when the
+/// last decision was "fits" (or nothing has asked yet).
+pub fn hw_decode_decline_reason() -> Option<String> {
+    DECLINE_REASON.lock().unwrap().clone()
+}
+
+static DECLINE_REASON: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn set_decline(reason: Option<String>) {
+    *DECLINE_REASON.lock().unwrap() = reason;
+}
+
+fn hw_decode_fits_inner(streams: &[(u32, u32)]) -> bool {
+    if std::env::var_os("VR180_NO_HW_DECODE").is_some() {
+        tracing::info!("hw decode: disabled by VR180_NO_HW_DECODE");
+        set_decline(Some("hardware decode disabled (VR180_NO_HW_DECODE)".into()));
+        return false;
+    }
+    if std::env::var_os("VR180_FORCE_HW_DECODE").is_some() {
+        set_decline(None);
+        return true;
+    }
+    // Keep back enough for the preview/compose textures and the desktop; the
+    // DXGI budget is shared and a decoder that *just* fits would push the
+    // rest of the app into eviction.
+    const RESERVE_MIB: u64 = 1024;
+    let need = decoder_vram_estimate_mib(streams);
+    match vram_headroom_mib() {
+        Some(head) => {
+            let fits = head >= need + RESERVE_MIB;
+            set_decline((!fits).then(|| format!(
+                "not enough GPU memory for hardware decode ({:.1} GB needed, {:.1} GB free)",
+                need as f64 / 1024.0, head as f64 / 1024.0)));
+            if !fits {
+                tracing::warn!(
+                    "hw decode: {} MiB needed for {} stream(s) + {} MiB reserve, \
+                     but only {} MiB of VRAM headroom — using software decode",
+                    need, streams.len(), RESERVE_MIB, head,
+                );
+            } else {
+                tracing::info!(
+                    "hw decode: {} MiB needed, {} MiB headroom — OK", need, head);
+            }
+            fits
+        }
+        // No DXGI answer: assume it fits (the pre-2.6 behaviour) rather than
+        // demoting every export on a machine we cannot measure.
+        None => {
+            tracing::warn!("hw decode: DXGI budget unavailable — assuming it fits");
+            set_decline(None);
+            true
+        }
+    }
+}
