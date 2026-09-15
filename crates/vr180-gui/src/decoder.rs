@@ -332,6 +332,10 @@ pub struct Settings {
     pub eye_match_ct: f32,
     /// "Matching Eyes" inter-eye tint trim [-1..+1] (opposite per eye).
     pub eye_match_tint: f32,
+    /// "Matching Eyes" inter-eye exposure trim in STOPS [-1..+1] (opposite per
+    /// eye). Corrects a brightness difference between the two lenses, which
+    /// otherwise reads as binocular rivalry. 0 = off.
+    pub eye_match_exposure: f32,
     /// Optional 3D LUT file path. Empty string = no LUT.
     /// Equirect-aware unsharp-mask amount (0 = off, 0.5 subtle, 1 mod,
     /// 2 strong). Ported from the Python app; applies to every source.
@@ -448,6 +452,7 @@ impl Default for Settings {
             saturation: 1.0,
             eye_match_ct: 0.0,
             eye_match_tint: 0.0,
+            eye_match_exposure: 0.0,
             lut_path: String::new(),
             lut_intensity: 1.0,
             preview_mode: PreviewMode::Sbs,
@@ -595,6 +600,7 @@ impl Settings {
         // `ColorStackPlan::for_eye` at each per-eye color-stack apply site.
         plan.eye_match_ct = self.eye_match_ct;
         plan.eye_match_tint = self.eye_match_tint;
+        plan.eye_match_exposure = self.eye_match_exposure;
         if !self.lut_path.is_empty() {
             if let Some(lut) = load_lut_cached(&self.lut_path) {
                 plan.lut = Some((lut, self.lut_intensity.clamp(0.0, 1.0)));

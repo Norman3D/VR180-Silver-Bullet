@@ -1358,7 +1358,8 @@ fn export_fisheye_inner(
             )?;
             let sbs_rgb8 = pipeline.read_texture_rgb8(&sbs_tex, sbs_w, sbs_h)?;
             let mut graded = if color_any {
-                apply_color_stack_rgb8(&*pipeline, &color_plan, sbs_rgb8, sbs_w, sbs_h)?
+                apply_color_stack_rgb8_sbs(
+                    &*pipeline, &color_plan, sbs_rgb8, sbs_w, sbs_h, cfg.eye_w)?
             } else {
                 sbs_rgb8
             };
@@ -1754,7 +1755,8 @@ fn export_eac_inner(
         let sbs = pipeline.compose_sbs_textures(&left, &right, cfg.eye_w, cfg.eye_h)?;
         let rgb = pipeline.read_texture_rgb8(&sbs, sbs_w, sbs_h)?;
         let mut graded = if color_any {
-            apply_color_stack_rgb8(&pipeline, &color_plan, rgb, sbs_w, sbs_h)?
+            apply_color_stack_rgb8_sbs(
+                &pipeline, &color_plan, rgb, sbs_w, sbs_h, cfg.eye_w)?
         } else { rgb };
         // "BeyondVR Hack" — last, on the graded SBS (padding stays black).
         if color_plan.eye_scale != 1.0 {
@@ -4049,4 +4051,49 @@ fn apply_color_stack_rgb8(
         rgb = pipeline.apply_color_grade(&rgb, w, h, plan.color_grade.saturation_only())?;
     }
     Ok(rgb)
+}
+
+/// `apply_color_stack_rgb8` for a COMPOSED side-by-side buffer, honouring the
+/// "Matching Eyes" per-eye trim (CT / tint / exposure).
+///
+/// The 8-bit fallback grades the SBS in one pass, which silently dropped the
+/// per-eye trim that every 10-bit and zero-copy arm applies via
+/// [`ColorStackPlan::for_eye`]. Splitting is exact here because every stage in
+/// `apply_color_stack_rgb8` (CDL / LUT / WB / saturation) is per-pixel - there
+/// is no spatial filter to straddle the halves, so no seam.
+///
+/// With no trim set this is the old single whole-SBS call verbatim: same
+/// buffer, no split, byte-identical output.
+fn apply_color_stack_rgb8_sbs(
+    pipeline: &Device,
+    plan: &ColorStackPlan,
+    rgb: Vec<u8>,
+    sbs_w: u32, sbs_h: u32,
+    eye_w: u32,
+) -> Result<Vec<u8>> {
+    // `for_eye` borrows when every trim is off - the cheap way to ask
+    // "does this plan differ per eye?" without duplicating the condition.
+    let per_eye = matches!(plan.for_eye(true), std::borrow::Cow::Owned(_));
+    if !per_eye || sbs_w != eye_w * 2 {
+        return apply_color_stack_rgb8(pipeline, plan, rgb, sbs_w, sbs_h);
+    }
+    let row  = sbs_w as usize * 3;
+    let half = eye_w as usize * 3;
+    let rows = sbs_h as usize;
+    let mut l = Vec::with_capacity(half * rows);
+    let mut r = Vec::with_capacity(half * rows);
+    for y in 0..rows {
+        let o = y * row;
+        l.extend_from_slice(&rgb[o..o + half]);
+        r.extend_from_slice(&rgb[o + half..o + row]);
+    }
+    let l = apply_color_stack_rgb8(pipeline, &plan.for_eye(true),  l, eye_w, sbs_h)?;
+    let r = apply_color_stack_rgb8(pipeline, &plan.for_eye(false), r, eye_w, sbs_h)?;
+    let mut out = rgb;
+    for y in 0..rows {
+        let o = y * row;
+        out[o..o + half].copy_from_slice(&l[y * half..(y + 1) * half]);
+        out[o + half..o + row].copy_from_slice(&r[y * half..(y + 1) * half]);
+    }
+    Ok(out)
 }

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Matching Eyes: exposure
+- The **Matching Eyes** panel gains an **Eye Exposure (±EV)** slider
+  alongside Eye CT and Eye Tint. Like them it applies oppositely to the two
+  eyes — left `+`, right `−`, in stops — so a brightness difference between
+  the two lenses can be dialled out without changing the overall level. A
+  lens-to-lens exposure mismatch is a common cause of binocular rivalry (the
+  eyes "fighting" instead of fusing), and until now only its colour could be
+  corrected. 0 = off; ↑/↓ nudge by 0.01 stop.
+- **Fixed:** the Matching Eyes trim was silently dropped on **8-bit exports**.
+  That arm grades the composed side-by-side frame in one pass, so both eyes
+  got the same (un-trimmed) plan, while every 10-bit and zero-copy arm applied
+  it per eye. 8-bit now grades each half with its own plan. Output with no
+  trim set is byte-identical to before.
+
 ### Snapshot
 - **📷 Snapshot** button in the transport bar (`S`; Stop no longer has a
   hotkey): saves the

@@ -701,6 +701,14 @@ fn tr(en: &'static str) -> &'static str {
         "Radius" => "半径",
         "Reset tone" => "重置影调",
         "Reset color" => "重置色彩",
+        // Matching Eyes (inter-eye trim)
+        "Matching Eyes" => "双目匹配",
+        "Fixes a difference between the two lenses — CT, Tint and Exposure apply oppositely to each eye."
+            => "修正两个镜头之间的差异——色温、色调和曝光对两眼反向施加。",
+        "Eye CT (±)" => "双目色温 (±)",
+        "Eye Tint (±)" => "双目色调 (±)",
+        "Eye Exposure (±EV)" => "双目曝光 (±EV)",
+        "Reset matching" => "重置匹配",
         "Browse…" => "浏览…",
         "Clear" => "清除",
         "Use built-in Osmo 360 D-LogM→709" => "使用内置 Osmo 360 D-LogM→709",
@@ -5207,18 +5215,19 @@ impl App {
 
         ui.separator();
 
-        // ── Matching Eyes — inter-eye white-balance trim. CT/Tint apply
+        // ── Matching Eyes — inter-eye trim. Every knob here applies
         //    OPPOSITELY to each eye (left +, right −) to correct an inter-lens
-        //    color discrepancy without shifting overall color. ↑/↓ = 0.01. ──
+        //    discrepancy without shifting the overall look: CT/Tint for color,
+        //    Exposure (in stops) for brightness. ↑/↓ = 0.01. ──
         ui.label(RichText::new(tr("Matching Eyes")).strong());
         ui.label(RichText::new(tr(
-            "Fixes a color difference between the two lenses — CT and Tint \
-             apply oppositely to each eye."
+            "Fixes a difference between the two lenses — CT, Tint and Exposure apply oppositely to each eye."
         )).small().color(Color32::GRAY));
-        fine_slider(ui, 1.0, &mut s.eye_match_ct, -1.0..=1.0, "Eye CT (±)", 2, 1.0, 0.01);
-        fine_slider(ui, 1.0, &mut s.eye_match_tint, -1.0..=1.0, "Eye Tint (±)", 2, 1.0, 0.01);
+        fine_slider(ui, 1.0, &mut s.eye_match_ct, -1.0..=1.0, tr("Eye CT (±)"), 2, 1.0, 0.01);
+        fine_slider(ui, 1.0, &mut s.eye_match_tint, -1.0..=1.0, tr("Eye Tint (±)"), 2, 1.0, 0.01);
+        fine_slider(ui, 1.0, &mut s.eye_match_exposure, -1.0..=1.0, tr("Eye Exposure (±EV)"), 2, 1.0, 0.01);
         if ui.button(tr("Reset matching")).clicked() {
-            s.eye_match_ct = 0.0; s.eye_match_tint = 0.0;
+            s.eye_match_ct = 0.0; s.eye_match_tint = 0.0; s.eye_match_exposure = 0.0;
         }
 
         ui.separator();

@@ -4388,6 +4388,14 @@ pub struct ColorStackPlan {
     /// without shifting the overall color. 0 = off.
     pub eye_match_ct:   f32,
     pub eye_match_tint: f32,
+    /// "Matching Eyes" inter-eye EXPOSURE trim, in stops. Applied oppositely
+    /// to the two eyes (left `+`, right `−`) as a multiply on the CDL gain
+    /// (`gain * 2^(±stops)`) — the same pre-LUT stage the CT/tint trim uses,
+    /// so both corrections act on the sensor signal before the creative
+    /// transform. Corrects an inter-lens brightness discrepancy (a common
+    /// cause of binocular rivalry) without shifting the overall level.
+    /// 0 = off.
+    pub eye_match_exposure: f32,
     /// "BeyondVR Hack": scale each eye about its own (half-)center at the
     /// very END of the stack, padding the revealed border with black.
     /// 1.0 = off. Export-only — the preview plan never sets it.
@@ -4404,6 +4412,7 @@ impl Default for ColorStackPlan {
             color_grade: ColorGradeParams::default(),
             eye_match_ct: 0.0,
             eye_match_tint: 0.0,
+            eye_match_exposure: 0.0,
             eye_scale: 1.0,
         }
     }
@@ -4418,21 +4427,35 @@ impl ColorStackPlan {
             || !self.color_grade.is_identity()
             || self.eye_match_ct != 0.0
             || self.eye_match_tint != 0.0
+            || self.eye_match_exposure != 0.0
             || self.eye_scale != 1.0
     }
 
-    /// This plan specialized for one eye: the "Matching Eyes" CT/tint trim is
-    /// added in OPPOSITE directions (left `+`, right `−`) on top of the global
-    /// temperature/tint. Cheap when the trim is off — borrows `self` with no
-    /// clone; only clones (incl. any LUT) when a trim is actually set.
+    /// This plan specialized for one eye: the "Matching Eyes" trims are applied
+    /// in OPPOSITE directions (left `+`, right `−`) — CT/tint on top of the
+    /// global temperature/tint, exposure as a multiply on the CDL gain. Cheap
+    /// when every trim is off — borrows `self` with no clone; only clones
+    /// (incl. any LUT) when a trim is actually set.
     pub fn for_eye(&self, is_left: bool) -> std::borrow::Cow<'_, ColorStackPlan> {
-        if self.eye_match_ct == 0.0 && self.eye_match_tint == 0.0 {
+        if self.eye_match_ct == 0.0
+            && self.eye_match_tint == 0.0
+            && self.eye_match_exposure == 0.0
+        {
             return std::borrow::Cow::Borrowed(self);
         }
         let sign = if is_left { 1.0 } else { -1.0 };
         let mut p = self.clone();
         p.color_grade.temperature += sign * self.eye_match_ct;
         p.color_grade.tint += sign * self.eye_match_tint;
+        // Exposure is multiplicative: `gain` in `cdl.wgsl` is a straight
+        // `x * gain` before the shadow/highlight zones and the [0,1] clip, so
+        // scaling it by 2^stops IS an exposure trim. Composes with whatever
+        // the global Gain slider is set to, and activates the CDL stage on its
+        // own (the rest of that stage is identity, so the only added work is
+        // one dispatch).
+        if self.eye_match_exposure != 0.0 {
+            p.cdl.gain *= (sign * self.eye_match_exposure).exp2();
+        }
         std::borrow::Cow::Owned(p)
     }
 }

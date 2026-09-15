@@ -265,6 +265,36 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    realistic trigger is gone, and de-panicking them means threading
    `Option`/`Result` through ~12 call sites in hot loops (they also leak the
    `VkImage` on the allocate/bind failure paths).
+12. **Matching Eyes gained an EXPOSURE trim (2026-09-15) — CROSS-PLATFORM,
+   nothing Windows-specific.** `ColorStackPlan::eye_match_exposure` (stops)
+   joins `eye_match_ct`/`eye_match_tint` and is applied in the same one
+   place, `ColorStackPlan::for_eye`, as `cdl.gain *= 2^(±stops)` — `gain` in
+   `cdl.wgsl` is a straight `x * gain` before the shadow/highlight zones and
+   the [0,1] clip, so scaling it IS an exposure trim, and it lands PRE-LUT
+   next to the CT/tint trim (both correct the sensor signal before the
+   creative transform). Because `for_eye` is the single funnel every preview
+   and export arm already calls, no new plumbing was needed. It composes with
+   the global Gain slider rather than replacing it, and activates the CDL
+   stage on its own (one extra dispatch; the rest of that stage is identity).
+   Verified on real 16-bit textures by `examples/eye_exposure_check.rs`
+   (gitignored): left/right = `v · 2^±ev` to within 1 LSB of 16-bit, the two
+   eyes' geometric mean == the source, composition with Gain 1.2 exact, and
+   `for_eye` still BORROWS (no clone) when every trim is 0. End-to-end on an
+   OSV at 0.4 stop: 8-bit portable and 10-bit NVENC zero-copy agree to 0.02%
+   (left ×1.309, right ×0.755 — short of the nominal ×1.3195 only because
+   highlights clip on the brightening eye).
+   ONE REAL BUG FIXED doing this: the **8-bit portable arms dropped the
+   Matching Eyes trim entirely** (CT and tint too — pre-existing, not new).
+   Both of them (`fisheye_export.rs`: the portable SBS loop and the portable
+   EAC loop) grade the COMPOSED side-by-side buffer in one
+   `apply_color_stack_rgb8` call with the un-eyed plan, while every 10-bit and
+   zero-copy arm uses `for_eye`. New `apply_color_stack_rgb8_sbs` splits the
+   SBS into halves, grades each with its own plan and re-joins — exact, since
+   every stage in that 8-bit stack (CDL/LUT/WB/saturation) is per-pixel, so
+   there is no spatial filter to straddle the halves and no seam. It short-
+   circuits to the OLD single whole-SBS call when no trim is set, so the
+   untrimmed 8-bit path is untouched — PROVEN byte-identical (same frame md5,
+   same 4265493-byte file, before vs after).
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
