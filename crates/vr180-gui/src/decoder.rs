@@ -332,8 +332,8 @@ pub struct Settings {
     pub eye_match_ct: f32,
     /// "Matching Eyes" inter-eye tint trim [-1..+1] (opposite per eye).
     pub eye_match_tint: f32,
-    /// "Matching Eyes" inter-eye exposure trim in STOPS [-1..+1] (opposite per
-    /// eye). Corrects a brightness difference between the two lenses, which
+    /// "Matching Eyes" inter-eye exposure trim in STOPS [-0.5..+0.5] (opposite
+    /// per eye). Corrects a brightness difference between the two lenses, which
     /// otherwise reads as binocular rivalry. 0 = off.
     pub eye_match_exposure: f32,
     /// Optional 3D LUT file path. Empty string = no LUT.

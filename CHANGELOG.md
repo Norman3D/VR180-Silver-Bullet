@@ -9,7 +9,7 @@
   the two lenses can be dialled out without changing the overall level. A
   lens-to-lens exposure mismatch is a common cause of binocular rivalry (the
   eyes "fighting" instead of fusing), and until now only its colour could be
-  corrected. 0 = off; ↑/↓ nudge by 0.01 stop.
+  corrected. Range ±0.5 stop, 0 = off; ↑/↓ nudge by 0.01.
 - **Fixed:** the Matching Eyes trim was silently dropped on **8-bit exports**.
   That arm grades the composed side-by-side frame in one pass, so both eyes
   got the same (un-trimmed) plan, while every 10-bit and zero-copy arm applied

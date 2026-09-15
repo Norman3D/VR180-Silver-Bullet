@@ -5225,7 +5225,7 @@ impl App {
         )).small().color(Color32::GRAY));
         fine_slider(ui, 1.0, &mut s.eye_match_ct, -1.0..=1.0, tr("Eye CT (±)"), 2, 1.0, 0.01);
         fine_slider(ui, 1.0, &mut s.eye_match_tint, -1.0..=1.0, tr("Eye Tint (±)"), 2, 1.0, 0.01);
-        fine_slider(ui, 1.0, &mut s.eye_match_exposure, -1.0..=1.0, tr("Eye Exposure (±EV)"), 2, 1.0, 0.01);
+        fine_slider(ui, 1.0, &mut s.eye_match_exposure, -0.5..=0.5, tr("Eye Exposure (±EV)"), 2, 1.0, 0.01);
         if ui.button(tr("Reset matching")).clicked() {
             s.eye_match_ct = 0.0; s.eye_match_tint = 0.0; s.eye_match_exposure = 0.0;
         }
