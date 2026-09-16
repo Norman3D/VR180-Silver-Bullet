@@ -424,17 +424,25 @@ pub unsafe fn share_d3d11_texture_slice(
     })
 }
 
-/// HLSL: P010 (Y plane R16 SRV + UV plane Rg16 SRV) → RGBA16 UAV, with BT.709
-/// limited-range expansion and a box downscale to the output dims. Done on the
-/// D3D11 side because the multi-plane P010 texture imports into Vulkan with a
-/// broken chroma-plane offset — but a single-plane RGBA16 imports cleanly.
-/// SRVs (unlike `CopySubresourceRegion`) DO work on P010 planes.
-const P010_TO_RGBA16_HLSL: &str = r#"
+/// HLSL: a 2-plane YCbCr texture (Y plane SRV + UV plane SRV) → RGBA16 UAV,
+/// with BT.709 limited-range expansion and a box downscale to the output dims.
+/// Done on the D3D11 side because the multi-plane source imports into Vulkan
+/// with a broken chroma-plane offset — but a single-plane RGBA16 imports
+/// cleanly. SRVs (unlike `CopySubresourceRegion`) DO work on NV12/P010 planes.
+///
+/// The plane SRV formats and the range-expansion constants both depend on the
+/// source's bit depth (NV12 vs P010) — see [`hw_plane_layout`]. The constants
+/// ride the cbuffer so ONE compiled shader serves both; the output is RGBA16
+/// either way, so everything downstream is depth-agnostic.
+const YCBCR_TO_RGBA16_HLSL: &str = r#"
 Texture2D<float>  Ytex  : register(t0);
 Texture2D<float2> UVtex : register(t1);
 SamplerState      smp   : register(s0);
 RWTexture2D<unorm float4> Outp : register(u0);
-cbuffer CB : register(b0) { uint src_w; uint src_h; uint out_w; uint out_h; };
+cbuffer CB : register(b0) {
+    uint src_w; uint src_h; uint out_w; uint out_h;
+    float y_scale; float y_off; float c_scale; float c_off;
+};
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= out_w || id.y >= out_h) return;
@@ -452,9 +460,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             float2 uvc = float2(cx + ox, cy + oy) / float2((float)src_w, (float)src_h);
             float y  = Ytex.SampleLevel(smp, uvc, 0);
             float2 c = UVtex.SampleLevel(smp, uvc, 0);
-            float yl = y   * (65535.0 / 56064.0) - (64.0 / 876.0);
-            float ul = c.x * (65535.0 / 57344.0) - (512.0 / 896.0);
-            float vl = c.y * (65535.0 / 57344.0) - (512.0 / 896.0);
+            float yl = y   * y_scale - y_off;
+            float ul = c.x * c_scale - c_off;
+            float vl = c.y * c_scale - c_off;
             acc += float3(
                 saturate(yl + 1.5748 * vl),
                 saturate(yl - 0.1873 * ul - 0.4681 * vl),
@@ -473,12 +481,82 @@ struct ConvDims {
     src_h: u32,
     out_w: u32,
     out_h: u32,
+    /// BT.709 limited-range expansion, per source bit depth (`hw_plane_layout`).
+    y_scale: f32,
+    y_off: f32,
+    c_scale: f32,
+    c_off: f32,
 }
 
-/// A cached D3D11 compute pipeline that converts a P010 texture to a
+/// Plane SRV formats + BT.709 limited-range expansion constants for a d3d11va
+/// decoder output format. `None` = a format this converter cannot sample.
+///
+/// The DPB format follows the SOURCE bit depth: 8-bit H.264/HEVC decodes to
+/// **NV12**, 10-bit to **P010**. A plane SRV's format must match the plane's
+/// own format, so asking for `R16_UNORM` on NV12 fails `CreateShaderResourceView`
+/// outright (`E_INVALIDARG`) — which is what used to kill 8-bit sources on the
+/// first frame.
+///
+/// P010 stores its 10 bits in the HIGH bits of each 16-bit word, so a P010 and
+/// a P016 black both normalize to 4096/65535 — the two share one set of
+/// constants.
+fn hw_plane_layout(
+    fmt: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+) -> Option<(
+    windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    [f32; 4],
+)> {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_P016, DXGI_FORMAT_R16G16_UNORM,
+        DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM,
+    };
+    match fmt {
+        // 8-bit: Y 16..235, C 16..240 over a 0..255 range.
+        DXGI_FORMAT_NV12 => Some((
+            DXGI_FORMAT_R8_UNORM,
+            DXGI_FORMAT_R8G8_UNORM,
+            [255.0 / 219.0, 16.0 / 219.0, 255.0 / 224.0, 128.0 / 224.0],
+        )),
+        // 10/16-bit: Y 4096..60160, C 4096..61440 over a 0..65535 range.
+        DXGI_FORMAT_P010 | DXGI_FORMAT_P016 => Some((
+            DXGI_FORMAT_R16_UNORM,
+            DXGI_FORMAT_R16G16_UNORM,
+            [65535.0 / 56064.0, 64.0 / 876.0, 65535.0 / 57344.0, 512.0 / 896.0],
+        )),
+        _ => None,
+    }
+}
+
+/// Can the D3D11 plane converter handle a source with this **AVPixelFormat**
+/// (the value in `AVCodecParameters::format`)?
+///
+/// The zero-copy iterators call this at CONSTRUCTION so an unsupported source
+/// declines up front and the caller falls back to the portable path. Failing
+/// on the first frame instead would be unrecoverable: every caller treats a
+/// successful constructor as "zero-copy is on", so there is no fallback left
+/// by then — the same trap the VRAM pre-flight check exists to avoid.
+pub fn hw_convert_supports_pix_fmt(av_pix_fmt: i32) -> bool {
+    use ffmpeg_next::ffi::*;
+    #[allow(non_upper_case_globals)]
+    match av_pix_fmt {
+        // → NV12 in the DPB.
+        x if x == AVPixelFormat::AV_PIX_FMT_YUV420P as i32
+            || x == AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32
+            || x == AVPixelFormat::AV_PIX_FMT_NV12 as i32 => true,
+        // → P010 in the DPB.
+        x if x == AVPixelFormat::AV_PIX_FMT_YUV420P10LE as i32
+            || x == AVPixelFormat::AV_PIX_FMT_P010LE as i32 => true,
+        _ => false,
+    }
+}
+
+/// A cached D3D11 compute pipeline that converts a 2-plane YCbCr texture
+/// (**NV12 or P010** — whichever bit depth the source decodes to) to a
 /// single-plane RGBA16 (+ box downscale). One per D3D11 device (the OSV
 /// streams decode on separate `d3d11va` devices, so the iterator keeps one
-/// converter per stream). Built once; `convert` runs per frame.
+/// converter per stream). Built once; `convert` runs per frame and reads the
+/// source's format off the texture, so one converter serves either depth.
 pub struct P010Converter {
     cs: windows::Win32::Graphics::Direct3D11::ID3D11ComputeShader,
     sampler: windows::Win32::Graphics::Direct3D11::ID3D11SamplerState,
@@ -506,8 +584,8 @@ impl P010Converter {
             let mut blob: Option<ID3DBlob> = None;
             let mut errs: Option<ID3DBlob> = None;
             let hr = D3DCompile(
-                P010_TO_RGBA16_HLSL.as_ptr() as *const core::ffi::c_void,
-                P010_TO_RGBA16_HLSL.len(),
+                YCBCR_TO_RGBA16_HLSL.as_ptr() as *const core::ffi::c_void,
+                YCBCR_TO_RGBA16_HLSL.len(),
                 None,
                 None,
                 None,
@@ -556,18 +634,20 @@ impl P010Converter {
         }
     }
 
-    /// Convert a single-slice P010 texture (must have `BIND_SHADER_RESOURCE`)
-    /// to a fresh shareable RGBA16 texture at `out_w × out_h`, exported as an
-    /// NT handle ready to import single-plane into Vulkan.
+    /// Convert a single-slice NV12 **or** P010 texture (must have
+    /// `BIND_SHADER_RESOURCE`) to a fresh shareable RGBA16 texture at
+    /// `out_w × out_h`, exported as an NT handle ready to import single-plane
+    /// into Vulkan. The plane SRV formats and range constants come from the
+    /// source texture's own format, so either bit depth works.
     ///
     /// # Safety
-    /// `device`/`context` must own `src_p010`; `src_p010` must be a live
-    /// shader-resource P010 texture of `src_w × src_h`.
+    /// `device`/`context` must own `src_yuv`; `src_yuv` must be a live
+    /// shader-resource NV12/P010 texture of `src_w × src_h`.
     pub unsafe fn convert(
         &self,
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
-        src_p010: &ID3D11Texture2D,
+        src_yuv: &ID3D11Texture2D,
         src_w: u32,
         src_h: u32,
         out_w: u32,
@@ -582,9 +662,20 @@ impl P010Converter {
             D3D11_USAGE_DEFAULT, ID3D11ShaderResourceView, ID3D11UnorderedAccessView,
         };
         use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_FORMAT_R16G16B16A16_UNORM, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16_UNORM,
-            DXGI_SAMPLE_DESC,
+            DXGI_FORMAT_R16G16B16A16_UNORM, DXGI_SAMPLE_DESC,
         };
+
+        // Plane formats + range constants follow the SOURCE's bit depth (NV12
+        // vs P010); an unsupported format is refused here rather than handed to
+        // CreateShaderResourceView, which would fail with a bare E_INVALIDARG.
+        let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+        src_yuv.GetDesc(&mut src_desc);
+        let (y_fmt, uv_fmt, range) = hw_plane_layout(src_desc.Format).ok_or_else(|| {
+            windows::core::Error::new(
+                windows::Win32::Foundation::E_INVALIDARG,
+                format!("unsupported d3d11va plane format {:?}", src_desc.Format),
+            )
+        })?;
 
         // Output RGBA16 texture: UAV (compute writes) + SRV (Vulkan import
         // samples) + shareable NT handle.
@@ -604,7 +695,7 @@ impl P010Converter {
         device.CreateTexture2D(&odesc, None, Some(&mut out_tex))?;
         let out_tex = out_tex.unwrap();
 
-        // Plane SRVs on the P010 (format selects the plane).
+        // Plane SRVs on the source (format selects the plane).
         let mk_srv = |fmt| -> windows::core::Result<ID3D11ShaderResourceView> {
             let d = D3D11_SHADER_RESOURCE_VIEW_DESC {
                 Format: fmt,
@@ -614,11 +705,11 @@ impl P010Converter {
                 },
             };
             let mut v = None;
-            device.CreateShaderResourceView(src_p010, Some(&d), Some(&mut v))?;
+            device.CreateShaderResourceView(src_yuv, Some(&d), Some(&mut v))?;
             Ok(v.unwrap())
         };
-        let srv_y = mk_srv(DXGI_FORMAT_R16_UNORM)?;
-        let srv_uv = mk_srv(DXGI_FORMAT_R16G16_UNORM)?;
+        let srv_y = mk_srv(y_fmt)?;
+        let srv_uv = mk_srv(uv_fmt)?;
 
         let uav_desc = D3D11_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R16G16B16A16_UNORM,
@@ -631,7 +722,10 @@ impl P010Converter {
         device.CreateUnorderedAccessView(&out_tex, Some(&uav_desc), Some(&mut uav))?;
         let _ = D3D11_USAGE_DEFAULT;
 
-        let dims = ConvDims { src_w, src_h, out_w, out_h };
+        let dims = ConvDims {
+            src_w, src_h, out_w, out_h,
+            y_scale: range[0], y_off: range[1], c_scale: range[2], c_off: range[3],
+        };
         context.UpdateSubresource(
             &self.cbuffer, 0, None,
             &dims as *const ConvDims as *const core::ffi::c_void, 0, 0,
@@ -750,14 +844,15 @@ pub unsafe fn extract_d3d11_from_frame(
     Some((tex, array_index, device, context))
 }
 
-/// Copy one array slice of a `d3d11va` P010 DPB texture into a fresh
-/// single-slice **shader-resource** P010 (no share). The decoder's DPB array
-/// has only `BIND_DECODER`, so it can't be SRV-sampled directly; this gives us
-/// an SRV-able copy for [`P010Converter::convert`].
+/// Copy one array slice of a `d3d11va` DPB texture into a fresh single-slice
+/// **shader-resource** texture of the SAME format (no share). The decoder's DPB
+/// array has only `BIND_DECODER`, so it can't be SRV-sampled directly; this
+/// gives us an SRV-able copy for [`P010Converter::convert`]. Format-agnostic:
+/// NV12 in, NV12 out; P010 in, P010 out.
 ///
 /// # Safety
 /// `device`/`context` own `src`; `slice` is a valid subresource of `src`.
-unsafe fn copy_slice_to_shader_p010(
+unsafe fn copy_slice_to_shader_texture(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     src: &ID3D11Texture2D,
@@ -772,7 +867,7 @@ unsafe fn copy_slice_to_shader_p010(
         Height: h,
         MipLevels: 1,
         ArraySize: 1,
-        Format: sdesc.Format, // P010
+        Format: sdesc.Format, // NV12 (8-bit source) or P010 (10-bit)
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
@@ -787,7 +882,7 @@ unsafe fn copy_slice_to_shader_p010(
     // the coded frame (NVDEC aligns the width — e.g. 5952 → 6016), and those
     // extra columns are black padding. An explicit box copies just the valid
     // pixels into the (w×h) shader texture so the converter never samples the
-    // padding. (P010 is 4:2:0, so w/h must be even — coded dims always are.)
+    // padding. (Both formats are 4:2:0, so w/h must be even — coded dims are.)
     let src_box = windows::Win32::Graphics::Direct3D11::D3D11_BOX {
         left: 0, top: 0, front: 0, right: w, bottom: h, back: 1,
     };
@@ -798,13 +893,19 @@ unsafe fn copy_slice_to_shader_p010(
 }
 
 /// Decode-frame → shareable **RGBA16** eye, doing the YCbCr→RGB on the D3D11
-/// side (the multi-plane P010 imports into Vulkan with a broken chroma-plane
+/// side (the multi-plane source imports into Vulkan with a broken chroma-plane
 /// offset; a single-plane RGBA16 imports cleanly). Lazily builds the converter
 /// for the frame's device. `work_w`/`work_h` is the (downscaled) preview
 /// working resolution. After this returns the source frame can be dropped.
 ///
+/// Takes either bit depth — NV12 (8-bit source) or P010 (10-bit) — and always
+/// produces RGBA16, so callers are depth-agnostic. Iterators that can be handed
+/// an arbitrary file should still gate on [`hw_convert_supports_pix_fmt`] at
+/// construction: reaching a refusal HERE is mid-stream, where no fallback is
+/// left.
+///
 /// # Safety
-/// `frame` must be a live `AV_PIX_FMT_D3D11` P010 frame from a d3d11va decoder.
+/// `frame` must be a live `AV_PIX_FMT_D3D11` frame from a d3d11va decoder.
 pub unsafe fn share_eye_converted(
     frame: &ffmpeg_next::frame::Video,
     converter: &mut Option<P010Converter>,
@@ -834,8 +935,8 @@ pub unsafe fn share_eye_converted(
         frame.width().min(desc.Width).max(2) & !1,
         frame.height().min(desc.Height).max(2) & !1,
     );
-    let p010 = copy_slice_to_shader_p010(&dev, &dctx, &tex, slice, nw, nh)?;
-    match conv.convert(&dev, &dctx, &p010, nw, nh, work_w, work_h) {
+    let planar = copy_slice_to_shader_texture(&dev, &dctx, &tex, slice, nw, nh)?;
+    match conv.convert(&dev, &dctx, &planar, nw, nh, work_w, work_h) {
         Ok(shared) => Some(shared),
         Err(e) => {
             tracing::warn!("share_eye_converted: convert failed: {e}");

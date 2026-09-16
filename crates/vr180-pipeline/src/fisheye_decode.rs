@@ -1645,6 +1645,19 @@ impl D3d11SharedSbsIter {
             1.0 / 30.0
         };
 
+        // Unlike the camera-specific iterators, this one is handed ARBITRARY
+        // files, so the source's pixel format is not known in advance. Refuse
+        // anything the D3D11 plane converter can't sample BEFORE committing:
+        // every caller reads a successful constructor as "zero-copy is on" and
+        // has no fallback left once frames start, so a format miss has to
+        // decline here to reach the portable path.
+        let src_pix_fmt = unsafe { (*video.parameters().as_ptr()).format };
+        if !crate::interop_windows::hw_convert_supports_pix_fmt(src_pix_fmt) {
+            return Err(Error::Ffmpeg(format!(
+                "zero-copy SBS path: source pixel format {src_pix_fmt} is not an \
+                 NV12/P010-convertible layout — using the portable path")));
+        }
+
         let mut codec_ctx =
             ffmpeg_next::codec::context::Context::from_parameters(video.parameters())
                 .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;

@@ -296,6 +296,48 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    untrimmed 8-bit path is untouched — PROVEN byte-identical (same frame md5,
    same 4265493-byte file, before vs after).
 
+13. **8-bit SBS was broken on the zero-copy path — FIXED (2026-09-15).**
+   Reported from the mac side, reproduced and confirmed here. The d3d11va DPB
+   format follows the SOURCE bit depth: 8-bit H.264/HEVC → **NV12**, 10-bit →
+   **P010**. `P010Converter::convert` hardcoded `R16_UNORM`/`R16G16_UNORM`
+   plane SRVs, and a plane SRV's format must match the plane's own format, so
+   on NV12 `CreateShaderResourceView` returned a bare `E_INVALIDARG`
+   (0x80070057). Worse, it failed at FRAME 1, not at construction — the same
+   unrecoverable shape as item 11's VRAM bug: `D3d11SharedSbsIter::new`
+   returned `Ok`, every caller reads that as "zero-copy is on", so there was
+   no fallback left. BLAST RADIUS was exactly the generic-SBS iterator (the
+   2026-09-15 addition, and the only one handed arbitrary files): OSV/`.insv`
+   are 10-bit cameras, and the GoPro `.360` on hand probes `yuv420p10le` too,
+   so both shipped paths were always P010 and unaffected — verified, not
+   assumed.
+   FIX, in two parts: (a) `hw_plane_layout(DXGI_FORMAT)` returns the plane SRV
+   formats AND the BT.709 range constants for NV12 vs P010/P016, `convert`
+   reads the format off the source texture, and the constants moved into the
+   cbuffer so ONE compiled shader serves both depths (the HLSL is now
+   `YCBCR_TO_RGBA16_HLSL`; P010 and P016 share constants because P010 keeps
+   its 10 bits in the HIGH bits, so both blacks normalize to 4096/65535).
+   Output stays RGBA16, so everything downstream is depth-agnostic and 8-bit
+   SBS gets the fast path rather than just a graceful fallback. (b) a
+   construction-time guard — `interop_windows::hw_convert_supports_pix_fmt`,
+   checked in `D3d11SharedSbsIter::new_with_work` against the stream's
+   `AVCodecParameters::format` — so a format the converter can't sample
+   declines UP FRONT and the portable ladder still works. Only the SBS
+   iterator gets the guard: it is the one fed arbitrary files.
+   VERIFIED: an 8-bit `yuv420p` SBS clip went from `** FAILED **` on frame 1
+   to a full `sbs_zc_check` PASS — GPU-vs-CPU 129.5/65535 (0.20%, better than
+   the 10-bit path's documented 1.03/255), split separation 31×, work-res
+   downscale exact, sustained loop clean; end-to-end export zc-vs-portable
+   1.234/255 max 16, matching the OSV arm's own 1.233/255. NO REGRESSION: the
+   10-bit OSV zc export is **byte-identical** to before (same frame md5, same
+   3868683-byte file), so the cbuffer refactor is a provable no-op for 10-bit;
+   the `.360` GPU-resident arm still engages; OSV/SBS × zc/portable all pass
+   with stab on. NOTE for whoever touches this next: `import_p010` has **no
+   callers** — every zero-copy import is single-plane `import_rgba16` — so the
+   `Features::TEXTURE_FORMAT_P010` test in the preview/export gates is
+   vestigial. It is merely over-conservative (it can only decline to a working
+   path, and every d3d11va-capable adapter has P010), so it was left alone
+   rather than widened on shipped paths.
+
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
   Swift helper); GPU-resident zero-copy P010 for OSV **and** `.360`/EAC. The

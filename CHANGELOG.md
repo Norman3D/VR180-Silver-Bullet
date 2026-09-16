@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Fixed: 8-bit side-by-side input on Windows
+- **8-bit SBS sources failed on the Windows GPU fast path.** The hardware
+  decoder's frame format follows the source bit depth — 8-bit H.264/HEVC
+  decodes to NV12, 10-bit to P010 — but the D3D11 YCbCr→RGB converter asked
+  for 16-bit plane views unconditionally, which an NV12 surface rejects
+  outright. The path was chosen on a GPU capability rather than on the
+  source's actual format, so it committed to the fast path and then died on
+  the first frame, with no fallback left. Since the fast path only started
+  taking generic SBS files two days ago, this never shipped.
+- The converter now reads the source's format and picks matching plane views
+  and range constants, so **8-bit side-by-side input gets the same GPU fast
+  path 10-bit already had** rather than merely falling back. Output is RGBA16
+  either way, so nothing downstream changes, and 10-bit output is unchanged
+  bit-for-bit. Anything the converter genuinely cannot sample is now declined
+  up front, where falling back to the portable path still works.
+
 ### Matching Eyes: exposure
 - The **Matching Eyes** panel gains an **Eye Exposure (±EV)** slider
   alongside Eye CT and Eye Tint. Like them it applies oppositely to the two
