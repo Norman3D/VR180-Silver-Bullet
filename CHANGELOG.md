@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### macOS: side-by-side sources get the zero-copy GPU path
+
+`.360`, `.osv` and `.insv` clips have decoded straight into GPU memory on
+macOS for a while: VideoToolbox hands back an IOSurface, the app wraps it as
+a Metal texture, and the frame never touches the CPU. Generic side-by-side
+`.mp4` / `.mov` sources were the one format left out — they still decoded on
+the CPU and uploaded every frame. That gap is now closed, for both preview
+and export.
+
+- **Side-by-side export is ~3.7x faster and uses ~6x less memory.** On a
+  3840x1920 10-bit HEVC clip a 120-frame export went from **4.73 s / 697 MB**
+  to **1.29 s / 118 MB**. The whole frame is resolved once on the GPU and the
+  two eyes are split with a subregion copy, so there is no swscale pass and no
+  per-frame upload.
+- **Colour is closer to the source, not just faster.** Measured against a
+  known-good reference the new path lands at a mean error of 0.46/255 where
+  the CPU path measures 0.72/255 — the CPU path's swscale conversion rounds
+  slightly dark. Eye order, trim and frame-accurate seek all match the old
+  path exactly.
+- Requires a **10-bit H.264/HEVC** source, which is what VideoToolbox can
+  hand over as P010. Anything else — 8-bit, ProRes, a multi-segment clip, or
+  an export with temporal noise reduction on — falls back to the existing CPU
+  path automatically, with the reason in the log. Windows is untouched.
+- **Fixed:** the source bit depth was read from `bits_per_raw_sample`, which
+  is frequently `0` even for genuine 10-bit files (any x265-muxed clip, for
+  one). The depth now falls back to the stream's pixel format, so the fast
+  path actually engages instead of silently declining every clip.
+
 ### macOS: side-by-side sources decode several times faster
 - **Generic side-by-side `.mp4` / `.mov` sources now decode multi-threaded
   on macOS.** libavcodec defaults a decoder to ONE thread and nothing in

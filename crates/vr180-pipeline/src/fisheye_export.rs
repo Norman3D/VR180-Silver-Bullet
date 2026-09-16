@@ -737,17 +737,44 @@ fn export_fisheye_inner(
         // Handles a merged recording too: the zero-copy iterator chains its
         // segments internally (new_segmented), so denoise + stab stay on the
         // fast GPU path across seams instead of dropping to the portable loop.
-        let can_zero_copy_decode = cfg.source_kind.is_dual_stream()
+        // Generic SBS rides this path too (single VT stream, whole-frame
+        // IOSurface → one resolve → split). NB `cfg.bit_depth` above is the
+        // OUTPUT depth and says NOTHING about the source — the SOURCE refusal
+        // (8-bit NV12 cannot be wrapped as P010) lives in
+        // `VtSharedSbsIter::new`. Denoise is excluded because
+        // `DenoisingZeroCopyIter::new` takes a `ZeroCopyDualStreamFisheyeIter`
+        // by value; multi-segment because `new_segmented` is dual-stream-only
+        // and a merged SBS would silently export just segment 0.
+        let sbs_zero_copy_ok = cfg.source_kind == SourceKind::SbsFisheye
+            && cfg.segments.len() <= 1
+            && cfg.denoise_strength <= 0.0;
+        let can_zero_copy_decode = (cfg.source_kind.is_dual_stream() || sbs_zero_copy_ok)
             && on_macos_vt
             && (cfg.bit_depth == 10 || cfg.bit_depth == 8);
-        // NB: denoise (cfg.denoise_strength > 0) STAYS on this fast path — the
-        // zero-copy export denoises the P010 IOSurfaces on the GPU via
-        // DenoisingZeroCopyIter, with no CPU bounce (≈3× faster than dropping
-        // to the portable readback path).
+        // NB: denoise (cfg.denoise_strength > 0) STAYS on this fast path for
+        // DUAL-STREAM sources — the zero-copy export denoises the P010
+        // IOSurfaces on the GPU via DenoisingZeroCopyIter, with no CPU bounce
+        // (≈3× faster than dropping to the portable readback path).
         if can_zero_copy_decode {
-            return export_fisheye_osv_zerocopy_p010(
-                pipeline, cfg, &mut progress_cb, cancel,
-            );
+            // For SBS the open can legitimately fail (8-bit / ProRes / no VT),
+            // so probe it HERE and fall through to the portable loop on Err —
+            // never `?`, which would abort an otherwise-valid export.
+            let sbs_iter = if sbs_zero_copy_ok {
+                match crate::fisheye_decode::VtSharedSbsIter::new(&cfg.source_path) {
+                    Ok(it) => Some(it),
+                    Err(e) => {
+                        tracing::info!(
+                            "fisheye_export: macOS zero-copy SBS unavailable ({e}) \
+                             — portable path");
+                        None
+                    }
+                }
+            } else { None };
+            if !sbs_zero_copy_ok || sbs_iter.is_some() {
+                return export_fisheye_osv_zerocopy_p010(
+                    pipeline, cfg, &mut progress_cb, cancel, sbs_iter,
+                );
+            }
         }
     }
 
@@ -2483,9 +2510,12 @@ fn export_fisheye_osv_zerocopy_p010(
     cfg: FisheyeExportConfig,
     progress_cb: &mut dyn FnMut(ExportProgress),
     cancel: Arc<AtomicBool>,
+    // Pre-opened generic-SBS iterator, when the caller's gate chose that
+    // source and the open succeeded. `None` for every dual-stream export.
+    sbs_iter: Option<crate::fisheye_decode::VtSharedSbsIter>,
 ) -> Result<()> {
     use crate::fisheye_decode::{
-        DenoisingZeroCopyIter, ZcDecoder, ZeroCopyDualStreamFisheyeIter,
+        DenoisingZeroCopyIter, ZcDecoder, ZcMacFrame, ZeroCopyDualStreamFisheyeIter,
     };
 
     // Per-segment durations (for a merged recording): chain the decoder, rebase
@@ -2504,27 +2534,36 @@ fn export_fisheye_osv_zerocopy_p010(
             .collect()
     } else { Vec::new() };
 
-    // Open zero-copy decoder. OSV swap convention mirrors DualStreamFisheyeIter:
-    // Dual-stream default swap ⊕ user toggle (DJI: Lens A == stream 0 ==
-    // right eye). A merged recording chains its segments into one stream.
-    let raw = if cfg.segments.len() > 1 {
-        ZeroCopyDualStreamFisheyeIter::new_segmented(
-            &cfg.segments, &seg_durs, 0, cfg.source_kind.dual_stream_iter_swap(cfg.fisheye_swap_eyes),
-        )?
+    let mut decoder = if let Some(it) = sbs_iter {
+        // Generic SBS: one VT stream, no chaining, no denoise (gated out at
+        // the caller). `eye_dims()` is PER-EYE, so `resolve_calib_pair` below
+        // and the projections' src_w/src_h are unchanged.
+        tracing::info!("fisheye_export (zero-copy): generic SBS, single VT stream");
+        ZcDecoder::Sbs(it)
     } else {
-        ZeroCopyDualStreamFisheyeIter::new(&cfg.source_path, 0, cfg.source_kind.dual_stream_iter_swap(cfg.fisheye_swap_eyes))?
-    };
-    // Temporal NR, if requested, wraps the decoder and denoises the P010
-    // IOSurfaces on the GPU (no CPU readback) — the whole reason this path
-    // is fast. Falls back to the raw decoder when off / unsupported.
-    let mut decoder = if cfg.denoise_strength > 0.0 && crate::vt_denoise::is_supported() {
-        tracing::info!(
-            "fisheye_export (zero-copy): temporal NR ENGAGED on GPU (strength={:.2})",
-            cfg.denoise_strength
-        );
-        ZcDecoder::Denoising(DenoisingZeroCopyIter::new(raw, cfg.denoise_strength)?)
-    } else {
-        ZcDecoder::Raw(raw)
+        // Open zero-copy decoder. OSV swap convention mirrors
+        // DualStreamFisheyeIter: dual-stream default swap ⊕ user toggle (DJI:
+        // Lens A == stream 0 == right eye). A merged recording chains its
+        // segments into one stream.
+        let raw = if cfg.segments.len() > 1 {
+            ZeroCopyDualStreamFisheyeIter::new_segmented(
+                &cfg.segments, &seg_durs, 0, cfg.source_kind.dual_stream_iter_swap(cfg.fisheye_swap_eyes),
+            )?
+        } else {
+            ZeroCopyDualStreamFisheyeIter::new(&cfg.source_path, 0, cfg.source_kind.dual_stream_iter_swap(cfg.fisheye_swap_eyes))?
+        };
+        // Temporal NR, if requested, wraps the decoder and denoises the P010
+        // IOSurfaces on the GPU (no CPU readback) — the whole reason this path
+        // is fast. Falls back to the raw decoder when off / unsupported.
+        if cfg.denoise_strength > 0.0 && crate::vt_denoise::is_supported() {
+            tracing::info!(
+                "fisheye_export (zero-copy): temporal NR ENGAGED on GPU (strength={:.2})",
+                cfg.denoise_strength
+            );
+            ZcDecoder::Denoising(DenoisingZeroCopyIter::new(raw, cfg.denoise_strength)?)
+        } else {
+            ZcDecoder::Raw(raw)
+        }
     };
     let (src_w, src_h) = decoder.eye_dims();
 
@@ -2647,22 +2686,23 @@ fn export_fisheye_osv_zerocopy_p010(
     let t_start = std::time::Instant::now();
     let mut frame_idx: u64 = 0;
 
-    while let Some(pair) = decoder.next_pair(&pipeline.device)? {
+    while let Some(frame) = decoder.next_frame(&pipeline.device)? {
         if cancel.load(Ordering::SeqCst) {
             tracing::info!("fisheye_export (zero-copy): cancelled at frame {}", frame_idx);
             break;
         }
-        if pair.pts_s.is_finite() && pair.pts_s >= t_out {
-            tracing::info!("fisheye_export (zero-copy): hit trim_out @ {:.3}s", pair.pts_s);
+        let pts_s = frame.pts_s();
+        if pts_s.is_finite() && pts_s >= t_out {
+            tracing::info!("fisheye_export (zero-copy): hit trim_out @ {:.3}s", pts_s);
             break;
         }
         // Drop pre-trim frames (keyframe-backward seek, no decode-forward).
-        if pair.pts_s.is_finite() && pair.pts_s < t_in - 0.5 * dt {
+        if pts_s.is_finite() && pts_s < t_in - 0.5 * dt {
             continue;
         }
 
-        let stab_idx = if pair.pts_s.is_finite() && pair.pts_s >= 0.0 {
-            (pair.pts_s / dt).round() as usize
+        let stab_idx = if pts_s.is_finite() && pts_s >= 0.0 {
+            (pts_s / dt).round() as usize
         } else {
             frame_idx as usize
         };
@@ -2702,7 +2742,10 @@ fn export_fisheye_osv_zerocopy_p010(
         // shutter correction is wired for BOTH projections — the RS warp
         // operates on the source-frame direction, independent of whether
         // the output is half-equirect or fisheye.
-        let (left_eq, right_eq) = match (cfg.projection, rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
+        let (left_eq, right_eq) = match &frame {
+            // Dual-stream: project each eye straight from its P010 planes
+            // (no resolve, no split) — unchanged.
+            ZcMacFrame::Pair(pair) => match (cfg.projection, rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
             (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, Some(rs_l), Some(rs_r)) => {
                 let l = pipeline.project_fisheye_p010_to_equirect_rs_texture_16(
                     &pair.left_y.texture, &pair.left_uv.texture,
@@ -2746,6 +2789,48 @@ fn export_fisheye_osv_zerocopy_p010(
                     src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right,
                 )?;
                 (l, r)
+            }
+            },
+            // Generic SBS: ONE whole-frame resolve at native (1:1, so the box
+            // filter is a single tap and the projection still does all the
+            // minification, exactly as on the dual path), then two GPU
+            // subregion copies, then the cross-platform rgba16 family. Slot 32
+            // keeps this resolve's cached output distinct from the preview's
+            // 0/1/2; slots 30/31 keep the projections' cached outputs distinct
+            // from preview 0/1 (same convention as the Windows arm).
+            // NO eye swap: the halves are already in L|R frame order, matching
+            // the CPU `SbsFisheyeIter` and the Windows SBS arm.
+            ZcMacFrame::Sbs(f) => {
+                let full = pipeline.resolve_p010_planes_to_rgba16(
+                    &f.frame_y.texture, &f.frame_uv.texture,
+                    f.frame_w, f.frame_h, f.frame_w, f.frame_h, 32)?;
+                let (l_tex, r_tex) = pipeline.split_sbs_texture_16(&full, src_w, src_h, 32)?;
+                match (cfg.projection, rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
+                    (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, Some(rs_l), Some(rs_r)) => (
+                        pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
+                            &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l, 30)?,
+                        pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
+                            &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r, 31)?,
+                    ),
+                    (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, _, _) => (
+                        pipeline.project_fisheye_rgba16_texture_to_equirect_16(
+                            &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 30)?,
+                        pipeline.project_fisheye_rgba16_texture_to_equirect_16(
+                            &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 31)?,
+                    ),
+                    (FisheyeExportProjection::Fisheye, Some(rs_l), Some(rs_r)) => (
+                        pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
+                            &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l, 30)?,
+                        pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
+                            &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r, 31)?,
+                    ),
+                    (FisheyeExportProjection::Fisheye, _, _) => (
+                        pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                            &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 30)?,
+                        pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                            &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 31)?,
+                    ),
+                }
             }
         };
 
@@ -2794,8 +2879,11 @@ fn export_fisheye_osv_zerocopy_p010(
         }
 
         // Drop decode + compose textures so the IOSurface retains
-        // release before the next frame allocates new ones.
-        drop(pair);
+        // release before the next frame allocates new ones. Must stay AFTER
+        // encode_pixel_buffer*: for the SBS arm the resolve and the split each
+        // queue.submit() inside their own call, so the GPU read of these
+        // planes is already submitted here.
+        drop(frame);
 
         frame_idx += 1;
         let elapsed = t_start.elapsed().as_secs_f32().max(1e-3);
@@ -3116,7 +3204,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
                 ),
                 ZcFisheyeFrame::Sbs(f) => {
                     let full = unsafe { ctx.import_rgba16(&pipeline.device, &f.tex) };
-                    pipeline.split_sbs_texture_16(&full, f.eye_w, f.eye_h)?
+                    pipeline.split_sbs_texture_16(&full, f.eye_w, f.eye_h, 33)?
                 }
             };
 

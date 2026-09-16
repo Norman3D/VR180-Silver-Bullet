@@ -180,13 +180,37 @@ pub struct Device {
     /// `(w, h, texture)`; reused when dims match.
     rgba16_eq_out_cache: Mutex<HashMap<u32, (u32, u32, wgpu::Texture)>>,
     /// Reusable per-eye halves for [`Device::split_sbs_texture_16`], keyed by
-    /// per-eye dims. Same reasoning as `rgba16_eq_out_cache`: the zero-copy
-    /// SBS preview splits on the DECODER thread, and a per-frame
-    /// `create_texture` there contends with eframe's main thread on the
-    /// shared device. Safe to overwrite each frame — the previous frame's
-    /// projection reads these before this frame's copy writes them
-    /// (GPU-ordered on one queue) and nothing holds them past compose.
-    sbs_split_cache: Mutex<HashMap<(u32, u32), (wgpu::Texture, wgpu::Texture)>>,
+    /// SLOT and storing `(w, h, left, right)`. Same reasoning as
+    /// `rgba16_eq_out_cache`: the zero-copy SBS preview splits on the DECODER
+    /// thread, and a per-frame `create_texture` there contends with eframe's
+    /// main thread on the shared device. Safe to overwrite each frame — the
+    /// previous frame's projection reads these before this frame's copy
+    /// writes them (GPU-ordered on one queue) and nothing holds them past
+    /// compose.
+    ///
+    /// The SLOT is load-bearing for the same reason it is on
+    /// `p010_resolve_out_cache`: on macOS the export worker SHARES this
+    /// `Device` with eframe (only Windows gets a dedicated one), so exporting
+    /// an SBS clip while its preview is still decoding would put both splits
+    /// at the SAME per-eye dims — a dims-only key handed them the same two
+    /// textures and each torn the other's frame.
+    sbs_split_cache: Mutex<HashMap<u32, (u32, u32, wgpu::Texture, wgpu::Texture)>>,
+    /// Reusable output texture for [`Device::resolve_p010_planes_to_rgba16`],
+    /// keyed by SLOT and storing `(w, h, texture)` — same shape as
+    /// `rgba16_eq_out_cache`, so a dims change (the Reframe flip) replaces the
+    /// entry instead of accumulating one per size.
+    ///
+    /// The SLOT is load-bearing, not a convenience: the dual-stream preview
+    /// resolves TWO eyes at IDENTICAL dims every frame, so a dims-only key
+    /// would hand the same texture back for both and silently collapse the
+    /// stereo. Slots: 0 = preview dual left, 1 = preview dual right,
+    /// 2 = preview side-by-side whole frame, 32 = export side-by-side whole frame.
+    ///
+    /// Why cache at all: a whole-frame side-by-side resolve at 8192x4096 is
+    /// 256 MiB of `create_texture` per frame on the render thread, contending
+    /// with eframe on the shared device — exactly what the
+    /// `rgba16_eq_out_cache` comment below exists to avoid.
+    p010_resolve_out_cache: Mutex<HashMap<u32, (u32, u32, wgpu::Texture)>>,
     /// Reusable MAP_READ staging buffers for texture readback, keyed by byte
     /// size. Allocating a fresh 88 MB staging buffer every frame (the P010
     /// Y+UV readback) is a big chunk of the export's per-frame cost —
@@ -494,6 +518,7 @@ impl Device {
             proj_fisheye_cache: Mutex::new(HashMap::new()),
             rgba16_eq_out_cache: Mutex::new(HashMap::new()),
             sbs_split_cache: Mutex::new(HashMap::new()),
+            p010_resolve_out_cache: Mutex::new(HashMap::new()),
             readback_staging: Mutex::new(HashMap::new()),
         })
     }
@@ -3084,12 +3109,15 @@ impl Device {
         full: &wgpu::Texture,
         eye_w: u32,
         eye_h: u32,
+        slot: u32,
     ) -> Result<(wgpu::Texture, wgpu::Texture)> {
         // Reuse the halves across frames (see `sbs_split_cache`) — the live
-        // preview runs this on the decoder thread every frame.
+        // preview runs this on the decoder thread every frame. Per SLOT, so a
+        // concurrent preview and export never share the pair.
         let (left, right) = {
             let mut cache = self.sbs_split_cache.lock().unwrap();
-            cache.entry((eye_w, eye_h)).or_insert_with(|| {
+            let hit = matches!(cache.get(&slot), Some(&(w, h, _, _)) if w == eye_w && h == eye_h);
+            if !hit {
                 let mk = |label: &str| self.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some(label),
                     size: wgpu::Extent3d { width: eye_w, height: eye_h, depth_or_array_layers: 1 },
@@ -3104,8 +3132,10 @@ impl Device {
                         | wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[],
                 });
-                (mk("sbs_split_left"), mk("sbs_split_right"))
-            }).clone()
+                cache.insert(slot, (eye_w, eye_h, mk("sbs_split_left"), mk("sbs_split_right")));
+            }
+            let e = cache.get(&slot).unwrap();
+            (e.2.clone(), e.3.clone())
         };
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("sbs_split"),
@@ -5353,24 +5383,44 @@ impl Device {
     /// `src_w`/`src_h` are the native P010 (Y-plane) dims; `out_w`/`out_h` the
     /// working preview res.
     #[cfg(target_os = "macos")]
+    /// `slot` picks the cached output texture (see `p010_resolve_out_cache`).
+    /// CALLERS MUST USE A DISTINCT SLOT PER CONCURRENT OUTPUT: the dual-stream
+    /// preview resolves both eyes at identical dims in one frame, so sharing a
+    /// slot would alias left and right. 0 = preview left, 1 = preview right,
+    /// 2 = preview side-by-side whole frame, 32 = export side-by-side whole frame.
     pub fn resolve_p010_planes_to_rgba16(
         &self,
         y_tex: &wgpu::Texture,
         uv_tex: &wgpu::Texture,
         src_w: u32, src_h: u32,
         out_w: u32, out_h: u32,
+        slot: u32,
     ) -> Result<wgpu::Texture> {
-        let out_tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("p010_planes_resolved_rgba16"),
-            size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        // Reuse a per-slot output across frames. Safe to overwrite for the
+        // same reason the projection caches are: the previous frame's reader
+        // (the projection, or the split's copy_texture_to_texture) is
+        // GPU-ordered ahead of this frame's write on the same queue, and
+        // nothing holds a resolved texture past compose.
+        let out_tex = {
+            let mut cache = self.p010_resolve_out_cache.lock().unwrap();
+            let hit = matches!(cache.get(&slot), Some(&(w, h, _)) if w == out_w && h == out_h);
+            if !hit {
+                let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("p010_planes_resolved_rgba16"),
+                    size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+                    mip_level_count: 1, sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Unorm,
+                    // COPY_SRC is what lets `split_sbs_texture_16` read this.
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::STORAGE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                cache.insert(slot, (out_w, out_h, tex));
+            }
+            cache.get(&slot).unwrap().2.clone()
+        };
         // Separate plane textures — bind their default views directly (the
         // single-texture path uses plane-aspect views of one P010 texture).
         let y_view = y_tex.create_view(&Default::default());
