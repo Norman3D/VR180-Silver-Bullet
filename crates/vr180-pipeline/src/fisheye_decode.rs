@@ -319,6 +319,16 @@ pub struct SbsFisheyeIter {
     video_idx: usize,
     decoder: ffmpeg_next::codec::decoder::Video,
     scaler: Option<ffmpeg_next::software::scaling::Context>,
+    /// `(pixel format, width, height)` the cached `scaler` was built for.
+    /// Revalidated every frame — see `repack_split`.
+    scaler_def: Option<(ffmpeg_next::format::Pixel, u32, u32)>,
+    /// Reusable destination for `av_hwframe_transfer_data`. Held across
+    /// frames on purpose: transferring into an EMPTY frame makes ffmpeg
+    /// allocate the full plane buffer every time (~136 MB for one 4128²
+    /// P010 eye pair), which cost ~40 ms/frame and made hardware decode
+    /// measurably SLOWER than threaded software decode. Transferring into
+    /// an already-allocated frame of matching format/dims reuses it.
+    sw_storage: ffmpeg_next::frame::Video,
     eye_w: u32,
     eye_h: u32,
     frame_limit: u32,
@@ -382,9 +392,99 @@ impl SbsFisheyeIter {
         let time_base = video.time_base();
         let time_base_s = time_base.numerator() as f64 / time_base.denominator() as f64;
 
-        #[allow(unused_mut)]
         let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(video.parameters())
             .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+        // Tracks whether a hwaccel actually attached, so the threading block
+        // further down can leave the decoder single-threaded when the GPU is
+        // doing the work. Frame threads buy nothing there and cost real
+        // memory (measured +885 MB at 8K), and on Windows extra frame threads
+        // enlarge the d3d11va surface pool that `interop_windows`'s VRAM
+        // pre-flight budgets for without a thread_count term.
+        #[allow(unused_mut, unused_assignments)]
+        let mut hw_attached = false;
+        // macOS: VideoToolbox hardware decode. Mirrors the Windows d3d11va
+        // attach below and `DualStreamFisheyeIter::new_with_options` — the
+        // `hw` flag was accepted and then dropped here, so every generic
+        // side-by-side source decoded in software on macOS while every other
+        // source kind got VT. Decoded frames are GPU-resident
+        // (`Pixel::VIDEOTOOLBOX`); `repack_split` downloads them before
+        // swscale, which cannot consume them.
+        //
+        // OPT-IN ONLY (`VR180_SBS_VT=1`): it MEASURED SLOWER than the threaded
+        // software decode above, on an M5 Max, for this path —
+        //
+        //   8256x4128 10-bit HEVC, per frame     software   VideoToolbox
+        //     decode + repack to RGBA8              51 ms       69 ms
+        //     decode + repack to RGBA64            144 ms      160 ms
+        //   full 301-frame reframe export         52.7 s      61.2 s
+        //
+        // The reason is structural, and it is exactly why "mirror the Windows
+        // d3d11va attach" does NOT transfer to macOS: on Windows the decoded
+        // surface STAYS on the GPU and feeds a zero-copy pipeline. Here it has
+        // to come straight back to host memory through
+        // av_hwframe_transfer_data so swscale can reach it, and that download
+        // costs more than the multi-threaded decode it replaces. (Reusing the
+        // download buffer across frames — done above — did not close the gap.)
+        // The macOS equivalent of the Windows win is the zero-copy IOSurface
+        // path the dual-stream sources already use, where frames never leave
+        // the GPU; not a hwaccel attach in front of a CPU pipeline.
+        //
+        // Kept, off by default, because the trade flips on a machine with few
+        // cores: software decode scales with core count, the download does
+        // not. The env var makes the comparison above one command to re-run.
+        // `VR180_NO_HW_DECODE=1` additionally forces software everywhere here.
+        //
+        // Restricted to H.264 / HEVC, the codecs where VT decode was MEASURED
+        // byte-identical to the software decode through this whole path (both
+        // hand back NV12 / P010, which swscale converts to the same RGB).
+        // ProRes is deliberately excluded: VT returns p210le for 422 and
+        // ayuv64le for 4444 instead of the software yuv422p10le / yuva444p12le,
+        // and the exported frames differ visibly (max 10/255 on 422,
+        // 66/255 on 4444). ProRes software decode is cheap and now threaded,
+        // so it loses little by staying on that path. Widen this list only
+        // with a fresh A/B (VR180_SBS_VT=1 vs unset).
+        #[cfg(target_os = "macos")]
+        let vt_codec_ok = matches!(
+            video.parameters().id(),
+            ffmpeg_next::codec::Id::H264 | ffmpeg_next::codec::Id::HEVC
+        );
+        // ...and never for an 8-bit FULL-RANGE source. VideoToolbox maps both
+        // the video-range and full-range biplanar CVPixelBuffer types onto a
+        // plain `nv12` AVFrame, so the range tag is gone after the download.
+        // swscale here takes its entire colour interpretation from that one
+        // pixel-format enum (`Context::run` calls raw `sws_scale` and never
+        // sees the frame's tags), and `sws_getContext`'s handle_jpeg() gives
+        // `yuvj420p` full range but `nv12` limited range. A full-range clip
+        // would therefore decode with crushed blacks and clipped whites under
+        // VT while the software path — and the `HwDecode::Software`
+        // zoom-still worker — got it right, so the same frame would not even
+        // match itself across the UI. 10-bit is unaffected (yuv420p10le and
+        // p010le are both limited-range as far as swscale is concerned).
+        #[cfg(target_os = "macos")]
+        let vt_range_ok = {
+            let par = video.parameters();
+            // SAFETY: read-only access to a POD field of AVCodecParameters.
+            let range = unsafe { (*par.as_ptr()).color_range };
+            let depth = codecpar_luma_depth(&par);
+            !(range == ffmpeg_next::ffi::AVColorRange::AVCOL_RANGE_JPEG
+                && depth <= 8)
+        };
+        #[cfg(target_os = "macos")]
+        if vt_codec_ok
+            && vt_range_ok
+            && matches!(hw, HwDecode::Auto | HwDecode::VideoToolbox)
+            && std::env::var_os("VR180_SBS_VT").is_some()
+            && std::env::var_os("VR180_NO_HW_DECODE").is_none()
+        {
+            if crate::decode::try_enable_videotoolbox_decode(&mut codec_ctx) {
+                hw_attached = true;
+                tracing::info!("SbsFisheyeIter: VideoToolbox hardware decode attached");
+            } else if matches!(hw, HwDecode::VideoToolbox) {
+                return Err(Error::Ffmpeg(
+                    "VideoToolbox requested but unavailable".into(),
+                ));
+            }
+        }
         // Windows: hardware decode via d3d11va (NVDEC) — the flag was
         // accepted but silently ignored here, so every generic-SBS source
         // decoded in software. Decoded frames are GPU-resident; repack_split
@@ -393,9 +493,49 @@ impl SbsFisheyeIter {
         if matches!(hw, HwDecode::Auto)
             && crate::decode::try_enable_d3d11va_decode(&mut codec_ctx)
         {
+            hw_attached = true;
             tracing::info!("SbsFisheyeIter: d3d11va (NVDEC) hardware decode attached");
         }
-        #[cfg(not(target_os = "windows"))]
+        // Multi-threaded SOFTWARE decode. libavcodec defaults `thread_count`
+        // to 1 and no decoder in this workspace ever set it, so every software
+        // decode here ran on ONE core: measured 228 ms/frame on 8256x4128
+        // 10-bit HEVC versus 27 ms multi-threaded, which was ~59% of a whole
+        // side-by-side export frame budget. This is the change that took the
+        // 301-frame reframe export from 114.6 s to 52.1 s.
+        //
+        // Deliberately AFTER the hwaccel attaches, and skipped when one did:
+        // frame threads add nothing when the GPU video engine is decoding,
+        // they cost ~+885 MB at 8K, and on Windows they would enlarge the
+        // d3d11va surface pool that the VRAM pre-flight in `interop_windows`
+        // sizes without a thread_count term — which could push a clip that
+        // passed that check over the real limit. Leaving hardware decodes at
+        // thread_count 1 keeps Windows byte-for-byte as it was.
+        //
+        // Capped at 6, which is the knee of the curve. Measured decoding 60
+        // frames of 8256x4128 10-bit HEVC (wall time / peak RSS):
+        //
+        //     threads   1     2     4     6     8
+        //     fps      4.3   8.2  12.0  17.7  19.2
+        //     RSS     1263  1345  1505  1760  2069 MB
+        //
+        // 6 -> 8 buys 8% more speed for another ~300 MB, and each frame thread
+        // holds its own reference frames — which matters here because the
+        // preview worker, the zoom-still worker and an export can each hold a
+        // decoder open at once (see the construction sites in
+        // vr180-gui::decoder). Machines with fewer cores land below the cap
+        // anyway.
+        if !hw_attached {
+            let n = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(1, 6);
+            let mut tc = ffmpeg_next::threading::Config::kind(
+                ffmpeg_next::threading::Type::Frame,
+            );
+            tc.count = n;
+            codec_ctx.set_threading(tc);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let _ = hw;
         let decoder = codec_ctx.decoder().video()
             .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?;
@@ -411,7 +551,8 @@ impl SbsFisheyeIter {
         let eye_h = frame_h;
 
         Ok(Self {
-            ictx, video_idx, decoder, scaler: None,
+            ictx, video_idx, decoder, scaler: None, scaler_def: None,
+            sw_storage: ffmpeg_next::frame::Video::empty(),
             eye_w, eye_h,
             frame_limit, frames_yielded: 0,
             output_bit_depth,
@@ -426,14 +567,13 @@ impl FisheyePairIter for SbsFisheyeIter {
             return Ok(None);
         }
         let mut decoded = ffmpeg_next::frame::Video::empty();
-        let mut sw_storage = ffmpeg_next::frame::Video::empty();
 
         // Try buffered output first.
         loop {
             if self.decoder.receive_frame(&mut decoded).is_ok() {
                 let pts_ticks = decoded.pts().unwrap_or(0);
                 let pts_s = pts_ticks as f64 * self.time_base_s;
-                let (left, right) = self.repack_split(&mut decoded, &mut sw_storage)?;
+                let (left, right) = self.repack_split(&mut decoded)?;
                 self.frames_yielded += 1;
                 return Ok(Some(FisheyePair {
                     left, right,
@@ -455,7 +595,7 @@ impl FisheyePairIter for SbsFisheyeIter {
                     if self.decoder.receive_frame(&mut decoded).is_ok() {
                         let pts_ticks = decoded.pts().unwrap_or(0);
                         let pts_s = pts_ticks as f64 * self.time_base_s;
-                        let (left, right) = self.repack_split(&mut decoded, &mut sw_storage)?;
+                        let (left, right) = self.repack_split(&mut decoded)?;
                         self.frames_yielded += 1;
                         return Ok(Some(FisheyePair {
                             left, right,
@@ -488,15 +628,42 @@ impl SbsFisheyeIter {
     /// Scale to RGBA8 (or RGBA64LE at `output_bit_depth` 16) and split the
     /// frame down the middle. Returns (left, right), each
     /// `eye_w × eye_h × (4 | 8)` bytes.
+    /// Lend the struct-owned `sw_storage` to [`Self::repack_split_with`].
+    /// Swapped out and back so the borrow checker sees one `&mut self`;
+    /// the buffer is restored on every path, including the error one.
     fn repack_split(
+        &mut self,
+        decoded: &mut ffmpeg_next::frame::Video,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut sw = std::mem::replace(
+            &mut self.sw_storage,
+            ffmpeg_next::frame::Video::empty(),
+        );
+        let out = self.repack_split_with(decoded, &mut sw);
+        self.sw_storage = sw;
+        out
+    }
+
+    fn repack_split_with(
         &mut self,
         decoded: &mut ffmpeg_next::frame::Video,
         sw_storage: &mut ffmpeg_next::frame::Video,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        // d3d11va frames are GPU-resident — download to host (NV12 / P010)
-        // before swscale. Software frames pass through untouched.
+        // Hardware-decoded surfaces live in GPU memory — download to host
+        // (NV12 / P010) before swscale, which cannot consume them. Covers
+        // both VideoToolbox (macOS) and D3D11VA/NVDEC (Windows); software
+        // frames pass through untouched.
+        //
+        // Testing the per-frame FORMAT rather than a stored "hwaccel
+        // attached" flag is deliberate: when a hwaccel declines during init
+        // ffmpeg silently falls back to software, and only the format tells
+        // the truth. These two formats never appear on a software frame.
         let decoded: &ffmpeg_next::frame::Video =
-            if decoded.format() == ffmpeg_next::format::Pixel::D3D11 {
+            if matches!(
+                decoded.format(),
+                ffmpeg_next::format::Pixel::VIDEOTOOLBOX
+                    | ffmpeg_next::format::Pixel::D3D11
+            ) {
                 crate::decode::download_hw_frame(decoded, sw_storage)?;
                 sw_storage
             } else {
@@ -519,19 +686,67 @@ impl SbsFisheyeIter {
         } else {
             ffmpeg_next::software::scaling::Flags::FAST_BILINEAR
         };
+        // Rebuild the cached scaler when the source definition changes.
+        // It used to be built once from frame 0 and reused forever, which
+        // was safe only because software decode never changes pixel format
+        // mid-stream. A hwaccel can: if VideoToolbox / d3d11va declines
+        // partway through init, ffmpeg falls back to software and frames
+        // arrive as yuv420p10le instead of p010le. `Context::run` then
+        // returns `InputChanged` for every remaining frame — which surfaces
+        // as a preview that stops dead and reads as EOF, and as a zoom still
+        // that never appears. Keyed on dims too, so a resolution change is
+        // caught the same way.
+        // `eye_w`/`eye_h` were fixed at construction from the container's
+        // dimensions, and the L/R split below slices by them — so a frame that
+        // changes SIZE mid-stream must not be quietly re-scaled at the old
+        // split point. At HEAD the cached scaler turned that into a clean
+        // `Error::InputChanged`; keep it an error now that the cache rebuilds.
+        // A pixel-FORMAT change is the intended rebuild (it is the hwaccel
+        // falling back to software) and is safe, because the split does not
+        // depend on format.
+        if frame_w != self.eye_w * 2 || frame_h != self.eye_h {
+            return Err(Error::Ffmpeg(format!(
+                "SBS frame changed size mid-stream: expected {}x{}, got {}x{}",
+                self.eye_w * 2, self.eye_h, frame_w, frame_h
+            )));
+        }
+        let src_def = (decoded.format(), frame_w, frame_h);
+        if self.scaler_def != Some(src_def) {
+            if self.scaler.is_some() {
+                tracing::info!(
+                    "SbsFisheyeIter: source changed to {:?} {}x{} — rebuilding scaler",
+                    src_def.0, frame_w, frame_h
+                );
+            }
+            self.scaler = None;
+        }
         let scaler = match &mut self.scaler {
             Some(s) => s,
             None => {
                 self.scaler = Some(
                     ffmpeg_next::software::scaling::Context::get(
-                        decoded.format(),
+                        src_def.0,
                         frame_w, frame_h,
                         target_pix_fmt,
                         frame_w, frame_h,
                         scaler_flags,
                     ).map_err(|e| Error::Ffmpeg(format!("scaler: {e}")))?
                 );
-                self.scaler.as_mut().unwrap()
+                self.scaler_def = Some(src_def);
+                // Tell swscale the exact source / destination colorimetry via
+                // sws_setColorspaceDetails. Without it `Context::run` (raw
+                // sws_scale, which never sees the frame's tags) falls back to
+                // SWS_CS_DEFAULT = Rec.601 coefficients — so every generic
+                // side-by-side frame was converted with a 601 matrix while the
+                // GPU shaders, and every other source kind including the
+                // dual-stream iterator at the identical call site above, use
+                // Rec.709. Zero error on neutrals, up to ~20/255 on a
+                // saturated primary. Measured on bt709-tagged 8K footage, this
+                // path sat much closer to a 601 reference (mean 0.45) than a
+                // 709 one (mean 1.51) before this line.
+                let s = self.scaler.as_mut().unwrap();
+                set_sws_colorspace_details(s, is_16bit);
+                s
             }
         };
 
@@ -1403,6 +1618,340 @@ impl VtSharedDualStreamIter {
     }
 }
 
+/// One VideoToolbox zero-copy frame from a GENERIC side-by-side source
+/// (plain `.mp4`/`.mov`, `SourceKind::SbsFisheye`): the WHOLE
+/// `2·eye_w × eye_h` frame's Y + UV planes wrapped as wgpu textures that
+/// ALIAS the decoded P010 IOSurface. The consumer resolves the whole frame
+/// ONCE with `Device::resolve_p010_planes_to_rgba16` and halves it with
+/// `Device::split_sbs_texture_16` — never by giving the fisheye shaders an
+/// x-offset, which normalise by `cal.src_w/src_h` and rely on ClampToEdge,
+/// so an out-of-frame tap lands in the OTHER EYE instead of clamping.
+/// macOS analogue of the Windows [`SharedSbsFrame`]. Deliberately NOT `Send`
+/// (like [`VtSharedFisheyePair`]) — the IOSurface textures must not cross a
+/// thread. Hold it alive until the resolve reading it has been SUBMITTED.
+#[cfg(target_os = "macos")]
+pub struct VtSharedSbsFrame {
+    pub frame_y:  crate::interop_macos::IOSurfacePlaneTexture,
+    pub frame_uv: crate::interop_macos::IOSurfacePlaneTexture,
+    /// WHOLE-frame (Y-plane) dims — what the resolve downscales FROM.
+    pub frame_w: u32,
+    pub frame_h: u32,
+    /// PER-EYE native dims (`frame_w / 2`, `frame_h`) — what
+    /// `split_sbs_texture_16` and the calib resolver want.
+    pub eye_w: u32,
+    pub eye_h: u32,
+    /// Presentation timestamp in seconds, `0.0` if unknown.
+    pub pts_s: f64,
+}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Debug for VtSharedSbsFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VtSharedSbsFrame")
+            .field("frame", &(self.frame_w, self.frame_h))
+            .field("eye", &(self.eye_w, self.eye_h))
+            .field("pts_s", &self.pts_s)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Single-stream VideoToolbox zero-copy iterator for GENERIC side-by-side
+/// sources — [`VtSharedDualStreamIter`] collapsed to ONE stream the way
+/// Windows' [`D3d11SharedSbsIter`] collapses `D3d11SharedStreamPairIter`.
+///
+/// Two deliberate differences from the Windows sibling:
+///  * NO work-res downscale. VT hands back the native IOSurface and cannot
+///    convert on the way out, so the box filter is the consumer's resolve —
+///    `eye_dims()` reports NATIVE per-eye dims, same convention as
+///    [`VtSharedDualStreamIter::eye_dims`].
+///  * NO eye swap, same as Windows: the halves come out in frame order,
+///    exactly like the CPU [`SbsFisheyeIter`] (whose constructor takes no
+///    swap flag either), so the user toggle is applied exactly once,
+///    downstream. Adding one here would double-apply it against the CPU
+///    fallback.
+///
+/// Single-segment only — there is no segmented VT SBS chaining, so a merged
+/// SBS clip must stay on the CPU iterator (the callers gate on that).
+#[cfg(target_os = "macos")]
+pub struct VtSharedSbsIter {
+    ictx: ffmpeg_next::format::context::Input,
+    video_idx: usize,
+    decoder: ffmpeg_next::codec::decoder::Video,
+    /// Native WHOLE-frame dims (`frame_w == 2 · eye_w`).
+    frame_w: u32,
+    frame_h: u32,
+    /// Native PER-EYE dims.
+    eye_w: u32,
+    eye_h: u32,
+    time_base_s: f64,
+    /// Nominal frame duration (1/fps) for the precise-seek run-in window.
+    dt_s: f64,
+    frames_yielded: u32,
+    /// Precise-seek state — `next_frame` decodes-and-discards the
+    /// keyframe→target run-in so the first frame returned is the exact
+    /// requested one (same contract as every other zero-copy iterator).
+    skip_until_s: Option<f64>,
+}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Debug for VtSharedSbsIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VtSharedSbsIter")
+            .field("video_idx", &self.video_idx)
+            .field("frame", &(self.frame_w, self.frame_h))
+            .field("eye", &(self.eye_w, self.eye_h))
+            .field("frames_yielded", &self.frames_yielded)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "macos")]
+/// Luma bit depth of a stream, from `AVCodecParameters`.
+///
+/// `bits_per_raw_sample` is the obvious field but is frequently **0** even
+/// after `avformat_find_stream_info` — a genuine `hvc1` Main10 clip muxed by
+/// x265 reports 0, which is why this is not a one-liner. So fall back to the
+/// pixel format, which the mov/mp4 demuxer fills from hvcC/avcC (`ffprobe`
+/// prints it as `pix_fmt`) and which carries the real depth in its component
+/// descriptor. Returns 0 only when BOTH are unknown — callers must treat that
+/// as "not 10-bit", never guess.
+fn codecpar_luma_depth(par: &ffmpeg_next::codec::Parameters) -> i32 {
+    // SAFETY: read-only access to POD fields of AVCodecParameters, and
+    // `av_pix_fmt_desc_get` on a value that came out of that struct (it
+    // returns null for AV_PIX_FMT_NONE / out-of-range, which we check).
+    unsafe {
+        let p = &*par.as_ptr();
+        if p.bits_per_raw_sample > 0 {
+            return p.bits_per_raw_sample;
+        }
+        let desc = ffmpeg_next::ffi::av_pix_fmt_desc_get(
+            std::mem::transmute::<i32, ffmpeg_next::ffi::AVPixelFormat>(p.format));
+        if desc.is_null() {
+            return 0;
+        }
+        let d = &*desc;
+        if d.nb_components == 0 { 0 } else { d.comp[0].depth }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl VtSharedSbsIter {
+    /// Open a generic SBS file and force VideoToolbox decode.
+    ///
+    /// Returns `Err` — so every caller falls back to the CPU
+    /// [`SbsFisheyeIter`] with nothing consumed — when:
+    ///  * there is no video stream;
+    ///  * the codec is not H.264/HEVC. VT returns `p210le` (4:2:2) for ProRes
+    ///    422 and `ayuv64le` for 4444, which breaks the half-res-UV
+    ///    assumption baked into `p010_resolve_rgba16.wgsl`'s `uv_uv`;
+    ///  * the source is not >= 10-bit. THIS IS THE LOAD-BEARING CHECK.
+    ///    `wrap_p010_planes` hard-codes R16Unorm/Rg16Unorm and
+    ///    `IOSurfaceNv12Descriptor::new` validates ONLY `plane_count() == 2`,
+    ///    which an 8-bit NV12 surface ALSO satisfies — it would be wrapped
+    ///    silently and render garbage rather than erroring, and there is no
+    ///    runtime check anywhere downstream. See `codecpar_luma_depth` for
+    ///    why this cannot just read `bits_per_raw_sample`; a depth of 0
+    ///    (both sources unknown) is a REFUSAL for the same reason —
+    ///    guessing 10 reintroduces exactly the case this check prevents;
+    ///  * the frame width is odd, or a dimension is zero (not splittable);
+    ///  * VideoToolbox will not attach, or `VR180_NO_HW_DECODE` is set.
+    ///
+    /// Deliberately NOT gated on `VR180_SBS_VT`. That gate exists on
+    /// [`SbsFisheyeIter`] because VT there is followed by an
+    /// `av_hwframe_transfer_data` download that measured SLOWER than threaded
+    /// software decode; this path has no download, so the trade does not
+    /// apply. Do not remove the gate from `SbsFisheyeIter` either.
+    pub fn new(path: &Path) -> Result<Self> {
+        ffmpeg_init();
+        if std::env::var_os("VR180_NO_HW_DECODE").is_some() {
+            return Err(Error::Ffmpeg(
+                "VR180_NO_HW_DECODE set — VT zero-copy SBS path disabled".into()));
+        }
+        let ictx = ffmpeg_next::format::input(path)
+            .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+        // Largest video stream wins — same selection as `SbsFisheyeIter` and
+        // `D3d11SharedSbsIter` (protects against thumbnail / data streams).
+        let video = ictx
+            .streams()
+            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+            .max_by_key(|s| {
+                let p = s.parameters();
+                unsafe {
+                    let cp = &*p.as_ptr();
+                    (cp.width as u64) * (cp.height as u64)
+                }
+            })
+            .ok_or_else(|| Error::Ffmpeg("no video stream".into()))?;
+        let video_idx = video.index();
+
+        // ── Open-time refusals. BEFORE the VT attach, which replaces
+        //    `decoder.format()` with VIDEOTOOLBOX and hides the source format.
+        let par = video.parameters();
+        if !matches!(
+            par.id(),
+            ffmpeg_next::codec::Id::H264 | ffmpeg_next::codec::Id::HEVC
+        ) {
+            return Err(Error::Ffmpeg(format!(
+                "VT zero-copy SBS path is H.264/HEVC only; source is {:?} \
+                 — falling back to the CPU iterator", par.id())));
+        }
+        let depth = codecpar_luma_depth(&par);
+        if depth < 10 {
+            return Err(Error::Ffmpeg(format!(
+                "VT zero-copy SBS path is P010-only; source luma depth is \
+                 {depth} (0 = unknown) — falling back to the CPU iterator")));
+        }
+
+        let time_base = video.time_base();
+        let time_base_s = time_base.numerator() as f64 / time_base.denominator().max(1) as f64;
+        let fr = video.avg_frame_rate();
+        let dt_s = if fr.numerator() > 0 {
+            fr.denominator() as f64 / fr.numerator() as f64
+        } else {
+            1.0 / 30.0
+        };
+
+        let mut codec_ctx =
+            ffmpeg_next::codec::context::Context::from_parameters(video.parameters())
+                .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+        if !crate::decode::try_enable_videotoolbox_decode(&mut codec_ctx) {
+            return Err(Error::Ffmpeg(
+                "VT zero-copy SBS path requires VideoToolbox — setup failed".into()));
+        }
+        let decoder = codec_ctx.decoder().video()
+            .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?;
+        let (fw, fh) = (decoder.width(), decoder.height());
+        if fw % 2 != 0 || fw == 0 || fh == 0 {
+            return Err(Error::Ffmpeg(format!(
+                "SBS frame {fw}x{fh} not splittable (width must be even)")));
+        }
+        let (eye_w, eye_h) = (fw / 2, fh);
+        tracing::info!(
+            "VtSharedSbsIter: {fw}x{fh} SBS (native {eye_w}x{eye_h} per eye), \
+             {depth}-bit, VideoToolbox P010 IOSurface zero-copy");
+        Ok(Self {
+            ictx, video_idx, decoder,
+            frame_w: fw, frame_h: fh,
+            eye_w, eye_h,
+            time_base_s, dt_s,
+            frames_yielded: 0,
+            skip_until_s: None,
+        })
+    }
+
+    /// Native PER-EYE dims — same convention as
+    /// [`VtSharedDualStreamIter::eye_dims`]; the consumer downscales itself.
+    pub fn eye_dims(&self) -> (u32, u32) { (self.eye_w, self.eye_h) }
+
+    /// Native WHOLE-frame (Y-plane) dims — what the resolve reads FROM.
+    pub fn frame_dims(&self) -> (u32, u32) { (self.frame_w, self.frame_h) }
+
+    /// PRECISE seek — arms the run-in discard, like every zero-copy iterator.
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        let target_s = target_s.max(0.0);
+        let ts = (target_s * 1_000_000.0) as i64;
+        self.ictx.seek(ts, ..ts)
+            .map_err(|e| Error::Ffmpeg(format!("seek {target_s:.3}s: {e}")))?;
+        self.decoder.flush();
+        self.frames_yielded = 0;
+        self.skip_until_s = Some(target_s);
+        Ok(())
+    }
+
+    /// Wrap a VT-decoded P010 frame's IOSurface as (Y: `R16Unorm`,
+    /// UV: `Rg16Unorm`) plane textures aliasing the surface — the same recipe
+    /// as [`VtSharedDualStreamIter::wrap_p010_planes`], applied to the WHOLE
+    /// SBS frame instead of one eye.
+    fn wrap_p010_planes(
+        device: &wgpu::Device,
+        frame: &ffmpeg_next::frame::Video,
+    ) -> Result<(crate::interop_macos::IOSurfacePlaneTexture,
+                 crate::interop_macos::IOSurfacePlaneTexture)> {
+        use crate::interop_macos::{
+            extract_iosurface_from_vt_frame, wgpu_texture_from_iosurface_plane,
+            IOSurfaceNv12Descriptor, RetainedIOSurface,
+        };
+        let surf = extract_iosurface_from_vt_frame(frame)?;
+        let desc = IOSurfaceNv12Descriptor::new(surf)?;
+        let y_surf  = unsafe { RetainedIOSurface::retain(desc.surface.as_raw()) };
+        let uv_surf = unsafe { RetainedIOSurface::retain(desc.surface.as_raw()) };
+        let y = wgpu_texture_from_iosurface_plane(
+            device, y_surf, 0,
+            metal::MTLPixelFormat::R16Unorm, wgpu::TextureFormat::R16Unorm,
+            desc.width, desc.height, "sbs_vt_y")?;
+        let uv = wgpu_texture_from_iosurface_plane(
+            device, uv_surf, 1,
+            metal::MTLPixelFormat::RG16Unorm, wgpu::TextureFormat::Rg16Unorm,
+            desc.width / 2, desc.height / 2, "sbs_vt_uv")?;
+        drop(desc);
+        Ok((y, uv))
+    }
+
+    /// Decode the next SBS frame and wrap its P010 planes. `Ok(None)` at EOF.
+    /// Honours the precise-seek run-in — discarding BEFORE the wrap, so no
+    /// IOSurface retain is taken against the decoder's surface pool for a
+    /// frame that is thrown away.
+    pub fn next_frame(&mut self, device: &wgpu::Device)
+        -> Result<Option<VtSharedSbsFrame>>
+    {
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+        loop {
+            let got = if self.decoder.receive_frame(&mut decoded).is_ok() {
+                true
+            } else {
+                // Need more packets; drain at EOF.
+                let mut got = false;
+                loop {
+                    match self.ictx.packets().next() {
+                        Some((stream, packet)) => {
+                            if stream.index() != self.video_idx { continue; }
+                            let _ = self.decoder.send_packet(&packet);
+                            if self.decoder.receive_frame(&mut decoded).is_ok() {
+                                got = true;
+                                break;
+                            }
+                        }
+                        None => {
+                            let _ = self.decoder.send_eof();
+                            got = self.decoder.receive_frame(&mut decoded).is_ok();
+                            break;
+                        }
+                    }
+                }
+                got
+            };
+            if !got { return Ok(None); }
+
+            let pts_s = decoded.pts().unwrap_or(0) as f64 * self.time_base_s;
+            // Precise-seek run-in: decode-and-discard WITHOUT wrapping.
+            if let Some(target) = self.skip_until_s {
+                if pts_s < target - 0.5 * self.dt_s { continue; }
+                self.skip_until_s = None;
+            }
+
+            // A mid-stream resolution change would leave the wrapped
+            // IOSurface at the NEW size while `frame_w`/`eye_w` still
+            // describe the old one — the resolve would sample outside the
+            // plane and the split would cut at the stale eye width. Error
+            // out exactly like `SbsFisheyeIter::repack_split` rather than
+            // silently re-splitting at the wrong offset.
+            if decoded.width() != self.frame_w || decoded.height() != self.frame_h {
+                return Err(Error::Ffmpeg(format!(
+                    "SBS frame changed size mid-stream: expected {}x{}, got {}x{}",
+                    self.frame_w, self.frame_h, decoded.width(), decoded.height())));
+            }
+            let (frame_y, frame_uv) = Self::wrap_p010_planes(device, &decoded)?;
+            self.frames_yielded += 1;
+            return Ok(Some(VtSharedSbsFrame {
+                frame_y, frame_uv,
+                frame_w: self.frame_w, frame_h: self.frame_h,
+                eye_w: self.eye_w, eye_h: self.eye_h,
+                pts_s,
+            }));
+        }
+    }
+}
+
 /// Chains a merged OSV recording's segments through the VideoToolbox
 /// zero-copy preview iterator — the macOS preview analog of the export's
 /// segmented [`ZeroCopyDualStreamFisheyeIter`] (and of Windows'
@@ -1497,6 +2046,68 @@ impl SegmentedVtSharedDualStreamIter {
             self.open_segment(idx)?;
         }
         self.cur.seek(t - self.seg_start_s[idx])
+    }
+}
+
+/// The macOS zero-copy fisheye preview's frame source: a segment-chained
+/// dual-stream camera (`.osv`/`.insv`) or a single-stream generic SBS file.
+/// One enum instead of a trait so the (inline, render-thread) preview loop
+/// keeps a plain owned value. Mirror of the Windows [`ZcFisheyeSource`].
+#[cfg(target_os = "macos")]
+pub enum VtZcFisheyeSource {
+    Dual(SegmentedVtSharedDualStreamIter),
+    Sbs(VtSharedSbsIter),
+}
+
+#[cfg(target_os = "macos")]
+impl VtZcFisheyeSource {
+    /// Native PER-EYE dims for BOTH variants — so the consumer's working-res
+    /// derivation, the calib resolver and `preview_out_dims` see exactly what
+    /// they see for a dual-stream source today.
+    pub fn eye_dims(&self) -> (u32, u32) {
+        match self {
+            Self::Dual(i) => i.eye_dims(),
+            Self::Sbs(i) => i.eye_dims(),
+        }
+    }
+    pub fn seek(&mut self, t: f64) -> Result<()> {
+        match self {
+            Self::Dual(i) => i.seek(t),
+            Self::Sbs(i) => i.seek(t),
+        }
+    }
+    /// Named `next_pair` so the preview loop's existing call sites are
+    /// unchanged; an SBS source yields ONE whole-frame plane pair.
+    pub fn next_pair(&mut self, device: &wgpu::Device)
+        -> Result<Option<VtZcFisheyeFrame>>
+    {
+        match self {
+            Self::Dual(i) => Ok(i.next_pair(device)?.map(VtZcFisheyeFrame::Pair)),
+            Self::Sbs(i)  => Ok(i.next_frame(device)?.map(VtZcFisheyeFrame::Sbs)),
+        }
+    }
+}
+
+/// One frame from [`VtZcFisheyeSource`]. Deliberately NOT `Send`: both
+/// variants alias a VideoToolbox IOSurface and must stay on the thread that
+/// decoded them (see [`VtSharedFisheyePair`]).
+#[cfg(target_os = "macos")]
+pub enum VtZcFisheyeFrame {
+    Pair(VtSharedFisheyePair),
+    Sbs(VtSharedSbsFrame),
+}
+
+#[cfg(target_os = "macos")]
+impl VtZcFisheyeFrame {
+    /// Presentation timestamp, verbatim. Non-finite / negative values are the
+    /// caller's cue to fall back to the pacing clock — keep that branch alive
+    /// rather than normalising to 0.0 here: `stab_idx` → `absolute_frame_idx`
+    /// → `timestamp_s` is what the zoom-still DetailCache keys on.
+    pub fn pts_s(&self) -> f64 {
+        match self {
+            Self::Pair(p) => p.pts_s,
+            Self::Sbs(f) => f.pts_s,
+        }
     }
 }
 
@@ -2777,29 +3388,59 @@ impl DenoisingZeroCopyIter {
 pub enum ZcDecoder {
     Raw(ZeroCopyDualStreamFisheyeIter),
     Denoising(DenoisingZeroCopyIter),
+    /// Generic side-by-side source — ONE VideoToolbox stream, whole-frame
+    /// P010 planes. No denoise sibling on purpose: `DenoisingZeroCopyIter`
+    /// takes a `ZeroCopyDualStreamFisheyeIter` BY VALUE, so SBS + NR must stay
+    /// on the portable export path (the gate enforces that).
+    Sbs(VtSharedSbsIter),
+}
+
+/// One frame from [`ZcDecoder`]: a dual-stream per-eye plane pair, or a
+/// generic SBS source's whole-frame plane pair. macOS mirror of the Windows
+/// [`ZcFisheyeFrame`].
+#[cfg(target_os = "macos")]
+pub enum ZcMacFrame {
+    Pair(ZeroCopyFisheyePair),
+    Sbs(VtSharedSbsFrame),
+}
+
+#[cfg(target_os = "macos")]
+impl ZcMacFrame {
+    pub fn pts_s(&self) -> f64 {
+        match self {
+            Self::Pair(p) => p.pts_s,
+            Self::Sbs(f) => f.pts_s,
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 impl ZcDecoder {
+    /// PER-EYE dims for every variant (SBS reports decoded width / 2), so
+    /// `resolve_calib_pair` and the projections' src_w/src_h normalisation
+    /// are identical across kinds.
     pub fn eye_dims(&self) -> (u32, u32) {
         match self {
             Self::Raw(d) => d.eye_dims(),
             Self::Denoising(d) => d.eye_dims(),
+            Self::Sbs(d) => d.eye_dims(),
         }
     }
     pub fn seek(&mut self, target_s: f64) -> Result<()> {
         match self {
             Self::Raw(d) => d.seek(target_s),
             Self::Denoising(d) => d.seek(target_s),
+            Self::Sbs(d) => d.seek(target_s),
         }
     }
-    pub fn next_pair(
+    pub fn next_frame(
         &mut self,
         device: &wgpu::Device,
-    ) -> Result<Option<ZeroCopyFisheyePair>> {
+    ) -> Result<Option<ZcMacFrame>> {
         match self {
-            Self::Raw(d) => d.next_pair(device),
-            Self::Denoising(d) => d.next_pair(device),
+            Self::Raw(d) => Ok(d.next_pair(device)?.map(ZcMacFrame::Pair)),
+            Self::Denoising(d) => Ok(d.next_pair(device)?.map(ZcMacFrame::Pair)),
+            Self::Sbs(d) => Ok(d.next_frame(device)?.map(ZcMacFrame::Sbs)),
         }
     }
 }

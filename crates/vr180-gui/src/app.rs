@@ -20,6 +20,21 @@ use crate::decoder::{
 };
 
 /// The single egui application.
+
+/// What a worker-thread file picker came back with. One variant per call
+/// site; `Cancelled` covers the user dismissing the panel.
+enum DialogResult {
+    /// Video sources to open (the "Load video…" button and Cmd+O).
+    Videos(Vec<std::path::PathBuf>),
+    /// Batch output directory.
+    BatchOutDir(std::path::PathBuf),
+    /// A .cube LUT for the colour panel.
+    Lut(std::path::PathBuf),
+    /// A Gyroflow lens profile, applied to both eyes.
+    GyroflowProfile(std::path::PathBuf),
+    Cancelled,
+}
+
 pub struct App {
     /// Shared with the decoder worker. Built on eframe's wgpu device.
     pipeline: Arc<vr180_pipeline::gpu::Device>,
@@ -110,6 +125,41 @@ pub struct App {
     /// finishes (cleanly or via cancel) — the GUI re-enables the
     /// Export button.
     export_job: Option<ExportJob>,
+
+    // ─── Native file pickers ──────────────────────────────────────
+    //
+    // These MUST NOT be run from inside `update()`. rfd's blocking API
+    // ends in `-[NSSavePanel runModal]`, which spins a nested modal
+    // runloop while winit's event handler is still borrowed. winit posts
+    // its queued events with `CFRunLoopPerformBlock` in
+    // `kCFRunLoopDefaultMode` and deliberately avoids the modal and
+    // event-tracking modes so that a blocking modal is normally safe —
+    // but a Core Drag defeats that: `NSCoreDragTrackingProc` pumps
+    // `-[NSRunLoop runUntilDate:]` in DEFAULT mode, which drains the
+    // queued block straight back into the borrowed handler. winit's
+    // `try_borrow_mut` then fails and panics across an ObjC nounwind
+    // boundary, i.e. an immediate abort. Confirmed from the crash report
+    // for pid 84516 (frames: App::update → pick_and_load_file → rfd
+    // run_modal → NSSavePanel runModal → NSCoreDragTrackingProc →
+    // CFRunLoopDoBlocks → winit's block → abort).
+    //
+    // Running the picker on a worker thread fixes it: rfd wraps its
+    // blocking body in `run_on_main`, so off-thread it marshals through
+    // `dispatch::Queue::main().exec_sync` and `runModal` executes from a
+    // main-queue block — a SIBLING callout of the observer that drives
+    // winit, never nested inside it. No borrow is held for the dialog's
+    // life, so nothing is ever queued to be drained re-entrantly.
+    //
+    // NB `rfd::AsyncFileDialog` is NOT the fix. `ModalFuture::new` only
+    // takes the sheet path when a parent window resolves; otherwise it
+    // falls back to a plain `runModal` on the main thread and silently
+    // reintroduces this exact crash.
+    dialog_tx: crossbeam_channel::Sender<DialogResult>,
+    dialog_rx: crossbeam_channel::Receiver<DialogResult>,
+    /// A picker is on screen. The window keeps repainting behind it now
+    /// (the event loop is no longer blocked), so without this a second
+    /// click would stack a second panel.
+    dialog_open: bool,
 
     // ─── Auto-update (see updater.rs; export-job channel pattern) ──
     updater_tx: crossbeam_channel::Sender<crate::updater::UpdateEvent>,
@@ -1057,6 +1107,8 @@ impl App {
         // user can always check manually via the version label).
         let (updater_tx, updater_rx) = crossbeam_channel::unbounded();
         crate::updater::spawn_check(updater_tx.clone());
+        // Worker-thread file pickers (see the `dialog_tx` field comment).
+        let (dialog_tx, dialog_rx) = crossbeam_channel::unbounded();
 
         Self {
             pipeline,
@@ -1082,6 +1134,9 @@ impl App {
             export_job: None,
             updater_tx,
             updater_rx,
+            dialog_tx,
+            dialog_rx,
+            dialog_open: false,
             update_available: None,
             update_progress: None,
             update_installing: false,
@@ -1600,6 +1655,72 @@ impl App {
     /// Drain updater events + drive the periodic re-check. Mirrors the
     /// reference UX: auto-prompt once per discovered version, never
     /// during an export; manual checks surface "up to date"/errors.
+    /// Run a native file picker on a WORKER thread and deliver the result
+    /// through `dialog_rx`. Never call a blocking rfd dialog directly from
+    /// `update()` — see the `dialog_tx` field comment for the abort that
+    /// causes. Re-entrant clicks are ignored while a panel is up.
+    fn spawn_dialog<F>(&mut self, ctx: &egui::Context, pick: F)
+    where
+        F: FnOnce() -> Option<DialogResult> + Send + 'static,
+    {
+        if self.dialog_open {
+            return;
+        }
+        self.dialog_open = true;
+        let tx = self.dialog_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let r = pick().unwrap_or(DialogResult::Cancelled);
+            let _ = tx.send(r);
+            // The UI keeps painting behind the panel, but the result can
+            // land between frames — wake the loop so it is applied now.
+            ctx.request_repaint();
+        });
+    }
+
+    /// Apply whatever the worker-thread pickers came back with. Drained
+    /// once per frame from `update()`.
+    fn poll_dialogs(&mut self) {
+        while let Ok(r) = self.dialog_rx.try_recv() {
+            self.dialog_open = false;
+            match r {
+                DialogResult::Videos(paths) => self.open_paths(paths),
+                DialogResult::BatchOutDir(dir) => self.batch_out_dir = Some(dir),
+                DialogResult::Lut(p) => {
+                    self.settings.lut_path = p.to_string_lossy().to_string();
+                }
+                DialogResult::GyroflowProfile(path) => {
+                    let s = &mut self.settings;
+                    match vr180_fisheye::GyroflowLensProfile::load(&path) {
+                        Ok(prof) => match prof.to_calibration() {
+                            Ok(cal) => {
+                                let kk = [cal.k[0] as f32, cal.k[1] as f32,
+                                          cal.k[2] as f32, cal.k[3] as f32];
+                                s.fisheye_override_left = true;
+                                s.fisheye_override_right = true;
+                                s.fisheye_k_left = kk;
+                                s.fisheye_k_right = kk;
+                                if cal.calib_w > 0 {
+                                    let r_max = (cal.calib_w.min(cal.calib_h) as f64) * 0.5;
+                                    let fov = cal.full_fov_from_rim(r_max).to_degrees() as f32;
+                                    s.fisheye_fov_deg_left = fov;
+                                    s.fisheye_fov_deg_right = fov;
+                                }
+                                tracing::info!(
+                                    "loaded Gyroflow lens profile: {} — fov≈{:.2}°, k={:?}",
+                                    path.display(), s.fisheye_fov_deg_left, kk
+                                );
+                            }
+                            Err(e) => tracing::error!("Gyroflow lens profile invalid: {e}"),
+                        },
+                        Err(e) => tracing::error!("load Gyroflow JSON {}: {e}", path.display()),
+                    }
+                }
+                DialogResult::Cancelled => {}
+            }
+        }
+    }
+
     fn poll_updater(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = self.updater_rx.try_recv() {
             use crate::updater::UpdateEvent as E;
@@ -2483,10 +2604,10 @@ impl App {
 
     // ─── File loading ────────────────────────────────────────────
 
-    fn pick_and_load_file(&mut self) {
-        if let Some(paths) = Self::video_file_dialog().pick_files() {
-            self.open_paths(paths);
-        }
+    fn pick_and_load_file(&mut self, ctx: &egui::Context) {
+        self.spawn_dialog(ctx, || {
+            Self::video_file_dialog().pick_files().map(DialogResult::Videos)
+        });
     }
 
     /// Open one or more files: fisheye sources join the clip list (and
@@ -3563,7 +3684,9 @@ impl App {
         });
 
         if do_choose_dir {
-            if let Some(dir) = rfd::FileDialog::new().pick_folder() { self.batch_out_dir = Some(dir); }
+            self.spawn_dialog(ctx, || {
+                rfd::FileDialog::new().pick_folder().map(DialogResult::BatchOutDir)
+            });
         }
         if do_clear_dir { self.batch_out_dir = None; }
         if dismiss_summary { self.last_batch_summary = None; }
@@ -3832,6 +3955,7 @@ impl eframe::App for App {
         self.poll_export_job();
         // Auto-update: drain events + periodic re-check + popover.
         self.poll_updater(ctx);
+        self.poll_dialogs();
         self.poll_auto_align(ctx);
         self.draw_update_popover(ctx);
         if self.update_installing {
@@ -3885,7 +4009,7 @@ impl eframe::App for App {
                 if i.key_pressed(egui::Key::O)
                     && (i.modifiers.command || i.modifiers.ctrl)
                 {
-                    self.pick_and_load_file();
+                    self.pick_and_load_file(ctx);
                 }
                 // I / O — mark in/out at current playhead.
                 let cur = self.current_display.as_ref()
@@ -3947,7 +4071,7 @@ impl eframe::App for App {
                     }
                     ui.separator();
                     if ui.button(tr("Load video…")).clicked() {
-                        self.pick_and_load_file();
+                        self.pick_and_load_file(ctx);
                     }
                     // Language toggle (EN / 中文), persisted.
                     ui.separator();
@@ -4874,11 +4998,12 @@ impl App {
             }
             ui.add_space(2.0);
         }
+        // Deferred: the picker must not run inside the egui frame (see
+        // the `dialog_tx` field comment).
+        let mut add_clips = false;
         ui.horizontal(|ui| {
             if ui.small_button(tr("+ Add clips…")).clicked() {
-                if let Some(paths) = Self::video_file_dialog().pick_files() {
-                    self.open_paths(paths);
-                }
+                add_clips = true;
             }
             let n_sel = self.batch.iter().filter(|b| b.selected).count();
             if self.batch.len() > 1 {
@@ -4897,6 +5022,12 @@ impl App {
                 }
             }
         });
+        if add_clips {
+            let ctx = ui.ctx().clone();
+            self.spawn_dialog(&ctx, || {
+                Self::video_file_dialog().pick_files().map(DialogResult::Videos)
+            });
+        }
 
         if let Some(i) = select_idx { self.select_clip(i); }
         if let Some(i) = remove_idx { self.remove_clip(i); }
@@ -5180,6 +5311,9 @@ impl App {
         // (DJI D-LogM for OSV, GoPro GP-Log for `.360`) — never show the
         // wrong camera's curve.
         let kind = self.clip.as_ref().map(|c| c.source_kind);
+        // Deferred: the picker must not run inside the egui frame (see
+        // the `dialog_tx` field comment). Also `s` borrows self below.
+        let mut browse_lut = false;
         let s = &mut self.settings;
 
         // CDL: lift / gamma / gain / shadow / highlight.
@@ -5250,12 +5384,7 @@ impl App {
             };
             ui.add(egui::TextEdit::singleline(&mut label).interactive(false).desired_width(160.0));
             if ui.button(tr("Browse…")).clicked() {
-                if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("Cube LUT", &["cube", "CUBE"])
-                    .pick_file()
-                {
-                    s.lut_path = p.to_string_lossy().to_string();
-                }
+                browse_lut = true;
             }
             if ui.button(tr("Clear")).clicked() {
                 s.lut_path.clear();
@@ -5315,6 +5444,16 @@ impl App {
             s.sharpen_amount = 0.0; s.sharpen_radius = 1.5;
         }
         // (Noise reduction has moved to its own "Noise Reduction" section.)
+
+        if browse_lut {
+            let ctx = ui.ctx().clone();
+            self.spawn_dialog(&ctx, || {
+                rfd::FileDialog::new()
+                    .add_filter("Cube LUT", &["cube", "CUBE"])
+                    .pick_file()
+                    .map(DialogResult::Lut)
+            });
+        }
     }
 
     /// Dedicated Noise Reduction section. The caller only shows this when
@@ -5720,6 +5859,9 @@ impl App {
     /// center / KB + Gyroflow load). Mirrors the Python app's lens
     /// parameters. All sliders apply live during playback.
     fn draw_fisheye_panel(&mut self, ui: &mut egui::Ui) {
+        // Deferred: the picker must not run inside the egui frame (see
+        // the `dialog_tx` field comment). `s` borrows self below.
+        let mut load_gyroflow = false;
         let presets = vr180_fisheye::presets::presets();
         // Native per-eye pixel dims, used to display the principal point
         // as absolute pixels (stored normalized internally). Falls back
@@ -5819,35 +5961,7 @@ impl App {
         if !is_osv {
         ui.add_space(6.0);
         if ui.button("Load Gyroflow lens profile (both eyes)…").clicked() {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Gyroflow lens profile (.json)", &["json", "JSON"])
-                .pick_file()
-            {
-                match vr180_fisheye::GyroflowLensProfile::load(&path) {
-                    Ok(prof) => match prof.to_calibration() {
-                        Ok(cal) => {
-                            let kk = [cal.k[0] as f32, cal.k[1] as f32,
-                                      cal.k[2] as f32, cal.k[3] as f32];
-                            s.fisheye_override_left = true;
-                            s.fisheye_override_right = true;
-                            s.fisheye_k_left = kk;
-                            s.fisheye_k_right = kk;
-                            if cal.calib_w > 0 {
-                                let r_max = (cal.calib_w.min(cal.calib_h) as f64) * 0.5;
-                                let fov = cal.full_fov_from_rim(r_max).to_degrees() as f32;
-                                s.fisheye_fov_deg_left = fov;
-                                s.fisheye_fov_deg_right = fov;
-                            }
-                            tracing::info!(
-                                "loaded Gyroflow lens profile: {} — fov≈{:.2}°, k={:?}",
-                                path.display(), s.fisheye_fov_deg_left, kk
-                            );
-                        }
-                        Err(e) => tracing::error!("Gyroflow lens profile invalid: {e}"),
-                    },
-                    Err(e) => tracing::error!("load Gyroflow JSON {}: {e}", path.display()),
-                }
-            }
+            load_gyroflow = true;
         }
         } // hide Gyroflow loader for OSV
 
@@ -5858,6 +5972,15 @@ impl App {
              principal point and distortion by hand."
         )).small().color(Color32::GRAY));
 
+        if load_gyroflow {
+            let ctx = ui.ctx().clone();
+            self.spawn_dialog(&ctx, || {
+                rfd::FileDialog::new()
+                    .add_filter("Gyroflow lens profile (.json)", &["json", "JSON"])
+                    .pick_file()
+                    .map(DialogResult::GyroflowProfile)
+            });
+        }
     }
 }
 

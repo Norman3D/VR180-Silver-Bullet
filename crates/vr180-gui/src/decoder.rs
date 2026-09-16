@@ -1526,20 +1526,42 @@ fn run_fisheye(
     // falls through to the CPU path below untouched.
     #[cfg(target_os = "macos")]
     {
-        if kind.is_dual_stream() {
-            // Per-kind default swap ⊕ user toggle (matches open_fisheye_segment).
-            let swap = kind.dual_stream_iter_swap(control.settings.read().effective_swap_eyes());
-            let segs: Vec<std::path::PathBuf> = if cfg.segments.is_empty() {
-                vec![cfg.path.clone()]
+        // Generic SBS (plain .mp4/.mov) rides this path too: ONE stream, the
+        // whole frame's P010 IOSurface wrapped, resolved once, halves split on
+        // the GPU. There is no segmented VT SBS chaining, so a (rare)
+        // multi-segment SBS stays on the CPU worker — same predicate as the
+        // Windows `sbs_ok` above; opening only cfg.path would freeze the
+        // preview past the first seam.
+        let sbs_ok = kind == vr180_pipeline::SourceKind::SbsFisheye
+            && cfg.segments.len() <= 1;
+        if kind.is_dual_stream() || sbs_ok {
+            let opened = if sbs_ok {
+                // NO swap here: SBS eye order is frame order, exactly like the
+                // CPU `SbsFisheyeIter` (no swap flag) and Windows'
+                // `D3d11SharedSbsIter` (no swap field). Adding one would
+                // double-apply the user toggle against the CPU fallback.
+                vr180_pipeline::fisheye_decode::VtSharedSbsIter::new(&cfg.path)
+                    .map(vr180_pipeline::fisheye_decode::VtZcFisheyeSource::Sbs)
             } else {
-                cfg.segments.clone()
+                // Per-kind default swap ⊕ user toggle (matches open_fisheye_segment).
+                let swap = kind.dual_stream_iter_swap(
+                    control.settings.read().effective_swap_eyes());
+                let segs: Vec<std::path::PathBuf> = if cfg.segments.is_empty() {
+                    vec![cfg.path.clone()]
+                } else {
+                    cfg.segments.clone()
+                };
+                vr180_pipeline::fisheye_decode::SegmentedVtSharedDualStreamIter::new(&segs, swap)
+                    .map(vr180_pipeline::fisheye_decode::VtZcFisheyeSource::Dual)
             };
-            match vr180_pipeline::fisheye_decode::SegmentedVtSharedDualStreamIter::new(&segs, swap) {
+            match opened {
                 Ok(iter) => {
                     tracing::info!(
                         "decoder (fisheye): macOS ZERO-COPY VideoToolbox path ENGAGED \
-                         ({} segment(s); P010 IOSurface → resolve → project, \
-                         no host download/swscale)", segs.len()
+                         ({}; P010 IOSurface → resolve → project, no host \
+                         download/swscale)",
+                        if sbs_ok { "generic SBS, 1 stream".to_string() }
+                        else { format!("{} segment(s)", cfg.segments.len().max(1)) }
                     );
                     return run_fisheye_vt_zerocopy(
                         pipeline, cfg, control, kind, fps, dt, eye_w, eye_h,
@@ -1547,6 +1569,8 @@ fn run_fisheye(
                     );
                 }
                 Err(e) => {
+                    // Includes the 8-bit / non-HEVC refusal. frame_tx and
+                    // cmd_rx are untouched, so the CPU path below takes over.
                     tracing::info!(
                         "decoder (fisheye): macOS zero-copy unavailable ({e}) — CPU path");
                 }
@@ -2573,7 +2597,7 @@ fn run_fisheye_zerocopy(
                         ZcFisheyeFrame::Sbs(f) => {
                             let full = unsafe { ctx.import_rgba16(&pipeline.device, &f.tex) };
                             let (l, r) = pipeline
-                                .split_sbs_texture_16(&full, f.eye_w, f.eye_h)?;
+                                .split_sbs_texture_16(&full, f.eye_w, f.eye_h, 3)?;
                             (l, r, Some(full))
                         }
                     };
@@ -2885,8 +2909,8 @@ fn run_fisheye_zerocopy(
 /// analogue of the Windows [`retire_frame`]; we can't fence on this thread).
 #[cfg(target_os = "macos")]
 fn retire_vt_pair(
-    q: &mut std::collections::VecDeque<vr180_pipeline::fisheye_decode::VtSharedFisheyePair>,
-    old: Option<vr180_pipeline::fisheye_decode::VtSharedFisheyePair>,
+    q: &mut std::collections::VecDeque<vr180_pipeline::fisheye_decode::VtZcFisheyeFrame>,
+    old: Option<vr180_pipeline::fisheye_decode::VtZcFisheyeFrame>,
 ) {
     if let Some(p) = old { q.push_back(p); while q.len() > 2 { q.pop_front(); } }
 }
@@ -2914,11 +2938,11 @@ fn run_fisheye_vt_zerocopy(
     dt: f64,
     eye_w: u32,
     eye_h: u32,
-    mut iter: vr180_pipeline::fisheye_decode::SegmentedVtSharedDualStreamIter,
+    mut iter: vr180_pipeline::fisheye_decode::VtZcFisheyeSource,
     frame_tx: Sender<DecodedFrame>,
     cmd_rx: Receiver<DecoderCommand>,
 ) -> anyhow::Result<()> {
-    use vr180_pipeline::fisheye_decode::VtSharedFisheyePair;
+    use vr180_pipeline::fisheye_decode::VtZcFisheyeFrame;
 
     // Native fisheye dims (what the iterator yields) → working preview res (what
     // we resolve to + project from). Calib resolves against the WORKING res,
@@ -3011,8 +3035,12 @@ fn run_fisheye_vt_zerocopy(
     // `held` is the frame currently in hand (re-rendered while paused);
     // `retire` defers the drop of replaced frames so the GPU finishes reading
     // their IOSurfaces first.
-    let mut held: Option<VtSharedFisheyePair> = None;
-    let mut retire: std::collections::VecDeque<VtSharedFisheyePair> = std::collections::VecDeque::new();
+    // Only the IOSurface-aliasing frame needs manual deferral. The resolved
+    // RGBA16 texture and the SBS split halves are Device-cache-owned wgpu
+    // resources whose lifetime wgpu tracks through the submission — they must
+    // NOT be pushed here.
+    let mut held: Option<VtZcFisheyeFrame> = None;
+    let mut retire: std::collections::VecDeque<VtZcFisheyeFrame> = std::collections::VecDeque::new();
 
     'main: loop {
         let stay_on_pair = control.paused.load(Ordering::SeqCst) && held.is_some();
@@ -3061,7 +3089,11 @@ fn run_fisheye_vt_zerocopy(
                 } else if control.stab_loading.load(Ordering::SeqCst) {
                     tracing::info!("decoder (fisheye): stabilize ON → resuming IMU load");
                     control.imu_progress.pause.store(false, Ordering::SeqCst);
-                } else {
+                } else if dji_osv_imu.is_some() {
+                    // Only DJI/INSV sources have quats to load; a generic SBS
+                    // clip has no IMU (load_dji_imu_progressive returned None
+                    // and set imu_ready), so spawning the protobuf parse would
+                    // just scan a plain mp4 and leave stab_loading stuck on.
                     tracing::info!("decoder (fisheye): stabilize ON → starting IMU load");
                     spawn_dji_quat_load(cfg, &control);
                 }
@@ -3181,14 +3213,41 @@ fn run_fisheye_vt_zerocopy(
 
         // ── Resolve P010 planes → working-res RGBA16 (GPU, zero host hop) ──
         let phase_t0 = std::time::Instant::now();
-        let l_tex = pipeline.resolve_p010_planes_to_rgba16(
-            &pair.left_y.texture, &pair.left_uv.texture, native_w, native_h, src_w, src_h)?;
-        let r_tex = pipeline.resolve_p010_planes_to_rgba16(
-            &pair.right_y.texture, &pair.right_uv.texture, native_w, native_h, src_w, src_h)?;
+        let (l_tex, r_tex) = match pair {
+            // Dual-stream: one resolve per eye. Slots 0/1 MUST differ — the
+            // resolve caches its output per slot and both eyes share dims.
+            VtZcFisheyeFrame::Pair(p) => (
+                pipeline.resolve_p010_planes_to_rgba16(
+                    &p.left_y.texture, &p.left_uv.texture,
+                    native_w, native_h, src_w, src_h, 0)?,
+                pipeline.resolve_p010_planes_to_rgba16(
+                    &p.right_y.texture, &p.right_uv.texture,
+                    native_w, native_h, src_w, src_h, 1)?,
+            ),
+            // Generic SBS: ONE resolve of the WHOLE frame, then two GPU
+            // subregion copies. `src_w * 2` is load-bearing — the resolve is a
+            // per-axis box downscale by src/out, so a per-eye out width would
+            // squash the image 2x horizontally (a plausible-looking stretch,
+            // never an error). The X and Y ratios stay equal to the per-eye
+            // ratios, which is what keeps the shader's MAX_K = 4 box within
+            // budget. Do NOT instead hand the fisheye shaders an x-offset:
+            // they normalise by cal.src_w/src_h and ClampToEdge, so an
+            // out-of-frame tap lands in the OTHER EYE.
+            VtZcFisheyeFrame::Sbs(f) => {
+                let full = pipeline.resolve_p010_planes_to_rgba16(
+                    &f.frame_y.texture, &f.frame_uv.texture,
+                    f.frame_w, f.frame_h, src_w * 2, src_h, 2)?;
+                // Cached halves, slot 2 (the export's SBS split uses 32 — on
+                // macOS it shares this Device). Consume them THIS frame (the
+                // projections below do) and never stash them.
+                pipeline.split_sbs_texture_16(&full, src_w, src_h, 2)?
+            }
+        };
 
         // Frame-level stab rotation.
-        let stab_idx = if pair.pts_s.is_finite() && pair.pts_s >= 0.0 {
-            (pair.pts_s / dt).round() as usize
+        let pts_s = pair.pts_s();
+        let stab_idx = if pts_s.is_finite() && pts_s >= 0.0 {
+            (pts_s / dt).round() as usize
         } else {
             (((time_offset / dt).round() as i64) + frame_idx as i64).max(0) as usize
         };
