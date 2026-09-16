@@ -4,7 +4,9 @@
 //! and the per-eye composition at `vr180_gui.py:12789-12804`. Both
 //! sides (preview and export) compose
 //!
-//!     R_final_eye = R_stab · R_view_eye
+//! ```text
+//! R_final_eye = R_stab · R_view_eye
+//! ```
 //!
 //! where `R_view_eye` is built from `(global ± stereo)` Tait-Bryan
 //! angles. Convention is `R = R_y(yaw) · R_x(pitch) · R_z(roll)` —

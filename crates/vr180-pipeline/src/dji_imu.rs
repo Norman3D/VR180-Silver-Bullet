@@ -967,7 +967,7 @@ fn slerp_quat(a: Quat, b: Quat, wa: f32, wb: f32) -> Quat {
 /// matched to DJI's output.
 ///
 /// 3×3 portion, row-major:
-/// ```
+/// ```text
 /// [ 0  0 -1 ]
 /// [ 1  0  0 ]
 /// [ 0  1  0 ]
