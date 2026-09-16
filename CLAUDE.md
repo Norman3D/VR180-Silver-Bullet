@@ -306,10 +306,17 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    unrecoverable shape as item 11's VRAM bug: `D3d11SharedSbsIter::new`
    returned `Ok`, every caller reads that as "zero-copy is on", so there was
    no fallback left. BLAST RADIUS was exactly the generic-SBS iterator (the
-   2026-09-15 addition, and the only one handed arbitrary files): OSV/`.insv`
-   are 10-bit cameras, and the GoPro `.360` on hand probes `yuv420p10le` too,
-   so both shipped paths were always P010 and unaffected — verified, not
-   assumed.
+   2026-09-15 addition, and the only one handed arbitrary files). The other two
+   converter callers are safe, but NOT simply because "those cameras are
+   10-bit" — that is false and the measurements say so. Four GoPro `.360`
+   files all probe `yuv420p10le`, and the X6 `.insv` does too; but OLD
+   pre-X6 Insta360 `.insv` (2017/2020 clips here) are **8-bit `yuvj420p`**.
+   Those are safe for a different reason: they are SINGLE-stream, so
+   `D3d11SharedDualStreamIter::new` rejects them at construction ("expected 2
+   video streams, found 1") and they fall back long before the converter. So
+   the dual-stream arm's safety rests on a stream-count check, not on a bit
+   depth — do not restate it as "`.insv` is always 10-bit". (A future 8-bit
+   DUAL-stream camera now works regardless, since the converter takes NV12.)
    FIX, in two parts: (a) `hw_plane_layout(DXGI_FORMAT)` returns the plane SRV
    formats AND the BT.709 range constants for NV12 vs P010/P016, `convert`
    reads the format off the source texture, and the constants moved into the
