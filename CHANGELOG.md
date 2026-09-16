@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### macOS: side-by-side sources decode several times faster
+- **Generic side-by-side `.mp4` / `.mov` sources now decode multi-threaded
+  on macOS.** libavcodec defaults a decoder to ONE thread and nothing in
+  the app ever set otherwise, so these files — the catch-all path for any
+  clip that isn't `.360` / `.osv` / `.insv` — decoded on a single core.
+  A 301-frame reframe export of an 8256x4128 10-bit HEVC clip went from
+  **114.6 s to 52.1 s (2.2x)**, and preview decode from 4.3 to ~18 fps.
+  Output is byte-identical to before. Thread count is capped at 6 (the
+  knee of the speed/memory curve) and is skipped entirely when a hardware
+  decoder is driving, which leaves Windows exactly as it was.
+- Hardware (VideoToolbox) decode for these sources is available behind
+  `VR180_SBS_VT=1` but is **off by default**: it measured *slower* than
+  threaded software decode here, because the frame has to be copied back
+  from the GPU for the CPU pipeline, which costs more than the decode it
+  saves. (On Windows the equivalent frames stay on the GPU, which is why
+  it pays there.) It is restricted to H.264/HEVC and skipped for 8-bit
+  full-range clips, both cases where it would otherwise change colour.
+- **Fixed:** the cached scaler was built once from the first frame and
+  reused forever. It now revalidates per frame, so a decoder that changes
+  pixel format mid-stream rebuilds instead of failing every subsequent
+  frame, and a frame that changes *size* mid-stream is now a clear error
+  rather than a mis-split image.
+
 ### Matching Eyes: exposure
 - The **Matching Eyes** panel gains an **Eye Exposure (±EV)** slider
   alongside Eye CT and Eye Tint. Like them it applies oppositely to the two

@@ -319,6 +319,16 @@ pub struct SbsFisheyeIter {
     video_idx: usize,
     decoder: ffmpeg_next::codec::decoder::Video,
     scaler: Option<ffmpeg_next::software::scaling::Context>,
+    /// `(pixel format, width, height)` the cached `scaler` was built for.
+    /// Revalidated every frame — see `repack_split`.
+    scaler_def: Option<(ffmpeg_next::format::Pixel, u32, u32)>,
+    /// Reusable destination for `av_hwframe_transfer_data`. Held across
+    /// frames on purpose: transferring into an EMPTY frame makes ffmpeg
+    /// allocate the full plane buffer every time (~136 MB for one 4128²
+    /// P010 eye pair), which cost ~40 ms/frame and made hardware decode
+    /// measurably SLOWER than threaded software decode. Transferring into
+    /// an already-allocated frame of matching format/dims reuses it.
+    sw_storage: ffmpeg_next::frame::Video,
     eye_w: u32,
     eye_h: u32,
     frame_limit: u32,
@@ -382,9 +392,101 @@ impl SbsFisheyeIter {
         let time_base = video.time_base();
         let time_base_s = time_base.numerator() as f64 / time_base.denominator() as f64;
 
-        #[allow(unused_mut)]
         let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(video.parameters())
             .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+        // Tracks whether a hwaccel actually attached, so the threading block
+        // further down can leave the decoder single-threaded when the GPU is
+        // doing the work. Frame threads buy nothing there and cost real
+        // memory (measured +885 MB at 8K), and on Windows extra frame threads
+        // enlarge the d3d11va surface pool that `interop_windows`'s VRAM
+        // pre-flight budgets for without a thread_count term.
+        #[allow(unused_mut, unused_assignments)]
+        let mut hw_attached = false;
+        // macOS: VideoToolbox hardware decode. Mirrors the Windows d3d11va
+        // attach below and `DualStreamFisheyeIter::new_with_options` — the
+        // `hw` flag was accepted and then dropped here, so every generic
+        // side-by-side source decoded in software on macOS while every other
+        // source kind got VT. Decoded frames are GPU-resident
+        // (`Pixel::VIDEOTOOLBOX`); `repack_split` downloads them before
+        // swscale, which cannot consume them.
+        //
+        // OPT-IN ONLY (`VR180_SBS_VT=1`): it MEASURED SLOWER than the threaded
+        // software decode above, on an M5 Max, for this path —
+        //
+        //   8256x4128 10-bit HEVC, per frame     software   VideoToolbox
+        //     decode + repack to RGBA8              51 ms       69 ms
+        //     decode + repack to RGBA64            144 ms      160 ms
+        //   full 301-frame reframe export         52.7 s      61.2 s
+        //
+        // The reason is structural, and it is exactly why "mirror the Windows
+        // d3d11va attach" does NOT transfer to macOS: on Windows the decoded
+        // surface STAYS on the GPU and feeds a zero-copy pipeline. Here it has
+        // to come straight back to host memory through
+        // av_hwframe_transfer_data so swscale can reach it, and that download
+        // costs more than the multi-threaded decode it replaces. (Reusing the
+        // download buffer across frames — done above — did not close the gap.)
+        // The macOS equivalent of the Windows win is the zero-copy IOSurface
+        // path the dual-stream sources already use, where frames never leave
+        // the GPU; not a hwaccel attach in front of a CPU pipeline.
+        //
+        // Kept, off by default, because the trade flips on a machine with few
+        // cores: software decode scales with core count, the download does
+        // not. The env var makes the comparison above one command to re-run.
+        // `VR180_NO_HW_DECODE=1` additionally forces software everywhere here.
+        //
+        // Restricted to H.264 / HEVC, the codecs where VT decode was MEASURED
+        // byte-identical to the software decode through this whole path (both
+        // hand back NV12 / P010, which swscale converts to the same RGB).
+        // ProRes is deliberately excluded: VT returns p210le for 422 and
+        // ayuv64le for 4444 instead of the software yuv422p10le / yuva444p12le,
+        // and the exported frames differ visibly (max 10/255 on 422,
+        // 66/255 on 4444). ProRes software decode is cheap and now threaded,
+        // so it loses little by staying on that path. Widen this list only
+        // with a fresh A/B (VR180_SBS_VT=1 vs unset).
+        #[cfg(target_os = "macos")]
+        let vt_codec_ok = matches!(
+            video.parameters().id(),
+            ffmpeg_next::codec::Id::H264 | ffmpeg_next::codec::Id::HEVC
+        );
+        // ...and never for an 8-bit FULL-RANGE source. VideoToolbox maps both
+        // the video-range and full-range biplanar CVPixelBuffer types onto a
+        // plain `nv12` AVFrame, so the range tag is gone after the download.
+        // swscale here takes its entire colour interpretation from that one
+        // pixel-format enum (`Context::run` calls raw `sws_scale` and never
+        // sees the frame's tags), and `sws_getContext`'s handle_jpeg() gives
+        // `yuvj420p` full range but `nv12` limited range. A full-range clip
+        // would therefore decode with crushed blacks and clipped whites under
+        // VT while the software path — and the `HwDecode::Software`
+        // zoom-still worker — got it right, so the same frame would not even
+        // match itself across the UI. 10-bit is unaffected (yuv420p10le and
+        // p010le are both limited-range as far as swscale is concerned).
+        #[cfg(target_os = "macos")]
+        let vt_range_ok = {
+            let par = video.parameters();
+            // SAFETY: read-only access to POD fields of AVCodecParameters.
+            let (range, depth) = unsafe {
+                let p = &*par.as_ptr();
+                (p.color_range, p.bits_per_raw_sample)
+            };
+            !(range == ffmpeg_next::ffi::AVColorRange::AVCOL_RANGE_JPEG
+                && depth <= 8)
+        };
+        #[cfg(target_os = "macos")]
+        if vt_codec_ok
+            && vt_range_ok
+            && matches!(hw, HwDecode::Auto | HwDecode::VideoToolbox)
+            && std::env::var_os("VR180_SBS_VT").is_some()
+            && std::env::var_os("VR180_NO_HW_DECODE").is_none()
+        {
+            if crate::decode::try_enable_videotoolbox_decode(&mut codec_ctx) {
+                hw_attached = true;
+                tracing::info!("SbsFisheyeIter: VideoToolbox hardware decode attached");
+            } else if matches!(hw, HwDecode::VideoToolbox) {
+                return Err(Error::Ffmpeg(
+                    "VideoToolbox requested but unavailable".into(),
+                ));
+            }
+        }
         // Windows: hardware decode via d3d11va (NVDEC) — the flag was
         // accepted but silently ignored here, so every generic-SBS source
         // decoded in software. Decoded frames are GPU-resident; repack_split
@@ -393,9 +495,49 @@ impl SbsFisheyeIter {
         if matches!(hw, HwDecode::Auto)
             && crate::decode::try_enable_d3d11va_decode(&mut codec_ctx)
         {
+            hw_attached = true;
             tracing::info!("SbsFisheyeIter: d3d11va (NVDEC) hardware decode attached");
         }
-        #[cfg(not(target_os = "windows"))]
+        // Multi-threaded SOFTWARE decode. libavcodec defaults `thread_count`
+        // to 1 and no decoder in this workspace ever set it, so every software
+        // decode here ran on ONE core: measured 228 ms/frame on 8256x4128
+        // 10-bit HEVC versus 27 ms multi-threaded, which was ~59% of a whole
+        // side-by-side export frame budget. This is the change that took the
+        // 301-frame reframe export from 114.6 s to 52.1 s.
+        //
+        // Deliberately AFTER the hwaccel attaches, and skipped when one did:
+        // frame threads add nothing when the GPU video engine is decoding,
+        // they cost ~+885 MB at 8K, and on Windows they would enlarge the
+        // d3d11va surface pool that the VRAM pre-flight in `interop_windows`
+        // sizes without a thread_count term — which could push a clip that
+        // passed that check over the real limit. Leaving hardware decodes at
+        // thread_count 1 keeps Windows byte-for-byte as it was.
+        //
+        // Capped at 6, which is the knee of the curve. Measured decoding 60
+        // frames of 8256x4128 10-bit HEVC (wall time / peak RSS):
+        //
+        //     threads   1     2     4     6     8
+        //     fps      4.3   8.2  12.0  17.7  19.2
+        //     RSS     1263  1345  1505  1760  2069 MB
+        //
+        // 6 -> 8 buys 8% more speed for another ~300 MB, and each frame thread
+        // holds its own reference frames — which matters here because the
+        // preview worker, the zoom-still worker and an export can each hold a
+        // decoder open at once (see the construction sites in
+        // vr180-gui::decoder). Machines with fewer cores land below the cap
+        // anyway.
+        if !hw_attached {
+            let n = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(1, 6);
+            let mut tc = ffmpeg_next::threading::Config::kind(
+                ffmpeg_next::threading::Type::Frame,
+            );
+            tc.count = n;
+            codec_ctx.set_threading(tc);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let _ = hw;
         let decoder = codec_ctx.decoder().video()
             .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?;
@@ -411,7 +553,8 @@ impl SbsFisheyeIter {
         let eye_h = frame_h;
 
         Ok(Self {
-            ictx, video_idx, decoder, scaler: None,
+            ictx, video_idx, decoder, scaler: None, scaler_def: None,
+            sw_storage: ffmpeg_next::frame::Video::empty(),
             eye_w, eye_h,
             frame_limit, frames_yielded: 0,
             output_bit_depth,
@@ -426,14 +569,13 @@ impl FisheyePairIter for SbsFisheyeIter {
             return Ok(None);
         }
         let mut decoded = ffmpeg_next::frame::Video::empty();
-        let mut sw_storage = ffmpeg_next::frame::Video::empty();
 
         // Try buffered output first.
         loop {
             if self.decoder.receive_frame(&mut decoded).is_ok() {
                 let pts_ticks = decoded.pts().unwrap_or(0);
                 let pts_s = pts_ticks as f64 * self.time_base_s;
-                let (left, right) = self.repack_split(&mut decoded, &mut sw_storage)?;
+                let (left, right) = self.repack_split(&mut decoded)?;
                 self.frames_yielded += 1;
                 return Ok(Some(FisheyePair {
                     left, right,
@@ -455,7 +597,7 @@ impl FisheyePairIter for SbsFisheyeIter {
                     if self.decoder.receive_frame(&mut decoded).is_ok() {
                         let pts_ticks = decoded.pts().unwrap_or(0);
                         let pts_s = pts_ticks as f64 * self.time_base_s;
-                        let (left, right) = self.repack_split(&mut decoded, &mut sw_storage)?;
+                        let (left, right) = self.repack_split(&mut decoded)?;
                         self.frames_yielded += 1;
                         return Ok(Some(FisheyePair {
                             left, right,
@@ -488,15 +630,42 @@ impl SbsFisheyeIter {
     /// Scale to RGBA8 (or RGBA64LE at `output_bit_depth` 16) and split the
     /// frame down the middle. Returns (left, right), each
     /// `eye_w × eye_h × (4 | 8)` bytes.
+    /// Lend the struct-owned `sw_storage` to [`Self::repack_split_with`].
+    /// Swapped out and back so the borrow checker sees one `&mut self`;
+    /// the buffer is restored on every path, including the error one.
     fn repack_split(
+        &mut self,
+        decoded: &mut ffmpeg_next::frame::Video,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut sw = std::mem::replace(
+            &mut self.sw_storage,
+            ffmpeg_next::frame::Video::empty(),
+        );
+        let out = self.repack_split_with(decoded, &mut sw);
+        self.sw_storage = sw;
+        out
+    }
+
+    fn repack_split_with(
         &mut self,
         decoded: &mut ffmpeg_next::frame::Video,
         sw_storage: &mut ffmpeg_next::frame::Video,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        // d3d11va frames are GPU-resident — download to host (NV12 / P010)
-        // before swscale. Software frames pass through untouched.
+        // Hardware-decoded surfaces live in GPU memory — download to host
+        // (NV12 / P010) before swscale, which cannot consume them. Covers
+        // both VideoToolbox (macOS) and D3D11VA/NVDEC (Windows); software
+        // frames pass through untouched.
+        //
+        // Testing the per-frame FORMAT rather than a stored "hwaccel
+        // attached" flag is deliberate: when a hwaccel declines during init
+        // ffmpeg silently falls back to software, and only the format tells
+        // the truth. These two formats never appear on a software frame.
         let decoded: &ffmpeg_next::frame::Video =
-            if decoded.format() == ffmpeg_next::format::Pixel::D3D11 {
+            if matches!(
+                decoded.format(),
+                ffmpeg_next::format::Pixel::VIDEOTOOLBOX
+                    | ffmpeg_next::format::Pixel::D3D11
+            ) {
                 crate::decode::download_hw_frame(decoded, sw_storage)?;
                 sw_storage
             } else {
@@ -519,18 +688,53 @@ impl SbsFisheyeIter {
         } else {
             ffmpeg_next::software::scaling::Flags::FAST_BILINEAR
         };
+        // Rebuild the cached scaler when the source definition changes.
+        // It used to be built once from frame 0 and reused forever, which
+        // was safe only because software decode never changes pixel format
+        // mid-stream. A hwaccel can: if VideoToolbox / d3d11va declines
+        // partway through init, ffmpeg falls back to software and frames
+        // arrive as yuv420p10le instead of p010le. `Context::run` then
+        // returns `InputChanged` for every remaining frame — which surfaces
+        // as a preview that stops dead and reads as EOF, and as a zoom still
+        // that never appears. Keyed on dims too, so a resolution change is
+        // caught the same way.
+        // `eye_w`/`eye_h` were fixed at construction from the container's
+        // dimensions, and the L/R split below slices by them — so a frame that
+        // changes SIZE mid-stream must not be quietly re-scaled at the old
+        // split point. At HEAD the cached scaler turned that into a clean
+        // `Error::InputChanged`; keep it an error now that the cache rebuilds.
+        // A pixel-FORMAT change is the intended rebuild (it is the hwaccel
+        // falling back to software) and is safe, because the split does not
+        // depend on format.
+        if frame_w != self.eye_w * 2 || frame_h != self.eye_h {
+            return Err(Error::Ffmpeg(format!(
+                "SBS frame changed size mid-stream: expected {}x{}, got {}x{}",
+                self.eye_w * 2, self.eye_h, frame_w, frame_h
+            )));
+        }
+        let src_def = (decoded.format(), frame_w, frame_h);
+        if self.scaler_def != Some(src_def) {
+            if self.scaler.is_some() {
+                tracing::info!(
+                    "SbsFisheyeIter: source changed to {:?} {}x{} — rebuilding scaler",
+                    src_def.0, frame_w, frame_h
+                );
+            }
+            self.scaler = None;
+        }
         let scaler = match &mut self.scaler {
             Some(s) => s,
             None => {
                 self.scaler = Some(
                     ffmpeg_next::software::scaling::Context::get(
-                        decoded.format(),
+                        src_def.0,
                         frame_w, frame_h,
                         target_pix_fmt,
                         frame_w, frame_h,
                         scaler_flags,
                     ).map_err(|e| Error::Ffmpeg(format!("scaler: {e}")))?
                 );
+                self.scaler_def = Some(src_def);
                 self.scaler.as_mut().unwrap()
             }
         };
