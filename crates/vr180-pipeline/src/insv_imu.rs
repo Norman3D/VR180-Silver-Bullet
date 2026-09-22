@@ -43,19 +43,33 @@ use vr180_core::gyro::cori_iori::Quat;
 use vr180_fisheye::insta360::{Insta360Meta, InsvLensCalib, InsvWindowCrop};
 use vr180_fisheye::{DjiLensCalib, DjiOsvImu, OmniLensModel};
 
-/// IMU→camera basis for the X6's stream-0 (back) lens — rows are the
-/// camera axes (x right, y up, z optical) expressed in IMU coordinates.
-/// Measured on four walking clips by fitting the rotation between
-/// consecutive frames (exact factory lens model, far-field features) to the
-/// gyro's rotation over the same interval: a signed axis permutation plus a
-/// 0.6° tilt about the camera's x axis, consistent per clip to 0.3° and
-/// with the lens extrinsics in the calibration string. (An earlier value
-/// carried a 4.5° tilt, an artefact of the lens model used at the time; it
-/// left a residual proportional to the motion.) Re-orthonormalised at use.
+/// IMU→camera basis for the VR180-modded X6 — rows are the camera axes
+/// (x right, y up, z optical) expressed in IMU coordinates. Both lenses
+/// share it: after the mod they face the same way, and the two sensors'
+/// timelines differ only in timing (`lens_b_timeline`).
+///
+/// This is the STOCK back-lens measurement yawed 180° about the camera's
+/// vertical axis (x and z rows negated). The mount was measured on four
+/// pre-mod walking clips against the back lens (stream 0), by fitting the
+/// rotation between consecutive frames (exact factory lens model,
+/// far-field features) to the gyro's rotation over the same interval: a
+/// signed axis permutation plus a 0.6° tilt about the camera's x axis,
+/// consistent per clip to 0.3° and with the lens extrinsics in the
+/// calibration string — `[[0.0035, 0.0044, -1], [1, 0.0083, 0.0036],
+/// [0.0084, -1, -0.0044]]`. The VR180 mod turns that lens through 180°
+/// about the body's vertical axis to sit beside the screen lens facing the
+/// screen-lens direction, so the frame both lenses now share is the stock
+/// one with x and z reversed. Verified on post-mod footage
+/// (VID_20260921_195239, 5–8 s, camera-lock): the stock basis left 1.73×
+/// the un-stabilised frame-to-frame motion — the correction applied
+/// backwards, the "twice as shaky" report — and the yawed basis 0.00×. The
+/// 0.6° tilt is about x and survives the yaw unchanged. (An earlier value
+/// carried a 4.5° tilt, an artefact of the lens model used at the time.)
+/// Re-orthonormalised at use.
 pub const INSV_X6_IMU_TO_CAM: [[f32; 3]; 3] = [
-    [0.0035, 0.0044, -1.0000],
+    [-0.0035, -0.0044, 1.0000],
     [1.0000, 0.0083, 0.0036],
-    [0.0084, -1.0000, -0.0044],
+    [-0.0084, 1.0000, 0.0044],
 ];
 
 /// Fallback centre-row content time relative to `t_end_of_exposure −
@@ -267,14 +281,15 @@ fn fit_kb5(r_of_theta: impl Fn(f64) -> f64) -> (f64, [f64; 5]) {
 /// Calibration-only IMU (no quats) — enough to dewarp and to seed the
 /// Override UI; stabilization stays off until the full build lands.
 pub fn insv_calib_only(meta: &Insta360Meta, stream_w: u32, stream_h: u32) -> DjiOsvImu {
-    // Stream 0 (back lens = left eye by default = `lens_b`) carries
+    // Stream 0 (back lens = RIGHT eye by default = `lens_a`, the DJI
+    // convention — see `SourceKind::dual_stream_iter_swap`) carries
     // calibration entry 2 on the X6 — its tracks are stored in reverse lens
     // order (file flag; default when the file doesn't say) — and stream 1
-    // (screen lens = `lens_a`) entry 1.
+    // (screen lens = `lens_b`) entry 1.
     let reversed = meta.track_order_reversed.unwrap_or(true);
     let (i0, i1) = if reversed { (1, 0) } else { (0, 1) };
     let crop = meta.window_crop.as_ref();
-    let (lens_b, lens_a) = if meta.lenses.len() >= 2 {
+    let (lens_a, lens_b) = if meta.lenses.len() >= 2 {
         (stream_lens_calib(&meta.lenses[i0], crop, stream_w, stream_h),
          stream_lens_calib(&meta.lenses[i1], crop, stream_w, stream_h))
     } else {
@@ -476,11 +491,19 @@ pub fn build_insv_imu(
     // record, so lens B (the second sensor) gets its own timeline.
     let sync_s = (meta.gyro_offset_ms.unwrap_or(INSV_X6_SYNC_MS as f64) - INSV_STUDIO_SAMPLE_LAG_MS) * 1e-3;
     let frame_dur = 1.0 / fps as f64;
-    let n_frames = n_frames_hint.max(meta.frames.len());
-    if meta.frames.len() != n_frames_hint && n_frames_hint > 0 {
+    // Stream 0 = `lens_a` = calibration entry 2 = the SECOND sensor's stamps
+    // (record 0x000c), so those drive the main timeline; the first sensor's
+    // (entry 1, stream 1) become lens B's. A file without the second record
+    // has one stamp table serving both eyes and no lens-B timeline.
+    let (stamps_a, stamps_b): (&[vr180_fisheye::insta360::InsvFrameStamp],
+                               Option<&[vr180_fisheye::insta360::InsvFrameStamp]>) =
+        if meta.frames_b.is_empty() { (&meta.frames, None) }
+        else { (&meta.frames_b, Some(&meta.frames)) };
+    let n_frames = n_frames_hint.max(stamps_a.len());
+    if stamps_a.len() != n_frames_hint && n_frames_hint > 0 {
         tracing::info!(
             "insv_imu: {} frame stamps vs {} video frames — extrapolating the tail at 1/fps",
-            meta.frames.len(), n_frames_hint
+            stamps_a.len(), n_frames_hint
         );
     }
     let build = |stamps: &[vr180_fisheye::insta360::InsvFrameStamp], out: &mut DjiOsvImu| {
@@ -512,8 +535,8 @@ pub fn build_insv_imu(
         }
         content_time(0)
     };
-    let t0 = build(&meta.frames, &mut out);
-    if !meta.frames_b.is_empty() {
+    let t0 = build(stamps_a, &mut out);
+    if let Some(sb) = stamps_b {
         let mut b = DjiOsvImu {
             lens_a: out.lens_a.clone(),
             lens_b: out.lens_b.clone(),
@@ -523,13 +546,13 @@ pub fn build_insv_imu(
             sample_anchor: vr180_fisheye::SampleAnchor::BlockMid,
             ..Default::default()
         };
-        let t0b = build(&meta.frames_b, &mut b);
-        let n_diff = meta.frames.iter().zip(meta.frames_b.iter())
+        let t0b = build(sb, &mut b);
+        let n_diff = stamps_a.iter().zip(sb.iter())
             .filter(|(a, c)| ((a.t_us as f64 - a.exposure_s * 0.5e6) - (c.t_us as f64 - c.exposure_s * 0.5e6)).abs() > 500.0)
             .count();
         tracing::info!(
-            "insv_imu: lens B timeline from the second sensor's stamps ({} frames, {} differ from lens A by > 0.5 ms; frame 0 {:+.2} ms)",
-            meta.frames_b.len(), n_diff, (t0b - t0) * 1e3
+            "insv_imu: lens B timeline from the first sensor's stamps (entry 1, stream 1; {} frames, {} differ from lens A by > 0.5 ms; frame 0 {:+.2} ms)",
+            sb.len(), n_diff, (t0b - t0) * 1e3
         );
         out.lens_b_timeline = Some(Box::new(b));
     }
@@ -559,9 +582,12 @@ mod tests {
             - c[0][1] * (c[1][0] * c[2][2] - c[1][2] * c[2][0])
             + c[0][2] * (c[1][0] * c[2][1] - c[1][1] * c[2][0]);
         assert!((det - 1.0).abs() < 1e-5, "det = {det}");
-        // Stays close to the measured values.
+        // Stays close to the measured values. The y row is the stock
+        // measurement; the x and z rows are its 180° yaw (the VR180 mod), so
+        // x_cam·z_imu and z_cam·y_imu are +1 where the stock lens had −1.
         assert!((c[1][0] - 1.0).abs() < 0.01 && c[1][1].abs() < 0.02, "{c:?}");
-        assert!((c[0][2] + 1.0).abs() < 0.01);
+        assert!((c[0][2] - 1.0).abs() < 0.01, "x row not yawed: {:?}", c[0]);
+        assert!((c[2][1] - 1.0).abs() < 0.01, "z row not yawed: {:?}", c[2]);
     }
 
     #[test]
@@ -586,25 +612,26 @@ mod tests {
         let b = imu.high_rate_quats[100][HR_PER_FRAME / 2];
         assert!(a.dot(b).abs() > 0.999_99, "mid HR sample must match frame quat");
         assert!(imu.imu_to_cam.is_some());
-        // Per-file factory calibration in stream coords (entry 1 → stream 0 → lens_b).
+        // Per-file factory calibration in stream coords (entry 2 → stream 0 → lens_a).
         assert!((imu.readout_ms.unwrap() - 15.36).abs() < 1e-4);
         let b = imu.lens_b_timeline.as_deref().expect("second sensor timeline");
         assert_eq!(b.frame_quats.len(), 2161);
-        // Frame 0: lens B mid-exposure is 4.84 ms earlier → a small but non-zero delta.
+        // Frame 0: lens B (entry 1) mid-exposure is 4.84 ms later than lens A's
+        // → a small but non-zero delta.
         let d = imu.frame_quats[0].conjugate().mul(b.frame_quats[0]).normalize();
         let ang = 2.0 * d.w.abs().min(1.0).acos().to_degrees();
         assert!(ang > 0.05 && ang < 2.0, "lens B delta at frame 0 = {ang}°");
-        // Reversed track order: stream 0 (lens_b) = entry 2, stream 1 = entry 1.
-        let b = &imu.lens_b;
-        assert!((b.fx.unwrap() - 1045.66).abs() < 0.3, "fx {:?}", b.fx);
-        assert!((b.cx.unwrap() - 1896.55).abs() < 0.01 && (b.cy.unwrap() - 1922.985).abs() < 0.01, "pp {:?} {:?}", b.cx, b.cy);
-        let bo = b.omni.unwrap();
-        assert!((bo.fx - 7227.07 * 0.5).abs() < 1e-3 && (bo.xi - 2.45543).abs() < 1e-5);
+        // Reversed track order: stream 0 (lens_a) = entry 2, stream 1 (lens_b) = entry 1.
         let a = &imu.lens_a;
-        assert!((a.fx.unwrap() - 1044.14).abs() < 0.3, "fx {:?}", a.fx);
-        assert!((a.cx.unwrap() - 1911.73).abs() < 0.01 && (a.cy.unwrap() - 1926.265).abs() < 0.01, "pp {:?} {:?}", a.cx, a.cy);
-        assert!((a.k1.unwrap() - 0.0895).abs() < 0.001);
-        assert_eq!(a.omni.unwrap().tangential, [-0.00032840, 0.00113587, 0.00412989, 0.00653467]);
+        assert!((a.fx.unwrap() - 1045.66).abs() < 0.3, "fx {:?}", a.fx);
+        assert!((a.cx.unwrap() - 1896.55).abs() < 0.01 && (a.cy.unwrap() - 1922.985).abs() < 0.01, "pp {:?} {:?}", a.cx, a.cy);
+        let ao = a.omni.unwrap();
+        assert!((ao.fx - 7227.07 * 0.5).abs() < 1e-3 && (ao.xi - 2.45543).abs() < 1e-5);
+        let b = &imu.lens_b;
+        assert!((b.fx.unwrap() - 1044.14).abs() < 0.3, "fx {:?}", b.fx);
+        assert!((b.cx.unwrap() - 1911.73).abs() < 0.01 && (b.cy.unwrap() - 1926.265).abs() < 0.01, "pp {:?} {:?}", b.cx, b.cy);
+        assert!((b.k1.unwrap() - 0.0895).abs() < 0.001);
+        assert_eq!(b.omni.unwrap().tangential, [-0.00032840, 0.00113587, 0.00412989, 0.00653467]);
     }
 
     #[test]

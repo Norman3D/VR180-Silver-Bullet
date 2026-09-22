@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Insta360 X6: eye order and stabilization direction fixed for real post-mod footage
+
+The X6 path was wired before any modded camera existed, on an assumption about
+which way the mod turns the back lens. The first post-mod footage showed the
+assumption was mirrored: the right eye landed on the left of the frame, and
+stabilization pushed the wrong way on both eyes — every correction added shake
+instead of removing it ("twice as shaky").
+
+- **Eye order.** Stream 0 (the back lens) is now the RIGHT eye by default,
+  the same convention as the DJI Osmo 360. Nothing in the shared pipeline
+  changed — the X6 loader simply labels stream 0 as lens A, as DJI does, and
+  the iterator, calibration, per-eye rotation and rolling-shutter rows all
+  follow. If you had turned **Swap eyes** on as a workaround, turn it off.
+- **Stabilization.** The IMU→camera basis was measured on a stock camera
+  against the back lens. The mod turns that lens 180° about the body's
+  vertical axis to face the screen-lens side, so both lenses now share the
+  stock frame with x and z reversed. Measured on three post-mod clips: with
+  the old basis a camera-lock left 1.6–1.9× the *unstabilised* frame-to-frame
+  motion; with the corrected basis 0.00× (a perfect lock) on windows with
+  pitch/roll jitter, and soft-stab removed 74–100 % of the jitter on every
+  window tested while the old basis made each one worse.
+
+Pre-mod (stock, 360°) X6 files are not a target of this app, so no behaviour
+was kept for them.
+
 ### macOS: side-by-side sources get the zero-copy GPU path
 
 `.360`, `.osv` and `.insv` clips have decoded straight into GPU memory on

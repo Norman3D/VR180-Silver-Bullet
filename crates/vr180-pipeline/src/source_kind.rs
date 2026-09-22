@@ -61,13 +61,16 @@ impl SourceKind {
     }
 
     /// `swap_eyes` flag to hand the dual-stream iterators for a given user
-    /// toggle. DJI streams arrive stream 0 = RIGHT eye after the VR180 mod,
-    /// so the iterator swaps by default (`!user`); the Insta360 X6 arrives
-    /// stream 0 = back lens = LEFT eye, stream 1 = screen-side lens = RIGHT
-    /// eye, so the user toggle passes straight through.
+    /// toggle. Both VR180-modded cameras arrive with stream 0 = RIGHT eye —
+    /// DJI's Lens A, and on the Insta360 X6 the back lens, which the mod
+    /// turns to sit on the right facing the screen-lens direction (measured
+    /// on post-mod footage; see `insv_imu`) — so the iterator swaps by
+    /// default (`!user`). Every downstream consumer (calib, per-eye rotation,
+    /// RS rows) keys off the raw toggle with `lens_a` = stream 0, one
+    /// convention for both cameras.
     pub fn dual_stream_iter_swap(self, user_swap: bool) -> bool {
         match self {
-            Self::DjiOsv => !user_swap,
+            Self::DjiOsv | Self::Insta360Insv => !user_swap,
             _ => user_swap,
         }
     }
