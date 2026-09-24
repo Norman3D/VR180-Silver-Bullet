@@ -1479,17 +1479,21 @@ fn run_fisheye(
             // the segmented iterator (previously the zero-copy preview opened
             // only cfg.path — segment 0 — and froze past the first seam).
             let work = eye_w.max(eye_h).max(1280);
+            // The d3d11va decoder must land on the SAME adapter wgpu chose, or
+            // the shared NT handle is meaningless to Vulkan. `None` here makes
+            // the iterator decline, so we fall back to the portable path.
+            let luid = ctx.as_ref()
+                .and_then(vr180_pipeline::interop_windows::vulkan_device_luid);
             let iter = if sbs_ok {
                 vr180_pipeline::fisheye_decode::D3d11SharedSbsIter::new_with_work(
-                    &cfg.path, work, work,
+                    &cfg.path, work, work, luid,
                 ).map(vr180_pipeline::fisheye_decode::ZcFisheyeSource::Sbs)
             } else {
                 // XOR with DJI's "swap by default" (matches the CPU worker).
                 let swap = kind.dual_stream_iter_swap(
                     control.settings.read().effective_swap_eyes());
                 vr180_pipeline::fisheye_decode::SegmentedD3d11SharedDualStreamIter::new(
-                    &cfg.segments, swap, work, work,
-                    ctx.as_ref().and_then(vr180_pipeline::interop_windows::vulkan_device_luid),
+                    &cfg.segments, swap, work, work, luid,
                 ).map(vr180_pipeline::fisheye_decode::ZcFisheyeSource::Dual)
             };
             match (ctx, iter) {

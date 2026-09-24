@@ -1915,11 +1915,33 @@ pub(crate) fn try_enable_d3d11va_decode_n(
 pub(crate) fn enable_d3d11va_decode_on_adapter(
     dec_ctx: &mut ffmpeg_next::codec::context::Context,
     luid: Option<[u8; 8]>,
+    concurrent_streams: u32,
 ) -> Result<()> {
     use ffmpeg_next::ffi::*;
     use windows::core::Interface;
     use windows::Win32::Graphics::Direct3D11::ID3D11Device;
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIDevice, IDXGIFactory1};
+
+    // VRAM pre-flight — the same budget check `try_enable_d3d11va_decode_n`
+    // carries, and for the same reason: the d3d11va pool commits LAZILY, so
+    // `avcodec_open2` succeeds and the allocation only fails on the FIRST
+    // FRAME, by which point every caller has committed to zero-copy and no
+    // fallback is left. Declining here is what lets the existing ladder work.
+    {
+        let (w, h) = unsafe {
+            let raw = dec_ctx.as_ptr();
+            ((*raw).width.max(0) as u32, (*raw).height.max(0) as u32)
+        };
+        if w > 0 && h > 0 {
+            let streams = vec![(w, h); concurrent_streams.max(1) as usize];
+            if !crate::interop_windows::hw_decode_fits(&streams) {
+                return Err(Error::Ffmpeg(
+                    crate::interop_windows::hw_decode_decline_reason()
+                        .unwrap_or_else(|| "hardware decode does not fit in VRAM".into()),
+                ));
+            }
+        }
+    }
 
     let wanted = luid.ok_or_else(|| Error::Ffmpeg(
         "zero-copy requires a valid Vulkan adapter LUID".into()

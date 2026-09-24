@@ -1323,7 +1323,7 @@ impl D3d11SharedDualStreamIter {
             let mut codec_ctx =
                 ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
                     .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
-            crate::decode::enable_d3d11va_decode_on_adapter(&mut codec_ctx, adapter_luid)?;
+            crate::decode::enable_d3d11va_decode_on_adapter(&mut codec_ctx, adapter_luid, 2)?;
             decoders.push(
                 codec_ctx.decoder().video()
                     .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?,
@@ -2217,15 +2217,20 @@ impl std::fmt::Debug for D3d11SharedSbsIter {
 #[cfg(target_os = "windows")]
 impl D3d11SharedSbsIter {
     /// Native-resolution (no downscale) — what the export wants.
-    pub fn new(path: &Path) -> Result<Self> {
-        Self::new_with_work(path, u32::MAX, u32::MAX)
+    pub fn new(path: &Path, adapter_luid: Option<[u8; 8]>) -> Result<Self> {
+        Self::new_with_work(path, u32::MAX, u32::MAX, adapter_luid)
     }
 
     /// `work_w`/`work_h` are the PER-EYE working dims, clamped to native
     /// (same convention as [`D3d11SharedDualStreamIter::new`]): the D3D11
     /// P010→RGBA16 convert downscales to `2·work_w × work_h` so the live
     /// preview doesn't push full 8K frames through the projection.
-    pub fn new_with_work(path: &Path, work_w: u32, work_h: u32) -> Result<Self> {
+    pub fn new_with_work(
+        path: &Path,
+        work_w: u32,
+        work_h: u32,
+        adapter_luid: Option<[u8; 8]>,
+    ) -> Result<Self> {
         ffmpeg_init();
         let ictx = ffmpeg_next::format::input(path)
             .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
@@ -2268,10 +2273,10 @@ impl D3d11SharedSbsIter {
         let mut codec_ctx =
             ffmpeg_next::codec::context::Context::from_parameters(video.parameters())
                 .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
-        if !crate::decode::try_enable_d3d11va_decode(&mut codec_ctx) {
-            return Err(Error::Ffmpeg(
-                "zero-copy SBS path requires d3d11va hwaccel — setup failed".into()));
-        }
+        // One stream here, so budget one decoder. Same per-adapter attach as
+        // the dual-stream arms: this frame is imported into Vulkan, so the
+        // decoder has to sit on the wgpu adapter.
+        crate::decode::enable_d3d11va_decode_on_adapter(&mut codec_ctx, adapter_luid, 1)?;
         let decoder = codec_ctx.decoder().video()
             .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?;
         let (fw, fh) = (decoder.width(), decoder.height());
@@ -2495,7 +2500,7 @@ impl D3d11SharedStreamPairIter {
             let mut codec_ctx =
                 ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
                     .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
-            crate::decode::enable_d3d11va_decode_on_adapter(&mut codec_ctx, adapter_luid)?;
+            crate::decode::enable_d3d11va_decode_on_adapter(&mut codec_ctx, adapter_luid, 2)?;
             decoders.push(
                 codec_ctx.decoder().video()
                     .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?,
