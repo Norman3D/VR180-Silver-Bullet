@@ -1,4 +1,4 @@
-; Inno Setup script for VR180 Silver Bullet 2.0 (Windows x64).
+; Inno Setup script for VR180 Silver Bullet (Windows x64).
 ;
 ; Build:  ISCC.exe installer\windows.iss
 ; Input:  dist\VR180-Silver-Bullet-{#AppVer}-windows-x64\  (the bundle the
@@ -19,7 +19,7 @@ AppName=VR180 Silver Bullet
 AppVersion={#AppVer}
 AppPublisher=silverqsy
 AppPublisherURL=https://github.com/silverqsy/VR180-Silver-Bullet
-DefaultDirName={autopf}\VR180 Silver Bullet 2.0
+DefaultDirName={autopf}\VR180 Silver Bullet
 DefaultGroupName=VR180 Silver Bullet
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
@@ -31,7 +31,7 @@ OutputBaseFilename=VR180-Silver-Bullet-{#AppVer}-windows-x64-setup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-UninstallDisplayName=VR180 Silver Bullet 2.0
+UninstallDisplayName=VR180 Silver Bullet
 ; Installer wizard icon + Add/Remove Programs icon (shared app artwork).
 SetupIconFile=..\assets\icon.ico
 UninstallDisplayIcon={app}\vr180-gui.exe
@@ -51,12 +51,19 @@ Source: "{#BundleDir}\vr180-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BundleDir}\*.dll";         DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BundleDir}\README.txt";    DestDir: "{app}"; Flags: ignoreversion
 
+; Upgrades keep AppId (so the previous install dir is reused), but Inno
+; does not remove shortcuts whose NAME changed. Clear the pre-2.5.2
+; version-specific ones so a rename does not leave orphans.
+[InstallDelete]
+Type: files; Name: "{group}\VR180 Silver Bullet 2.0.lnk"
+Type: files; Name: "{autodesktop}\VR180 Silver Bullet 2.0.lnk"
+
 [Icons]
-Name: "{group}\VR180 Silver Bullet 2.0"; Filename: "{app}\vr180-gui.exe"
-Name: "{autodesktop}\VR180 Silver Bullet 2.0"; Filename: "{app}\vr180-gui.exe"; Tasks: desktopicon
+Name: "{group}\VR180 Silver Bullet"; Filename: "{app}\vr180-gui.exe"
+Name: "{autodesktop}\VR180 Silver Bullet"; Filename: "{app}\vr180-gui.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\vr180-gui.exe"; Description: "{cm:LaunchProgram,VR180 Silver Bullet 2.0}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\vr180-gui.exe"; Description: "{cm:LaunchProgram,VR180 Silver Bullet}"; Flags: nowait postinstall skipifsilent
 ; Silent installs (= in-app auto-update) relaunch the app themselves —
 ; the postinstall entry above is skipped when silent by design.
 Filename: "{app}\vr180-gui.exe"; Flags: nowait; Check: WizardSilent

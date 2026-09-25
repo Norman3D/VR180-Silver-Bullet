@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### The app is just "VR180 Silver Bullet" now
+- The Windows installer, its Start-menu and desktop shortcuts, the Add/Remove
+  Programs entry and the executable's own name (Task Manager, Properties) all
+  dropped the "2.0" — the product name is no longer version-specific; the
+  version lives in the version field. Upgrading replaces the old-named
+  shortcuts; settings and the install location are untouched.
+
 ## 2.5.1 — 2026-09-25
 
 ### macOS: side-by-side sources — 8-bit joins the zero-copy path, and it uses far less memory
