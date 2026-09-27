@@ -42,7 +42,9 @@ matches the vendor's own software (DJI Studio, Insta360 Studio).
   toggle, and per-scanline rolling-shutter correction.
 - **Stereo alignment.** Auto align fits the rig's pitch, roll and yaw from
   the footage itself; per-eye view adjustment and stereo offset for manual
-  work; Matching Eyes white-balance trim.
+  work; Matching Eyes white-balance and exposure trims, plus automatic
+  per-frame eye-exposure matching for the X6's independently exposing
+  sensors.
 - **Color**, 10-bit end to end: CDL, 3D LUT, white balance, saturation,
   sharpen, mid-detail. Temporal noise reduction on macOS (export only).
 - **Export**: hardware H.265 or ProRes 4:2:2, up to 8K (8192×4096), on a

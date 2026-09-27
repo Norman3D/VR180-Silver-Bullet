@@ -3,7 +3,7 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ Status: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows artifacts + latest.json merge PENDING** — Windows box: pull, build installer (AppVer 2.5.1 already in windows.iss), `make-latest-json.mjs --version 2.5.1` (syncs the mac entry from the release), `gh release upload v2.5.1 … latest.json --clobber`. Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; Windows respin + latest.json merge pending from the Windows box) — reframed mode, file-derived stabilization timing, Insta360 X6
+## ⚡ Status: **Unreleased on `main` (2026-09-27): X6 automatic per-frame eye-exposure matching — item 15 below.** 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows artifacts + latest.json merge PENDING** — Windows box: pull, build installer (AppVer 2.5.1 already in windows.iss), `make-latest-json.mjs --version 2.5.1` (syncs the mac entry from the release), `gh release upload v2.5.1 … latest.json --clobber`. Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; Windows respin + latest.json merge pending from the Windows box) — reframed mode, file-derived stabilization timing, Insta360 X6
 
 VR180 Silver Bullet **2.0** is feature-complete and building/running on both
 **macOS (Apple Silicon)** and **Windows (NVIDIA)**. The Windows GPU-resident
@@ -382,6 +382,82 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    limited-expanded everywhere. Do NOT “fix” one side alone: whether GoPro's
    `pc` tag is truthful (a known GoPro quirk) needs a deliberate cross-platform
    decision with both boxes comparing against a reference.
+
+15. **Automatic per-frame eye-exposure matching for the X6 (2026-09-27) —
+   SHARED code, on `main`, unreleased.** Why: the X6's two sensors auto-expose
+   independently (shutter AND gain — trailer record 0x0009 is the right
+   sensor's AE log, the left gain is recorded nowhere), and the difference is
+   real in the image: measured after the LUT in linear light, the eyes sat up
+   to ~0.9 stops apart for ~20 s on a real post-mod clip (regression of
+   brightness-vs-shutter ratio: slope 0.5–0.8, r 0.87–0.99). The static
+   Matching Eyes trim cannot follow that. WHAT: three new compute passes in
+   `gpu.rs` + `shaders/eye_match_{hist,reduce}.wgsl`, `eye_offset_apply.wgsl`
+   — per-eye 1024-bin luma histogram of the central quarter of each PROJECTED
+   eye texture (one kernel for every path; workgroup-shared atomics — the
+   first `atomic<u32>`/`var<workgroup>` in the codebase, core WGSL, no
+   feature), a one-thread reduce (both eyes' clipped tails cut by RANK
+   jointly — I-Log black 0.091 → lo 0.12, white wall 0.835 → hi 0.80 — then
+   the mean shift of 5 quantiles across the remaining rank range → smoothed
+   per-eye ADDITIVE code offsets in a GPU buffer, `EyeMatchState`; snap on
+   |Δ| > 0.008 code, EMA α 0.3 below; min 4096 unclipped samples; reset on
+   seek; `reason` tells the UI why a frame was not measured), and an apply pass as STAGE 0 of the colour stack
+   (an exposure gain on log footage — additive, NOT the multiplicative CDL
+   gain the static trim uses). No readback in the frame loop; the GUI readout
+   uses a 3-deep async MAP_READ ring (`EyeMatchReadback`, never polls — Lesson
+   #1). API: `ColorStackPlan.auto_eye_match: Option<EyeMatchMode>`,
+   `Device::apply_color_stack_pair_16` (both eyes, ONE submit — the 16-bit
+   stack was refactored into `record_color_stack_16`; `apply_color_stack_
+   per_eye_16` is now a wrapper and bit-identical when the flag is off),
+   `apply_color_stack_to_sbs_bgra_matched`, `match_eyes_8` (CPU-fallback arm),
+   `create_eye_match_state`. Plumbing: `Settings.auto_eye_match/_mode`
+   (serde default) → `build_color_stack`; preview funnel
+   `compose_with_color_and_mode` gained an `eye_match` arg (fisheye arms pass
+   `eye_match_arg(state, kind, stab_idx, enabled)`, EAC arms `None`; the single-eye
+   RIGHT view now swaps AFTER grading — the per-eye trims used to land on the
+   wrong eye there); export arms use the pair API with a per-stream state;
+   `build_export_cfg` and `eye_match_arg` gate to `Insta360Insv`, so the
+   persisted flag is inert for OSV/GoPro. UI: checkbox + reference combo
+   (meet in the middle / to left / to right) + EV readout (÷ 0.067 code/stop)
+   in the Colour panel's Matching Eyes block, X6 only. **Edited blind for
+   Windows:** the pair-API swaps in `export_fisheye_osv_zerocopy_d3d11` and
+   `export_fisheye_osv_gpu_resident` and the state creation in
+   `run_fisheye_zerocopy` (pure Rust, same shape as the macOS arm; no cfg
+   gates touched — `EyeMatchFrame` import is ungated). Verified: gitignored
+   `examples/eye_match_check.rs` (synthetic eyes, 20 checks incl. modes,
+   snap/EMA/reset, black-eye rejection, 8-bit helper — ALL PASS); real clip
+   036 via `reframe_check` + `EYE_MATCH=avg|left`: the shaded segment went
+   from L/R −0.44 stops (off) to +0.01 mean / ±0.06 max (on), the equal-shutter
+   control segment −0.017 → −0.004, match-to-left leaves the left eye at
+   +0.0000 stops vs off; `cargo test -p vr180-pipeline` 45/45. The user
+   ran the GUI on real footage (preview + export work; app control for an
+   automated check was declined). ADVERSARIAL REVIEW (6 finders, 1-vote
+   verify) found one real defect, fixed: the valid-luma gate was on a
+   linear scale while the histogram sees I-Log CODES (black 0.091, white
+   wall 0.835 — measured), so clipped sky was never excluded and a per-eye
+   value gate truncates the brighter eye more → shift biased toward 0. Now
+   `EyeMatchTuning::insta360_ilog()` (lo 0.12 / hi 0.80, the default since
+   only the X6 is enabled) and the reduce cuts both tails by RANK jointly
+   (max clipped fraction over both eyes + 0.03 margin) and averages 5
+   quantiles across the valid rank range — harness cases with 20–32 % of
+   one eye on the white wall and I-Log-black padding recover the shift to
+   ±0.0001. Also from the review: same frame index = re-render, not a seek
+   (`frame_for_index`), `EyeMatchState::clear()` while the passes are off so
+   re-enabling starts fresh, readback ring collected oldest→newest, the
+   paused loops collect the readout each tick, the still allocates a state
+   only when it can use it (the still applies the raw per-frame difference,
+   the live preview its smoothing — ≤ snap apart), and the export's colour
+   panel says "applied per frame" instead of "measuring" (the export stops
+   the preview, which is the only readout source). SECOND PASS (3 finders):
+   the tail counts are half-open (`count_bins(eye, start, end)`) — WGSL
+   `select` evaluates both arms, so the old `count_range(…, lo_b - 1u)` would
+   have spun 2^32 iterations for a tuning with lo = 0 (latent; the CPU side
+   now clamps lo/hi too); the readout ring is generation-tagged and returns
+   only values that landed in the call (no stale flash after re-enable), the
+   walk stops at the first in-flight slot; the panel keys on `decoder_alive`
+   (an exited worker used to leave "Measuring…"), and a frame the reduce
+   cannot use (mostly sky / black) says so via `EyeMatchReadout::reason`.
+   Known/accepted: the Windows arms are unverified here; the export does
+   not publish a readout; Play stays enabled during an export.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

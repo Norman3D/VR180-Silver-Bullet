@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### Insta360 X6: automatic per-frame eye-exposure matching
+
+The X6's two sensors auto-expose independently — shutter *and* gain — so the
+two eyes of a VR180 clip differ in brightness, and the difference moves with
+the light: on real post-mod footage the eyes sat up to about a stop apart
+for seconds at a time, then drifted back. The static "Matching Eyes"
+exposure trim cannot follow that.
+
+- **Auto-match eye exposure (per frame)** — a new switch in the Colour
+  panel's Matching Eyes section, shown for X6 clips. Every frame, the
+  brightness of the two eyes is measured on the GPU over the central region
+  both eyes share (a luma histogram; the mean shift of five quantiles across
+  the rank range both eyes keep once their clipped tails are cut is robust
+  to the content only one eye sees), and the difference is
+  cancelled with a log-domain code offset before the LUT — on I-Log that is
+  an exposure gain, so colour is untouched. Clipped highlights and crushed
+  blacks are cut out by rank, jointly for both eyes, so sky in the frame
+  does not water the correction down. The frame loop never waits on the
+  GPU: the export reads nothing back, and the preview's readout arrives
+  through a small asynchronous copy ring. A reference picker chooses
+  whether the eyes meet in the middle (default) or one eye follows the
+  other; a readout shows the measured difference and the offsets applied,
+  in EV.
+- Temporal behaviour: the camera's AE steps are taken at once (a lagged
+  step would leave the eyes mismatched for several frames); the small
+  frame-to-frame jitter is low-passed. A seek resets the smoothing.
+- The static Eye Exposure trim still composes on top, and the whole thing
+  is off for other cameras, whose sensors expose together.
+- Also fixed in the preview: in the single-eye "right" view the per-eye
+  trims (CT / tint / exposure) were applied to the wrong eye; they now
+  follow the eye they belong to.
+
 ## 2.5.1 — 2026-09-25
 
 ### macOS: side-by-side sources — 8-bit joins the zero-copy path, and it uses far less memory

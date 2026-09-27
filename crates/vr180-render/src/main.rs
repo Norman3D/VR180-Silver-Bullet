@@ -439,6 +439,7 @@ fn main() -> anyhow::Result<()> {
                 eye_match_ct: 0.0,
                 eye_match_tint: 0.0,
                 eye_match_exposure: 0.0,
+                auto_eye_match: None,
                 eye_scale: 1.0,
             };
             let post = PostProcess { apac_audio, apac_bitrate, apmp };

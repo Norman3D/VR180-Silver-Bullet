@@ -336,6 +336,15 @@ pub struct Settings {
     /// per eye). Corrects a brightness difference between the two lenses, which
     /// otherwise reads as binocular rivalry. 0 = off.
     pub eye_match_exposure: f32,
+    /// Automatic per-frame eye-exposure matching. Only the Insta360 X6 has two
+    /// sensors that auto-expose independently (shutter AND gain), so the
+    /// preview and export enable it for `Insta360Insv` sources only; the
+    /// persisted flag is ignored elsewhere. Measures the brightness difference
+    /// between the eyes on the GPU every frame and cancels it as a log-domain
+    /// code offset before the LUT. Composes with `eye_match_exposure`.
+    pub auto_eye_match: bool,
+    /// Which eye the other follows when `auto_eye_match` is on.
+    pub auto_eye_match_mode: vr180_pipeline::gpu::EyeMatchMode,
     /// Optional 3D LUT file path. Empty string = no LUT.
     /// Equirect-aware unsharp-mask amount (0 = off, 0.5 subtle, 1 mod,
     /// 2 strong). Ported from the Python app; applies to every source.
@@ -453,6 +462,8 @@ impl Default for Settings {
             eye_match_ct: 0.0,
             eye_match_tint: 0.0,
             eye_match_exposure: 0.0,
+            auto_eye_match: false,
+            auto_eye_match_mode: vr180_pipeline::gpu::EyeMatchMode::Average,
             lut_path: String::new(),
             lut_intensity: 1.0,
             preview_mode: PreviewMode::Sbs,
@@ -601,6 +612,10 @@ impl Settings {
         plan.eye_match_ct = self.eye_match_ct;
         plan.eye_match_tint = self.eye_match_tint;
         plan.eye_match_exposure = self.eye_match_exposure;
+        // Automatic per-frame matching: the callers that have an
+        // `EyeMatchState` (fisheye preview arms, export) act on it; the
+        // source-kind gate lives at those call sites.
+        plan.auto_eye_match = if self.auto_eye_match { Some(self.auto_eye_match_mode) } else { None };
         if !self.lut_path.is_empty() {
             if let Some(lut) = load_lut_cached(&self.lut_path) {
                 plan.lut = Some((lut, self.lut_intensity.clamp(0.0, 1.0)));
@@ -942,6 +957,11 @@ pub struct DecoderControl {
     /// loading spinner + a double-spawn guard). The read runs ONLY when
     /// stabilization is on; canceling stab aborts it via `imu_progress.cancel`.
     pub stab_loading: AtomicBool,
+    /// Latest automatic eye-exposure measurement from the preview worker
+    /// (X6 only, while `Settings::auto_eye_match` is on): the raw and
+    /// smoothed left−right difference and the offsets applied, in code units.
+    /// `None` until the first frame has been measured. For the UI readout.
+    pub eye_match_readout: parking_lot::Mutex<Option<vr180_pipeline::gpu::EyeMatchReadout>>,
 }
 
 /// One eye's in-file calibration, in the same units the UI's per-eye
@@ -1449,6 +1469,11 @@ fn run_fisheye(
 ) -> anyhow::Result<()> {
     use vr180_pipeline::fisheye_decode::FisheyePairIter;
     use vr180_fisheye::presets;
+
+    // Automatic eye-exposure matching (X6): one GPU-resident state per
+    // preview stream + a non-blocking readout ring for the UI.
+    let eye_match_state = pipeline.create_eye_match_state();
+    let mut eye_match_rb = pipeline.create_eye_match_readback();
 
     // ── Windows zero-copy fast path (DJI OSV only) ───────────────────
     // Probe synchronously so the decision is made BEFORE the live
@@ -2014,6 +2039,12 @@ fn run_fisheye(
             let pause_start = std::time::Instant::now();
             while control.paused.load(Ordering::SeqCst) {
                 std::thread::sleep(std::time::Duration::from_millis(16));
+                // A paused re-render queued a readout copy; its map completes
+                // on the UI's next present — collect it here so the readout
+                // shows the held frame's measurement.
+                if let Some(r) = pipeline.eye_match_readback_collect(&mut eye_match_rb) {
+                    *control.eye_match_readout.lock() = Some(r);
+                }
                 if control.settings_generation.load(Ordering::SeqCst) != cached_gen {
                     force_render_next = true;
                     break;
@@ -2307,10 +2338,21 @@ fn run_fisheye(
         let (preview_eye_w, preview_eye_h) = (left_tex.width(), left_tex.height());
         let phase_project = phase_t2.elapsed();
         let phase_t3 = std::time::Instant::now();
+        let auto_eye = control.settings.read().auto_eye_match;
         let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
             &pipeline, &control.settings.read(), &left_tex, &right_tex,
             preview_eye_w, preview_eye_h,
+            eye_match_arg(&eye_match_state, kind, stab_idx, auto_eye),
         )?;
+        if matches!(kind, vr180_pipeline::SourceKind::Insta360Insv) && auto_eye {
+            if let Some(r) = pipeline.eye_match_readback_poll(&eye_match_state, &mut eye_match_rb) {
+                *control.eye_match_readout.lock() = Some(r);
+            }
+        } else {
+            eye_match_rb.clear();
+            let mut g = control.eye_match_readout.lock();
+            if g.is_some() { *g = None; }
+        }
         let phase_compose = phase_t3.elapsed();
         // Per-frame phase timing. First 20 rendered frames log every
         // time so we see warm-cache numbers; after that, every 30.
@@ -2432,6 +2474,11 @@ fn run_fisheye_zerocopy(
     cmd_rx: Receiver<DecoderCommand>,
 ) -> anyhow::Result<()> {
     use vr180_pipeline::fisheye_decode::ZcFisheyeFrame;
+
+    // Automatic eye-exposure matching (X6): one GPU-resident state per
+    // preview stream + a non-blocking readout ring for the UI.
+    let eye_match_state = pipeline.create_eye_match_state();
+    let mut eye_match_rb = pipeline.create_eye_match_readback();
 
     // ── Worker sub-thread: decode + share (D3D11 only, never touches wgpu) ──
     enum IterCmd { Seek(f64) }
@@ -2698,6 +2745,12 @@ fn run_fisheye_zerocopy(
             let pause_start = std::time::Instant::now();
             while control.paused.load(Ordering::SeqCst) {
                 std::thread::sleep(std::time::Duration::from_millis(16));
+                // A paused re-render queued a readout copy; its map completes
+                // on the UI's next present — collect it here so the readout
+                // shows the held frame's measurement.
+                if let Some(r) = pipeline.eye_match_readback_collect(&mut eye_match_rb) {
+                    *control.eye_match_readout.lock() = Some(r);
+                }
                 if control.settings_generation.load(Ordering::SeqCst) != cached_gen {
                     force_render_next = true; break;
                 }
@@ -2874,9 +2927,20 @@ fn run_fisheye_zerocopy(
             }
         };
         let (pe_w, pe_h) = (left_tex.width(), left_tex.height());
+        let auto_eye = control.settings.read().auto_eye_match;
         let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
             &pipeline, &control.settings.read(), &left_tex, &right_tex, pe_w, pe_h,
+            eye_match_arg(&eye_match_state, kind, stab_idx, auto_eye),
         )?;
+        if matches!(kind, vr180_pipeline::SourceKind::Insta360Insv) && auto_eye {
+            if let Some(r) = pipeline.eye_match_readback_poll(&eye_match_state, &mut eye_match_rb) {
+                *control.eye_match_readout.lock() = Some(r);
+            }
+        } else {
+            eye_match_rb.clear();
+            let mut g = control.eye_match_readout.lock();
+            if g.is_some() { *g = None; }
+        }
 
         let should_log = frame_idx < 10 || frame_idx % 60 == 0;
         if should_log {
@@ -2951,6 +3015,11 @@ fn run_fisheye_vt_zerocopy(
     cmd_rx: Receiver<DecoderCommand>,
 ) -> anyhow::Result<()> {
     use vr180_pipeline::fisheye_decode::VtZcFisheyeFrame;
+
+    // Automatic eye-exposure matching (X6): one GPU-resident state per
+    // preview stream + a non-blocking readout ring for the UI.
+    let eye_match_state = pipeline.create_eye_match_state();
+    let mut eye_match_rb = pipeline.create_eye_match_readback();
 
     // Native fisheye dims (what the iterator yields) → working preview res (what
     // we resolve to + project from). Calib resolves against the WORKING res,
@@ -3152,6 +3221,12 @@ fn run_fisheye_vt_zerocopy(
             let pause_start = std::time::Instant::now();
             while control.paused.load(Ordering::SeqCst) {
                 std::thread::sleep(std::time::Duration::from_millis(16));
+                // A paused re-render queued a readout copy; its map completes
+                // on the UI's next present — collect it here so the readout
+                // shows the held frame's measurement.
+                if let Some(r) = pipeline.eye_match_readback_collect(&mut eye_match_rb) {
+                    *control.eye_match_readout.lock() = Some(r);
+                }
                 if control.settings_generation.load(Ordering::SeqCst) != cached_gen {
                     force_render_next = true; break;
                 }
@@ -3327,9 +3402,20 @@ fn run_fisheye_vt_zerocopy(
             }
         };
         let (pe_w, pe_h) = (left_tex.width(), left_tex.height());
+        let auto_eye = control.settings.read().auto_eye_match;
         let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
             &pipeline, &control.settings.read(), &left_tex, &right_tex, pe_w, pe_h,
+            eye_match_arg(&eye_match_state, kind, stab_idx, auto_eye),
         )?;
+        if matches!(kind, vr180_pipeline::SourceKind::Insta360Insv) && auto_eye {
+            if let Some(r) = pipeline.eye_match_readback_poll(&eye_match_state, &mut eye_match_rb) {
+                *control.eye_match_readout.lock() = Some(r);
+            }
+        } else {
+            eye_match_rb.clear();
+            let mut g = control.eye_match_readout.lock();
+            if g.is_some() { *g = None; }
+        }
 
         if frame_idx < 10 || frame_idx % 60 == 0 {
             tracing::info!(
@@ -3746,7 +3832,7 @@ fn render_zoom_detail(
          pipeline.project_cross_texture_to_equirect_texture(cross_a, dw, dh, rr, sr, &lens_r)?)
     };
     let (dsbs, dw, dh) = compose_with_color_and_mode(
-        pipeline, &s, &dl, &dr, dl.width(), dl.height())?;
+        pipeline, &s, &dl, &dr, dl.width(), dl.height(), None)?;
     let _ = tx.try_send(DecodedFrame {
         texture: Arc::new(dsbs), width: dw, height: dh,
         frame_idx: abs_frame_idx, timestamp_s,
@@ -4014,6 +4100,7 @@ fn run_zero_copy(
         };
         let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
             &pipeline, &control.settings.read(), &left_tex, &right_tex, left_tex.width(), left_tex.height(),
+            None,
         )?;
 
         let out = DecodedFrame {
@@ -4312,6 +4399,7 @@ fn run_eac_zerocopy(
         };
         let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
             &pipeline, &control.settings.read(), &left_tex, &right_tex, left_tex.width(), left_tex.height(),
+            None,
         )?;
 
         let out = DecodedFrame {
@@ -4565,6 +4653,7 @@ fn run_cpu_assemble(
         };
         let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
             &pipeline, &control.settings.read(), &left_tex, &right_tex, left_tex.width(), left_tex.height(),
+            None,
         )?;
 
         let out = DecodedFrame {
@@ -4658,23 +4747,32 @@ fn compose_with_color_and_mode(
     right_tex: &wgpu::Texture,
     eye_w: u32,
     eye_h: u32,
+    eye_match: Option<(&vr180_pipeline::gpu::EyeMatchState, vr180_pipeline::gpu::EyeMatchFrame)>,
 ) -> anyhow::Result<(wgpu::Texture, u32, u32)> {
-    let color_plan = s.build_color_stack();
+    let mut color_plan = s.build_color_stack();
+    // Automatic eye matching needs the pair state. Without one (a source
+    // whose sensors expose together, or a caller that has none) the plan
+    // must not claim it, or `any_active` would run an empty stack.
+    if eye_match.is_none() {
+        color_plan.auto_eye_match = None;
+    }
     let preview_mode = s.preview_mode.to_pipeline();
     // Single-eye: the compose shader (mode 3) outputs the LEFT input. To show
     // the RIGHT eye, swap the bindings so the right eye lands in that slot.
-    let (left_tex, right_tex) =
-        if preview_mode == vr180_pipeline::gpu::PreviewMode::SingleEye && s.preview_eye_right {
-            (right_tex, left_tex)
-        } else {
-            (left_tex, right_tex)
-        };
+    // The swap happens AFTER grading, so the per-eye trims and the automatic
+    // match always act on the eye they belong to.
+    let single_eye_right =
+        preview_mode == vr180_pipeline::gpu::PreviewMode::SingleEye && s.preview_eye_right;
+    let for_compose = |l: &wgpu::Texture, r: &wgpu::Texture| -> (wgpu::Texture, wgpu::Texture) {
+        if single_eye_right { (r.clone(), l.clone()) } else { (l.clone(), r.clone()) }
+    };
 
     // ── No grade: composite the projection outputs directly. ──
     // This is the hot path for ordinary playback — no per-eye color
     // passes, no extra texture allocations. compose_preview only READS
     // the inputs (TEXTURE_BINDING), so we pass them straight through.
     if !color_plan.any_active() {
+        let (left_tex, right_tex) = for_compose(left_tex, right_tex);
         if preview_mode == vr180_pipeline::gpu::PreviewMode::Sbs {
             // 8-bit eyes (CPU path): single texture-copy compose —
             // byte-identical to the pre-color-stack pipeline (1 submit, 1
@@ -4683,16 +4781,16 @@ fn compose_with_color_and_mode(
             // through `compose_preview`, which reads filterable-float and
             // writes the Rgba8Unorm SBS egui displays.
             if left_tex.format() == wgpu::TextureFormat::Rgba8Unorm {
-                let sbs = compose_sbs(pipeline, left_tex, right_tex, eye_w, eye_h)?;
+                let sbs = compose_sbs(pipeline, &left_tex, &right_tex, eye_w, eye_h)?;
                 return Ok((sbs, eye_w * 2, eye_h));
             }
-            let out = pipeline.compose_preview(left_tex, right_tex, eye_w, eye_h, preview_mode)?;
+            let out = pipeline.compose_preview(&left_tex, &right_tex, eye_w, eye_h, preview_mode)?;
             let (out_w, out_h) = preview_mode.output_dims(eye_w, eye_h);
             return Ok((out, out_w, out_h));
         }
         // Anaglyph / overlay: one compute dispatch, no extra copies.
         let out = pipeline.compose_preview(
-            left_tex, right_tex, eye_w, eye_h, preview_mode,
+            &left_tex, &right_tex, eye_w, eye_h, preview_mode,
         )?;
         let (out_w, out_h) = preview_mode.output_dims(eye_w, eye_h);
         return Ok((out, out_w, out_h));
@@ -4700,21 +4798,44 @@ fn compose_with_color_and_mode(
 
     // ── Grade active: per-eye color stack in 16-BIT, then composite. ──
     // Run the SAME 16-bit color stack the export uses (`apply_color_stack_
-    // per_eye_16`) so the preview's CDL / white-balance / LUT / saturation
+    // pair_16`) so the preview's CDL / white-balance / LUT / saturation
     // match the export's math — no 8-bit banding introduced by the grade.
+    // Both eyes go in one submit; the automatic eye-exposure match (when
+    // on) measures them first and its offsets open each eye's stack.
     // `compose_preview` reads its inputs as filterable float, so the
     // Rgba16Unorm graded eyes feed it directly and it writes the Rgba8Unorm
     // SBS that egui displays. (The source is still the preview's working-res
     // 8-bit decode, but the grade math now matches the export exactly.)
-    let left_g  = pipeline.apply_color_stack_per_eye_16(left_tex,  eye_w, eye_h, &color_plan.for_eye(true))?;
-    let right_g = pipeline.apply_color_stack_per_eye_16(right_tex, eye_w, eye_h, &color_plan.for_eye(false))?;
+    let (left_g, right_g) = pipeline.apply_color_stack_pair_16(
+        left_tex, right_tex, eye_w, eye_h, &color_plan, eye_match,
+    )?;
     let left_post  = left_g .as_ref().unwrap_or(left_tex);
     let right_post = right_g.as_ref().unwrap_or(right_tex);
+    let (left_post, right_post) = for_compose(left_post, right_post);
     let sbs_tex = pipeline.compose_preview(
-        left_post, right_post, eye_w, eye_h, preview_mode,
+        &left_post, &right_post, eye_w, eye_h, preview_mode,
     )?;
     let (out_w, out_h) = preview_mode.output_dims(eye_w, eye_h);
     Ok((sbs_tex, out_w, out_h))
+}
+
+/// The automatic eye-exposure-matching argument for a fisheye preview arm.
+/// `Some` only for the Insta360 X6, whose two sensors auto-expose
+/// independently, and only while `enabled` (`Settings::auto_eye_match`).
+/// `stab_idx` is the absolute source frame, so a seek or a jump resets the
+/// temporal smoothing; while the passes are off the continuity is cleared,
+/// so re-enabling starts from a fresh measurement.
+fn eye_match_arg(
+    state: &vr180_pipeline::gpu::EyeMatchState,
+    kind: vr180_pipeline::SourceKind,
+    stab_idx: usize,
+    enabled: bool,
+) -> Option<(&vr180_pipeline::gpu::EyeMatchState, vr180_pipeline::gpu::EyeMatchFrame)> {
+    if !enabled || !matches!(kind, vr180_pipeline::SourceKind::Insta360Insv) {
+        state.clear();
+        return None;
+    }
+    Some((state, state.frame_for_index(stab_idx as i64)))
 }
 
 /// Native-resolution still renderer for the zoom magnifier.
@@ -5102,7 +5223,15 @@ fn render_still_from_pair(
         }
     };
     let (ew, eh) = (left_tex.width(), left_tex.height());
-    let (sbs, ow, oh) = compose_with_color_and_mode(pipeline, s, &left_tex, &right_tex, ew, eh)?;
+    // A still is one frame: a fresh state measures it without history (the
+    // raw per-frame difference, which the live preview's smoothing converges
+    // to). Allocated only when it can be used.
+    let eye_match_state = (matches!(kind, vr180_pipeline::SourceKind::Insta360Insv) && s.auto_eye_match)
+        .then(|| pipeline.create_eye_match_state());
+    let (sbs, ow, oh) = compose_with_color_and_mode(
+        pipeline, s, &left_tex, &right_tex, ew, eh,
+        eye_match_state.as_ref().and_then(|st| eye_match_arg(st, kind, stab_idx, true)),
+    )?;
     Ok(Some((sbs, ow, oh)))
 }
 

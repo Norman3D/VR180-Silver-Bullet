@@ -140,6 +140,11 @@ pub struct Device {
     /// black padding.
     eye_scale: PerPixelPipeline,
     eye_scale_16: PerPixelPipeline,
+    /// Automatic eye-exposure matching: histogram → offsets → apply (8/16-bit).
+    eye_match_hist: EyeMatchHistPipeline,
+    eye_match_reduce: EyeMatchReducePipeline,
+    eye_offset_apply: EyeOffsetApplyPipeline,
+    eye_offset_apply_16: EyeOffsetApplyPipeline,
     gaussian_blur: GaussianBlur1dPipeline,
     sharpen_combine: SharpenCombinePipeline,
     mid_detail_combine: MidDetailCombinePipeline,
@@ -470,6 +475,10 @@ impl Device {
             &device, "eye_scale_16", EYE_SCALE_16_WGSL,
             std::mem::size_of::<EyeScaleUniforms>() as u64,
         );
+        let eye_match_hist = EyeMatchHistPipeline::create(&device);
+        let eye_match_reduce = EyeMatchReducePipeline::create(&device);
+        let eye_offset_apply = EyeOffsetApplyPipeline::create(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let eye_offset_apply_16 = EyeOffsetApplyPipeline::create(&device, wgpu::TextureFormat::Rgba16Unorm);
         let gaussian_blur = GaussianBlur1dPipeline::create(&device);
         let sharpen_combine = SharpenCombinePipeline::create(&device);
         let mid_detail_combine = MidDetailCombinePipeline::create(&device);
@@ -516,6 +525,7 @@ impl Device {
             cdl, cdl_16,
             color_grade, color_grade_16,
             eye_scale, eye_scale_16,
+            eye_match_hist, eye_match_reduce, eye_offset_apply, eye_offset_apply_16,
             gaussian_blur, sharpen_combine, mid_detail_combine, downsample_4x,
             gaussian_blur_16, sharpen_combine_16,
             mid_detail_combine_16, downsample_4x_16,
@@ -2432,6 +2442,9 @@ const COLOR_GRADE_WGSL: &str = include_str!("shaders/color_grade.wgsl");
 const COLOR_GRADE_16_WGSL: &str = include_str!("shaders/color_grade_16.wgsl");
 const EYE_SCALE_WGSL: &str = include_str!("shaders/eye_scale.wgsl");
 const EYE_SCALE_16_WGSL: &str = include_str!("shaders/eye_scale_16.wgsl");
+const EYE_MATCH_HIST_WGSL: &str = include_str!("shaders/eye_match_hist.wgsl");
+const EYE_MATCH_REDUCE_WGSL: &str = include_str!("shaders/eye_match_reduce.wgsl");
+const EYE_OFFSET_APPLY_WGSL: &str = include_str!("shaders/eye_offset_apply.wgsl");
 const GAUSSIAN_BLUR_1D_WGSL: &str = include_str!("shaders/gaussian_blur_1d.wgsl");
 const SHARPEN_COMBINE_WGSL: &str = include_str!("shaders/sharpen_combine.wgsl");
 const MID_DETAIL_COMBINE_WGSL: &str = include_str!("shaders/mid_detail_combine.wgsl");
@@ -4401,6 +4414,606 @@ impl Downsample4xPipeline {
     }
 }
 
+// ===== Automatic eye-exposure matching =====
+//
+// Two independently auto-exposing sensors (the Insta360 X6 after the VR180
+// mod) deliver eyes whose brightness differs by up to ~1 stop, and the
+// difference moves frame by frame with each sensor's AE. The three passes
+// below measure it on the GPU from the projected per-eye textures and
+// cancel it before the colour stack, with no readback in the frame loop:
+//
+//   eye_match_hist.wgsl   — per-eye luma histogram of the central region
+//   eye_match_reduce.wgsl — percentile shift → smoothed per-eye offsets
+//   eye_offset_apply.wgsl — add the offset (first stage of the stack)
+//
+// On log footage an additive code offset IS an exposure gain (the curve is
+// linear in stops — I-Log ≈ 0.067 code per stop), so the correction is
+// exact in the mid range and colour-neutral. The temporal state lives in
+// an [`EyeMatchState`], one per frame stream: preview and export must not
+// share one, or their smoothing would interleave.
+
+/// Which eye the other one is matched to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum EyeMatchMode {
+    /// Both eyes move half-way: the overall level follows the mean of the
+    /// two sensors' auto-exposure tracks (the smoothest option).
+    #[default]
+    Average,
+    /// The right eye is brought to the left eye's level.
+    ToLeft,
+    /// The left eye is brought to the right eye's level.
+    ToRight,
+}
+
+/// Per-frame input to the eye-match passes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EyeMatchFrame {
+    /// Discard the temporal state (first frame of a stream, or a seek).
+    pub reset: bool,
+}
+
+/// Tunables of the measurement, in code units (normalised texture values,
+/// 0..1, i.e. the SOURCE's log code — the histogram is taken before the
+/// LUT). The defaults are the Insta360 X6 I-Log values, the only source the
+/// feature is enabled for; give another log source its own constructor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EyeMatchTuning {
+    /// EMA factor for sub-threshold changes, (0, 1].
+    pub alpha: f32,
+    /// A change larger than this is taken at once instead of low-passed.
+    pub snap: f32,
+    /// Code below which a sample counts as crushed black (the sensor's black
+    /// level / the padding outside the image circle) and above which it
+    /// counts as clipped white. Both tails are cut by RANK from both eyes
+    /// jointly in the reduce pass, so the cut never biases the shift.
+    pub lo: f32,
+    pub hi: f32,
+    /// Minimum unclipped samples per eye; below it the previous offsets are kept.
+    pub min_count: u32,
+    /// Clamp on the measured difference — a runaway guard.
+    pub max_abs: f32,
+}
+
+impl EyeMatchTuning {
+    /// Insta360 X6, I-Log (10-bit, video range): measured on real footage the
+    /// black level sits at code 0.091 and the white wall at 0.835, so the
+    /// cuts go at 0.12 / 0.80. Per-frame jitter of the measurement is
+    /// ~0.001 code (0.01 stop) while an AE decision steps by up to ~0.05 code
+    /// (0.7 stop) in one frame — hence snap 0.008, alpha 0.3.
+    pub fn insta360_ilog() -> Self {
+        Self { alpha: 0.3, snap: 0.008, lo: 0.12, hi: 0.80, min_count: 4096, max_abs: 0.15 }
+    }
+}
+
+impl Default for EyeMatchTuning {
+    fn default() -> Self {
+        Self::insta360_ilog()
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct EyeMatchHistParams {
+    x0: u32, y0: u32, x1: u32, y1: u32,
+    eye: u32, _p0: u32, _p1: u32, _p2: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct EyeMatchReduceParams {
+    mode: u32, reset: u32, alpha: f32, snap: f32,
+    lo: f32, hi: f32, min_count: f32, max_abs: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct EyeOffsetApplyParams {
+    eye: u32, _p0: u32, _p1: u32, _p2: u32,
+}
+
+/// CPU mirror of the shader-side `EyeMatchState` (32 bytes), as returned by
+/// [`Device::eye_match_readout`].
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct EyeMatchReadout {
+    /// Additive code offset applied to the left eye.
+    pub off_l: f32,
+    /// Additive code offset applied to the right eye.
+    pub off_r: f32,
+    /// Smoothed luma difference left − right (code units).
+    pub d: f32,
+    /// This frame's raw measurement (code units).
+    pub d_raw: f32,
+    /// 1 once a measurement has been accepted.
+    pub valid: u32,
+    /// Unclipped samples this frame, per eye.
+    pub count_l: u32,
+    pub count_r: u32,
+    /// Why this frame was (not) measured: 0 measured, 1 too few unclipped
+    /// samples in an eye (black / covered / lens-capped), 2 the rank range
+    /// left after cutting the clipped tails is too narrow (mostly sky).
+    /// The previous offsets stay in force when it is non-zero.
+    pub reason: u32,
+}
+
+const EYE_MATCH_BINS: u64 = 1024;
+
+/// I-Log mid-range slope, normalised code per stop (the grey axis of the
+/// official Insta360 I-Log→709 LUT over code 0.30–0.60). Used only to
+/// DISPLAY a measured code offset in EV; the correction is applied in
+/// code units.
+pub const ILOG_CODE_PER_STOP: f32 = 0.067;
+const EYE_MATCH_HIST_BYTES: u64 = 2 * EYE_MATCH_BINS * 4;
+const EYE_MATCH_STATE_BYTES: u64 = std::mem::size_of::<EyeMatchReadout>() as u64;
+
+/// GPU-resident state of one eye-matching stream (histograms, smoothed
+/// offsets). Create one with [`Device::create_eye_match_state`] per
+/// preview or export stream and hand it to the pair colour-stack APIs.
+#[derive(Debug)]
+pub struct EyeMatchState {
+    /// 2 × 1024 × u32, cleared at the start of every frame.
+    hist: wgpu::Buffer,
+    /// Shader-side `EyeMatchState` (32 B): offsets + temporal state.
+    state: wgpu::Buffer,
+    /// MAP_READ copy of `state` for [`Device::eye_match_readout`].
+    staging: wgpu::Buffer,
+    pub tuning: EyeMatchTuning,
+    last_frame: std::cell::Cell<Option<i64>>,
+}
+
+impl EyeMatchState {
+    /// Frame parameters for a stream addressed by frame index: `reset`
+    /// when `idx` does not follow the previously seen frame (first frame,
+    /// seek, or a jump), so preview scrubbing never smooths across a cut.
+    /// The same index again is a re-render of the held frame (paused
+    /// preview) and keeps the smoothing — it just converges on that frame.
+    pub fn frame_for_index(&self, idx: i64) -> EyeMatchFrame {
+        // Forward steps of a few frames are continuity (the preview
+        // decimates 2×; a dropped frame is fine); anything backwards or a
+        // jump is a seek.
+        let reset = match self.last_frame.get() {
+            Some(prev) => idx < prev || idx - prev > 30,
+            None => true,
+        };
+        self.last_frame.set(Some(idx));
+        EyeMatchFrame { reset }
+    }
+
+    /// Forget the frame continuity, so the next measured frame starts from
+    /// scratch. Call it while the passes are NOT running (feature off), so
+    /// re-enabling never smooths from a stale value.
+    pub fn clear(&self) {
+        self.last_frame.set(None);
+    }
+}
+
+/// Storage-buffer bind-group-layout entry (compute).
+fn bgle_storage_buf(binding: u32, read_only: bool, min_size: u64) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding, visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: std::num::NonZeroU64::new(min_size),
+        },
+        count: None,
+    }
+}
+
+fn compute_pipeline_for(
+    device: &wgpu::Device,
+    label: &str,
+    wgsl: &str,
+    entries: &[wgpu::BindGroupLayoutEntry],
+) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    });
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(&format!("{label}_bgl")),
+        entries,
+    });
+    let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(&format!("{label}_pll")),
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(&format!("{label}_pipeline")),
+        layout: Some(&pll),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    (pipeline, bind_group_layout)
+}
+
+/// `eye_match_hist.wgsl`: input tex, rw histogram buffer, params uniform.
+#[derive(Debug)]
+struct EyeMatchHistPipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl EyeMatchHistPipeline {
+    fn create(device: &wgpu::Device) -> Self {
+        let (pipeline, bind_group_layout) = compute_pipeline_for(
+            device, "eye_match_hist", EYE_MATCH_HIST_WGSL,
+            &[
+                bgle_tex(0),
+                bgle_storage_buf(1, false, EYE_MATCH_HIST_BYTES),
+                bgle_uniform(2, std::mem::size_of::<EyeMatchHistParams>() as u64),
+            ],
+        );
+        Self { pipeline, bind_group_layout }
+    }
+}
+
+/// `eye_match_reduce.wgsl`: read histogram, rw state, params uniform.
+#[derive(Debug)]
+struct EyeMatchReducePipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl EyeMatchReducePipeline {
+    fn create(device: &wgpu::Device) -> Self {
+        let (pipeline, bind_group_layout) = compute_pipeline_for(
+            device, "eye_match_reduce", EYE_MATCH_REDUCE_WGSL,
+            &[
+                bgle_storage_buf(0, true, EYE_MATCH_HIST_BYTES),
+                bgle_storage_buf(1, false, EYE_MATCH_STATE_BYTES),
+                bgle_uniform(2, std::mem::size_of::<EyeMatchReduceParams>() as u64),
+            ],
+        );
+        Self { pipeline, bind_group_layout }
+    }
+}
+
+/// `eye_offset_apply.wgsl`: input tex, storage out (8- or 16-bit), params
+/// uniform, read-only state buffer.
+#[derive(Debug)]
+struct EyeOffsetApplyPipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl EyeOffsetApplyPipeline {
+    fn create(device: &wgpu::Device, out_format: wgpu::TextureFormat) -> Self {
+        let (wgsl, label) = if out_format == wgpu::TextureFormat::Rgba16Unorm {
+            (EYE_OFFSET_APPLY_WGSL.replace("rgba8unorm, write", "rgba16unorm, write"), "eye_offset_apply_16")
+        } else {
+            (EYE_OFFSET_APPLY_WGSL.to_string(), "eye_offset_apply")
+        };
+        let (pipeline, bind_group_layout) = compute_pipeline_for(
+            device, label, &wgsl,
+            &[
+                bgle_tex(0),
+                bgle_storage_out_fmt(1, out_format),
+                bgle_uniform(2, std::mem::size_of::<EyeOffsetApplyParams>() as u64),
+                bgle_storage_buf(3, true, EYE_MATCH_STATE_BYTES),
+            ],
+        );
+        Self { pipeline, bind_group_layout }
+    }
+}
+
+impl Device {
+    /// Allocate the GPU-side state of one eye-matching stream.
+    pub fn create_eye_match_state(&self) -> EyeMatchState {
+        let hist = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("eye_match_hist"),
+            size: EYE_MATCH_HIST_BYTES,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let state = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("eye_match_state"),
+            size: EYE_MATCH_STATE_BYTES,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("eye_match_staging"),
+            size: EYE_MATCH_STATE_BYTES,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // A zeroed state reads as "never measured" (valid = 0, offsets 0).
+        self.queue.write_buffer(&state, 0, bytemuck::bytes_of(&EyeMatchReadout::default()));
+        EyeMatchState { hist, state, staging, tuning: EyeMatchTuning::default(), last_frame: std::cell::Cell::new(None) }
+    }
+
+    /// When the plan asks for automatic matching AND the caller supplied a
+    /// state, record the measurement passes for this frame and return the
+    /// state to bind into the per-eye stacks; otherwise `None`.
+    fn record_eye_match_if_enabled<'s>(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        left: &wgpu::Texture,
+        right: &wgpu::Texture,
+        w: u32, h: u32,
+        plan: &ColorStackPlan,
+        eye_match: Option<(&'s EyeMatchState, EyeMatchFrame)>,
+    ) -> Option<&'s EyeMatchState> {
+        match (plan.auto_eye_match, eye_match) {
+            (Some(mode), Some((state, frame))) => {
+                self.record_eye_match_measure(encoder, left, right, w, h, state, mode, frame);
+                Some(state)
+            }
+            _ => None,
+        }
+    }
+
+    /// Record: clear histograms → histogram(left) → histogram(right) →
+    /// reduce. Both textures are `w × h` per-eye outputs of the projection
+    /// (any float-sampled format). Must precede the per-eye stacks that
+    /// consume the offsets in the same encoder.
+    fn record_eye_match_measure(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        left: &wgpu::Texture,
+        right: &wgpu::Texture,
+        w: u32, h: u32,
+        state: &EyeMatchState,
+        mode: EyeMatchMode,
+        frame: EyeMatchFrame,
+    ) {
+        encoder.clear_buffer(&state.hist, 0, None);
+        // Central half in each dimension: the FOV both eyes share, clear of
+        // the fisheye rim / black padding at the periphery.
+        let (x0, x1) = (w / 4, w - w / 4);
+        let (y0, y1) = (h / 4, h - h / 4);
+        for (eye, tex) in [(0u32, left), (1u32, right)] {
+            let uni = self.write_uniform("eye_match_hist_u", &EyeMatchHistParams {
+                x0, y0, x1, y1, eye, _p0: 0, _p1: 0, _p2: 0,
+            });
+            let view = tex.create_view(&Default::default());
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("eye_match_hist_bg"),
+                layout: &self.eye_match_hist.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: state.hist.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: uni.as_entire_binding() },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("eye_match_hist_pass"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.eye_match_hist.pipeline);
+            pass.set_bind_group(0, Some(&bg), &[]);
+            // 16×16 threads × 4×4 pixels each = 64×64 texels per workgroup.
+            pass.dispatch_workgroups((x1 - x0).div_ceil(64), (y1 - y0).div_ceil(64), 1);
+        }
+        let t = state.tuning;
+        let uni = self.write_uniform("eye_match_reduce_u", &EyeMatchReduceParams {
+            mode: match mode { EyeMatchMode::Average => 0, EyeMatchMode::ToLeft => 1, EyeMatchMode::ToRight => 2 },
+            reset: frame.reset as u32,
+            alpha: t.alpha.clamp(0.0, 1.0), snap: t.snap.max(0.0),
+            lo: t.lo.clamp(0.0, 1.0), hi: t.hi.clamp(t.lo.clamp(0.0, 1.0), 1.0),
+            min_count: t.min_count as f32, max_abs: t.max_abs.max(0.0),
+        });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("eye_match_reduce_bg"),
+            layout: &self.eye_match_reduce.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: state.hist.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: state.state.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: uni.as_entire_binding() },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("eye_match_reduce_pass"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.eye_match_reduce.pipeline);
+        pass.set_bind_group(0, Some(&bg), &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+
+    /// Record the offset-apply stage for one eye (`eye` 0 = left, 1 = right)
+    /// into `dst` (Rgba8Unorm, or Rgba16Unorm when `is_16`).
+    fn record_eye_offset_apply(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::Texture,
+        dst: &wgpu::Texture,
+        state: &EyeMatchState,
+        eye: u32,
+        is_16: bool,
+    ) {
+        let pipeline = if is_16 { &self.eye_offset_apply_16 } else { &self.eye_offset_apply };
+        let uni = self.write_uniform("eye_offset_apply_u", &EyeOffsetApplyParams {
+            eye, _p0: 0, _p1: 0, _p2: 0,
+        });
+        let src_v = src.create_view(&Default::default());
+        let dst_v = dst.create_view(&Default::default());
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("eye_offset_apply_bg"),
+            layout: &pipeline.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_v) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&dst_v) },
+                wgpu::BindGroupEntry { binding: 2, resource: uni.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: state.state.as_entire_binding() },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("eye_offset_apply_pass"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline.pipeline);
+        pass.set_bind_group(0, Some(&bg), &[]);
+        pass.dispatch_workgroups(dst.width().div_ceil(8), dst.height().div_ceil(8), 1);
+    }
+
+    /// Read the current offsets / measurement back to the CPU (blocking:
+    /// one small copy + map). For the GUI readout — not for the frame loop.
+    pub fn eye_match_readout(&self, state: &EyeMatchState) -> Result<EyeMatchReadout> {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("eye_match_readout_enc"),
+        });
+        encoder.copy_buffer_to_buffer(&state.state, 0, &state.staging, 0, EYE_MATCH_STATE_BYTES);
+        self.queue.submit(Some(encoder.finish()));
+        let slice = state.staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv()
+            .map_err(|_| Error::Wgpu("eye_match_readout: map callback dropped".into()))?
+            .map_err(|e| Error::Wgpu(format!("eye_match_readout: map failed: {e:?}")))?;
+        let out = *bytemuck::from_bytes::<EyeMatchReadout>(&slice.get_mapped_range());
+        state.staging.unmap();
+        Ok(out)
+    }
+}
+
+/// Non-blocking readout of an [`EyeMatchState`] for a thread that must not
+/// block on the device (the preview worker shares eframe's device and never
+/// polls it): a small ring of MAP_READ staging buffers mapped asynchronously.
+/// The map callbacks fire on the host's own polls (eframe polls per present),
+/// and the value is collected on a later call — it lags the GPU by a frame or
+/// two, which is fine for a readout.
+#[derive(Debug)]
+pub struct EyeMatchReadback {
+    ring: Vec<(wgpu::Buffer, std::sync::Arc<std::sync::atomic::AtomicU8>)>,
+    /// The generation each slot's copy was queued in; a copy from before a
+    /// [`Self::clear`] is dropped when it lands instead of being reported.
+    gens: Vec<u64>,
+    generation: u64,
+    next: usize,
+    last: Option<EyeMatchReadout>,
+}
+
+impl EyeMatchReadback {
+    /// Forget the last value and disown every copy still in flight, so
+    /// nothing measured before the passes were switched off can surface
+    /// after they come back.
+    pub fn clear(&mut self) {
+        self.last = None;
+        self.generation += 1;
+    }
+
+    /// The newest value collected so far (also what the poll returns when
+    /// it lands), for callers that want it without a fresh collection.
+    pub fn last(&self) -> Option<EyeMatchReadout> {
+        self.last
+    }
+}
+
+const EYE_RB_FREE: u8 = 0;
+const EYE_RB_IN_FLIGHT: u8 = 1;
+const EYE_RB_READY: u8 = 2;
+
+impl Device {
+    /// Allocate the staging ring for [`Self::eye_match_readback_poll`].
+    pub fn create_eye_match_readback(&self) -> EyeMatchReadback {
+        let ring = (0..3).map(|_| {
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("eye_match_rb"),
+                size: EYE_MATCH_STATE_BYTES,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            (buf, std::sync::Arc::new(std::sync::atomic::AtomicU8::new(EYE_RB_FREE)))
+        }).collect();
+        EyeMatchReadback { ring, gens: vec![0; 3], generation: 1, next: 0, last: None }
+    }
+
+    /// Collect any completed readback WITHOUT queuing a new one (for a
+    /// paused loop's tick, where nothing is composed but the last queued
+    /// copy may have completed). Returns a value only when one landed in
+    /// THIS call (the newest of them), so a caller never re-publishes an
+    /// old value. Never blocks and never polls the device.
+    pub fn eye_match_readback_collect(&self, rb: &mut EyeMatchReadback) -> Option<EyeMatchReadout> {
+        use std::sync::atomic::Ordering;
+        let mut fresh = None;
+        // Slots are queued in ring order and their maps complete in that
+        // order, so walk from `next` (oldest) and stop at the first one
+        // still in flight: anything behind it cannot have landed before it.
+        let n = rb.ring.len();
+        for k in 0..n {
+            let i = (rb.next + k) % n;
+            let (buf, status) = &rb.ring[i];
+            match status.load(Ordering::Acquire) {
+                EYE_RB_READY => {
+                    let v = {
+                        let view = buf.slice(..).get_mapped_range();
+                        *bytemuck::from_bytes::<EyeMatchReadout>(&view)
+                    };
+                    buf.unmap();
+                    status.store(EYE_RB_FREE, Ordering::Release);
+                    if rb.gens[i] == rb.generation {
+                        rb.last = Some(v);
+                        fresh = Some(v);
+                    }
+                }
+                EYE_RB_IN_FLIGHT => break,
+                _ => {}
+            }
+        }
+        fresh
+    }
+
+    /// Collect any completed readback, then queue a new one if a staging
+    /// buffer is free. Returns a value only when one landed in this call.
+    /// Never blocks and never polls the device.
+    pub fn eye_match_readback_poll(
+        &self,
+        state: &EyeMatchState,
+        rb: &mut EyeMatchReadback,
+    ) -> Option<EyeMatchReadout> {
+        use std::sync::atomic::Ordering;
+        let fresh = self.eye_match_readback_collect(rb);
+        let slot = rb.next;
+        let (buf, status) = &rb.ring[slot];
+        if status.load(Ordering::Acquire) == EYE_RB_FREE {
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("eye_match_rb_enc"),
+            });
+            encoder.copy_buffer_to_buffer(&state.state, 0, buf, 0, EYE_MATCH_STATE_BYTES);
+            self.queue.submit(Some(encoder.finish()));
+            status.store(EYE_RB_IN_FLIGHT, Ordering::Release);
+            let st = status.clone();
+            buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                st.store(if r.is_ok() { EYE_RB_READY } else { EYE_RB_FREE }, Ordering::Release);
+            });
+            rb.gens[slot] = rb.generation;
+            rb.next = (slot + 1) % rb.ring.len();
+        }
+        fresh
+    }
+
+    /// 8-bit CPU-fallback helper: measure + apply the automatic eye-exposure
+    /// offset on two `Rgba8Unorm` eye textures and return the corrected pair,
+    /// or `None` when matching is off (plan flag unset, or no state given).
+    /// The caller then runs the rest of its (CPU) grade on the result.
+    pub fn match_eyes_8(
+        &self,
+        left: &wgpu::Texture,
+        right: &wgpu::Texture,
+        w: u32, h: u32,
+        plan: &ColorStackPlan,
+        eye_match: Option<(&EyeMatchState, EyeMatchFrame)>,
+    ) -> Result<Option<(wgpu::Texture, wgpu::Texture)>> {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("eye_match_8_enc"),
+        });
+        let Some(state) = self.record_eye_match_if_enabled(
+            &mut encoder, left, right, w, h, plan, eye_match) else { return Ok(None); };
+        let usage = wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::COPY_SRC;
+        let l = make_rw_texture(&self.device, "eye_match8_l", w, h, usage);
+        let r = make_rw_texture(&self.device, "eye_match8_r", w, h, usage);
+        self.record_eye_offset_apply(&mut encoder, left, &l, state, 0, false);
+        self.record_eye_offset_apply(&mut encoder, right, &r, state, 1, false);
+        self.queue.submit(Some(encoder.finish()));
+        Ok(Some((l, r)))
+    }
+}
+
 /// Bind-group-layout entry for a writeable Rgba8Unorm storage texture.
 /// Used as the output of every per-pixel + multi-pass color shader.
 fn bgle_storage_out(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -4480,6 +5093,15 @@ pub struct ColorStackPlan {
     /// cause of binocular rivalry) without shifting the overall level.
     /// 0 = off.
     pub eye_match_exposure: f32,
+    /// Automatic per-frame eye-exposure matching. `Some(mode)` measures the
+    /// brightness difference between the two eyes on the GPU every frame
+    /// and cancels it with an additive code offset as the FIRST stage of
+    /// the stack (an exposure gain on log footage). Needs the pair API
+    /// ([`Device::apply_color_stack_pair_16`] /
+    /// [`Device::apply_color_stack_to_sbs_bgra_matched`]) plus an
+    /// [`EyeMatchState`]; the single-eye entry points ignore it. Composes
+    /// with the static `eye_match_exposure` trim. `None` = off.
+    pub auto_eye_match: Option<EyeMatchMode>,
     /// "BeyondVR Hack": scale each eye about its own (half-)center at the
     /// very END of the stack, padding the revealed border with black.
     /// 1.0 = off. Export-only — the preview plan never sets it.
@@ -4497,6 +5119,7 @@ impl Default for ColorStackPlan {
             eye_match_ct: 0.0,
             eye_match_tint: 0.0,
             eye_match_exposure: 0.0,
+            auto_eye_match: None,
             eye_scale: 1.0,
         }
     }
@@ -4512,6 +5135,7 @@ impl ColorStackPlan {
             || self.eye_match_ct != 0.0
             || self.eye_match_tint != 0.0
             || self.eye_match_exposure != 0.0
+            || self.auto_eye_match.is_some()
             || self.eye_scale != 1.0
     }
 
@@ -7334,6 +7958,22 @@ impl Device {
         eye_w: u32, eye_h: u32,
         plan: &ColorStackPlan,
     ) -> Result<()> {
+        self.apply_color_stack_to_sbs_bgra_matched(left_eq, right_eq, dst_bgra, eye_w, eye_h, plan, None)
+    }
+
+    /// [`Self::apply_color_stack_to_sbs_bgra`] with automatic eye-exposure
+    /// matching: when `plan.auto_eye_match` is set AND `eye_match` supplies
+    /// the stream's state, the two eyes are measured (histogram + reduce)
+    /// in the same encoder and each eye's stack starts with its offset.
+    pub fn apply_color_stack_to_sbs_bgra_matched(
+        &self,
+        left_eq: &wgpu::Texture,
+        right_eq: &wgpu::Texture,
+        dst_bgra: &wgpu::Texture,
+        eye_w: u32, eye_h: u32,
+        plan: &ColorStackPlan,
+        eye_match: Option<(&EyeMatchState, EyeMatchFrame)>,
+    ) -> Result<()> {
         let t_total = Instant::now();
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("color_stack_sbs_enc"),
@@ -7349,17 +7989,19 @@ impl Device {
         // texture, or `None` meaning "no stages ran, use the source
         // texture directly".
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(16);
+        let matching = self.record_eye_match_if_enabled(
+            &mut encoder, left_eq, right_eq, eye_w, eye_h, plan, eye_match);
         // Per-eye "Matching Eyes" trim: grade each eye with the OPPOSITE CT/tint
         // offset (left +, right −). `for_eye` borrows the plan when the trim is
         // off (no clone). The LUT is unchanged by the trim, so the pre-uploaded
         // `lut_resources` apply to both eyes.
         let left_idx = self.record_color_stack(
             &mut encoder, left_eq, eye_w, eye_h, &plan.for_eye(true), &lut_resources, &mut intermediates,
-            "stack_l",
+            "stack_l", matching.map(|s| (s, 0)),
         );
         let right_idx = self.record_color_stack(
             &mut encoder, right_eq, eye_w, eye_h, &plan.for_eye(false), &lut_resources, &mut intermediates,
-            "stack_r",
+            "stack_r", matching.map(|s| (s, 1)),
         );
         let left_final = match left_idx {
             Some(i) => &intermediates[i],
@@ -7421,8 +8063,22 @@ impl Device {
         lut_resources: &Option<Lut3DResources>,
         intermediates: &mut Vec<wgpu::Texture>,
         eye_label: &str,
+        eye_offset: Option<(&EyeMatchState, u32)>,
     ) -> Option<usize> {
         let mut current_idx: Option<usize> = None;
+
+        // Stage 0: automatic eye-exposure offset. A sensor-side correction
+        // (an exposure gain, additive on log footage), so it goes before
+        // every creative stage — the same place the static trim acts.
+        if let Some((state, eye)) = eye_offset {
+            let next = make_rw_texture(&self.device,
+                &format!("{eye_label}_eyeoff"), w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING);
+            self.record_eye_offset_apply(encoder, src, &next, state, eye, false);
+            intermediates.push(next);
+            current_idx = Some(intermediates.len() - 1);
+        }
 
         // Stage 1: CDL.
         if !plan.cdl.is_identity() {
@@ -7690,8 +8346,14 @@ impl Device {
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(4);
         let final_idx = self.record_color_stack(
             &mut encoder, src, w, h, plan, &lut_resources, &mut intermediates,
-            "stack8_per_eye",
-        ).expect("plan.any_active was true; record_color_stack must have run a stage");
+            "stack8_per_eye", None,
+        );
+        let Some(final_idx) = final_idx else {
+            // Only the automatic eye-exposure stage was requested; it needs
+            // the pair API (both eyes), so this single-eye entry passes through.
+            drop(encoder);
+            return self.apply_color_stack_to_sbs_bgra_per_eye(src, w, h, &ColorStackPlan::default());
+        };
         self.queue.submit(Some(encoder.finish()));
         // Move the final intermediate out of the Vec and return it.
         // swap_remove avoids the cost of shifting later elements.
@@ -7699,35 +8361,23 @@ impl Device {
         Ok(result)
     }
 
-    /// Apply the full color stack to one `Rgba16Unorm` equirect (or
-    /// fisheye) texture and return a new `Rgba16Unorm` texture with the
-    /// result. Order matches the 8-bit path:
-    ///   CDL → LUT3D → sharpen → mid-detail → color_grade.
-    ///
-    /// All stages stay at Rgba16Unorm storage, so a 10-bit export pipeline
-    /// keeps full 10-bit precision through the entire grade. Returns
-    /// `None` when every stage is identity; the caller can keep using
-    /// the original texture (zero-cost identity).
-    pub fn apply_color_stack_per_eye_16(
+    /// One eye's worth of the 16-bit colour stack, recorded into `encoder`
+    /// (no submit, no readback). Returns the index into `intermediates` of
+    /// the final texture, or `None` when no stage ran. Order:
+    ///   eye-exposure offset → CDL → LUT3D → sharpen → white balance →
+    ///   mid-detail → saturation → eye scale.
+    /// `eye_offset` = the automatic eye-exposure state and this eye's index
+    /// (0 = left, 1 = right); `None` skips that stage.
+    fn record_color_stack_16(
         &self,
+        encoder: &mut wgpu::CommandEncoder,
         src: &wgpu::Texture,
         w: u32, h: u32,
         plan: &ColorStackPlan,
-    ) -> Result<Option<wgpu::Texture>> {
-        if !plan.any_active() {
-            return Ok(None);
-        }
-
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("color_stack_16_enc"),
-        });
-
-        let lut_resources = if let Some((ref lut, _)) = plan.lut {
-            Some(self.upload_lut3d_resources(lut))
-        } else { None };
-
-        let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(12);
-
+        lut_resources: &Option<Lut3DResources>,
+        intermediates: &mut Vec<wgpu::Texture>,
+        eye_offset: Option<(&EyeMatchState, u32)>,
+    ) -> Option<usize> {
         let make_16 = |label: &str, w: u32, h: u32| {
             self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -7744,6 +8394,15 @@ impl Device {
 
         let mut current_idx: Option<usize> = None;
 
+        // 0. Automatic eye-exposure offset — sensor-side, so before every
+        //    creative stage (same place as the static exposure trim).
+        if let Some((state, eye)) = eye_offset {
+            let next = make_16("stack16_eyeoff_out", w, h);
+            self.record_eye_offset_apply(encoder, src, &next, state, eye, true);
+            intermediates.push(next);
+            current_idx = Some(intermediates.len() - 1);
+        }
+
         // 1. CDL.
         if !plan.cdl.is_identity() {
             let next = make_16("stack16_cdl_out", w, h);
@@ -7751,18 +8410,18 @@ impl Device {
                 Some(i) => &intermediates[i],
                 None => src,
             };
-            self.record_cdl_16(&mut encoder, prev, &next, plan.cdl);
+            self.record_cdl_16(encoder, prev, &next, plan.cdl);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }
         // 2. 3D LUT.
-        if let (Some((_, intensity)), Some(ref lr)) = (&plan.lut, &lut_resources) {
+        if let (Some((_, intensity)), Some(ref lr)) = (&plan.lut, lut_resources) {
             let next = make_16("stack16_lut_out", w, h);
             let prev = match current_idx {
                 Some(i) => &intermediates[i],
                 None => src,
             };
-            self.record_lut3d_16(&mut encoder, prev, &next, lr, *intensity, w, h);
+            self.record_lut3d_16(encoder, prev, &next, lr, *intensity, w, h);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }
@@ -7775,7 +8434,7 @@ impl Device {
                 Some(i) => &intermediates[i],
                 None => src,
             };
-            self.record_sharpen_16(&mut encoder, prev, &blur_h, &blur_v, &next, w, h, plan.sharpen);
+            self.record_sharpen_16(encoder, prev, &blur_h, &blur_v, &next, w, h, plan.sharpen);
             intermediates.push(blur_h);
             intermediates.push(blur_v);
             intermediates.push(next);
@@ -7789,7 +8448,7 @@ impl Device {
                 Some(i) => &intermediates[i],
                 None => src,
             };
-            self.record_color_grade_16(&mut encoder, prev, &next, plan.color_grade.white_balance_only());
+            self.record_color_grade_16(encoder, prev, &next, plan.color_grade.white_balance_only());
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }
@@ -7805,7 +8464,7 @@ impl Device {
                 Some(i) => &intermediates[i],
                 None => src,
             };
-            self.record_mid_detail_16(&mut encoder, prev,
+            self.record_mid_detail_16(encoder, prev,
                 &small, &small_h, &small_v, &next, w, h, sw, sh, plan.mid_detail);
             intermediates.push(small);
             intermediates.push(small_h);
@@ -7821,7 +8480,7 @@ impl Device {
                 Some(i) => &intermediates[i],
                 None => src,
             };
-            self.record_color_grade_16(&mut encoder, prev, &next, plan.color_grade.saturation_only());
+            self.record_color_grade_16(encoder, prev, &next, plan.color_grade.saturation_only());
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }
@@ -7833,15 +8492,85 @@ impl Device {
                 Some(i) => &intermediates[i],
                 None => src,
             };
-            self.record_eye_scale_16(&mut encoder, prev, &next, plan.eye_scale);
+            self.record_eye_scale_16(encoder, prev, &next, plan.eye_scale);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }
 
+        current_idx
+    }
+
+    /// Apply the full color stack to one `Rgba16Unorm` equirect (or
+    /// fisheye) texture and return a new `Rgba16Unorm` texture with the
+    /// result. Order matches the 8-bit path:
+    ///   CDL → LUT3D → sharpen → mid-detail → color_grade.
+    ///
+    /// All stages stay at Rgba16Unorm storage, so a 10-bit export pipeline
+    /// keeps full 10-bit precision through the entire grade. Returns
+    /// `None` when every stage is identity; the caller can keep using
+    /// the original texture (zero-cost identity). `plan.auto_eye_match` is
+    /// ignored here — it needs both eyes, see
+    /// [`Self::apply_color_stack_pair_16`].
+    pub fn apply_color_stack_per_eye_16(
+        &self,
+        src: &wgpu::Texture,
+        w: u32, h: u32,
+        plan: &ColorStackPlan,
+    ) -> Result<Option<wgpu::Texture>> {
+        if !plan.any_active() {
+            return Ok(None);
+        }
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("color_stack_16_enc"),
+        });
+        let lut_resources = if let Some((ref lut, _)) = plan.lut {
+            Some(self.upload_lut3d_resources(lut))
+        } else { None };
+        let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(12);
+        let idx = self.record_color_stack_16(
+            &mut encoder, src, w, h, plan, &lut_resources, &mut intermediates, None);
         self.queue.submit(Some(encoder.finish()));
-        let final_idx = current_idx.expect("at least one stage ran (any_active was true)");
-        let final_tex = intermediates.swap_remove(final_idx);
-        Ok(Some(final_tex))
+        Ok(idx.map(|i| intermediates.swap_remove(i)))
+    }
+
+    /// Both eyes' 16-bit colour stacks in ONE encoder / submit, with
+    /// automatic eye-exposure matching when `plan.auto_eye_match` is set and
+    /// `eye_match` supplies the stream's [`EyeMatchState`]: the two eyes are
+    /// measured first (histogram + reduce, all on the GPU), then each eye's
+    /// stack starts with its offset. Each returned texture is `None` when no
+    /// stage ran for that eye (use the input as-is). The "Matching Eyes"
+    /// trims are applied per eye via [`ColorStackPlan::for_eye`] as before.
+    pub fn apply_color_stack_pair_16(
+        &self,
+        left: &wgpu::Texture,
+        right: &wgpu::Texture,
+        w: u32, h: u32,
+        plan: &ColorStackPlan,
+        eye_match: Option<(&EyeMatchState, EyeMatchFrame)>,
+    ) -> Result<(Option<wgpu::Texture>, Option<wgpu::Texture>)> {
+        if !plan.any_active() {
+            return Ok((None, None));
+        }
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("color_stack_pair16_enc"),
+        });
+        // The LUT is untouched by the per-eye trims, so one upload serves both.
+        let lut_resources = if let Some((ref lut, _)) = plan.lut {
+            Some(self.upload_lut3d_resources(lut))
+        } else { None };
+        let matching = self.record_eye_match_if_enabled(
+            &mut encoder, left, right, w, h, plan, eye_match);
+        let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(24);
+        let li = self.record_color_stack_16(
+            &mut encoder, left, w, h, &plan.for_eye(true), &lut_resources, &mut intermediates,
+            matching.map(|s| (s, 0)));
+        let ri = self.record_color_stack_16(
+            &mut encoder, right, w, h, &plan.for_eye(false), &lut_resources, &mut intermediates,
+            matching.map(|s| (s, 1)));
+        self.queue.submit(Some(encoder.finish()));
+        // `wgpu::Texture` is a cheap handle clone; both indices may point into
+        // the same Vec, so clone rather than swap_remove twice.
+        Ok((li.map(|i| intermediates[i].clone()), ri.map(|i| intermediates[i].clone())))
     }
 
     /// Preview-mode composer: combines two per-eye half-equirect
