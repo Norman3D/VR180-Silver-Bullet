@@ -48,6 +48,8 @@ pub struct PreparedImu {
     /// Raw counts pre-resample for the printout (acc, mag).
     pub n_acc_input: usize,
     pub n_mag_input: usize,
+    /// Per-frame exposure (s) from the SHUT stream; empty when absent.
+    pub shutter_s: Vec<f32>,
 }
 
 /// Build [`PreparedImu`] from a .360 file. Equivalent to the input-prep
@@ -61,12 +63,13 @@ pub fn prepare_for_vqf(path: &Path) -> Result<PreparedImu> {
     use crate::decode::{extract_gpmf_stream, probe_video};
     use vr180_core::gyro::{
         resample::build_imu_sample_times,
-        cori_iori::parse_cori_with_stmps,
+        cori_iori::{parse_cori_with_stmps, parse_shut},
     };
 
     let gpmf = extract_gpmf_stream(path)?;
     let probe = probe_video(path)?;
     let raw = parse_raw_imu(&gpmf);
+    let shutter_s = parse_shut(&gpmf);
     if raw.gyro.is_empty() {
         return Err(Error::Ffmpeg("no GYRO blocks in GPMF stream".into()));
     }
@@ -121,7 +124,27 @@ pub fn prepare_for_vqf(path: &Path) -> Result<PreparedImu> {
         mag_source,
         n_acc_input,
         n_mag_input,
+        shutter_s,
     })
+}
+
+/// Per-frame exposure (s) across a chapter chain, aligned to the global
+/// frame index: each segment contributes `round(duration·fps)` entries
+/// (its SHUT values, padded with NaN where the stream is short or absent),
+/// so entry `i` is frame `i` of the chained timeline. Callers that already
+/// hold the GPMF of a single file should use [`vr180_core::gyro::parse_shut`]
+/// directly (this re-extracts the data track).
+pub fn gopro_shutter_per_frame(segments: &[std::path::PathBuf], fps: f32) -> Vec<f32> {
+    use crate::decode::{extract_gpmf_stream, probe_video};
+    use vr180_core::gyro::parse_shut;
+    let mut out = Vec::new();
+    for seg in segments {
+        let n = probe_video(seg).map(|p| (p.duration_sec * fps as f64).round() as usize).unwrap_or(0);
+        let mut shut = extract_gpmf_stream(seg).map(|g| parse_shut(&g)).unwrap_or_default();
+        shut.resize(n, f32::NAN);
+        out.extend_from_slice(&shut);
+    }
+    out
 }
 
 fn flatten_with_remap(blocks: &[ImuBlock], remap: [usize; 3]) -> Vec<[f32; 3]> {
@@ -268,7 +291,7 @@ pub fn vqf_cori_equivalent_stream(
 ) -> Result<Vec<Quat>> {
     use vr180_core::gyro::{
         vqf,
-        resample::{resample_quats_to_frames_timed, cori_swap_yz, SROT_S},
+        resample::{resample_quats_at_times, gopro_frame_sample_times, cori_swap_yz, SROT_S},
     };
 
     // 1. Prep the IMU arrays. `prepare_for_vqf` now returns the
@@ -326,20 +349,26 @@ pub fn vqf_cori_equivalent_stream(
         sample_times.len() as f32 / sample_times.last().copied().unwrap_or(1.0).max(1e-3),
     );
 
-    // 5. Resample to per-video-frame quaternions. Sample at the
-    //    readout midpoint with a 1 ms averaging window — matches
-    //    Python's `window_ms=1.0` default (`vqf_to_cori_quats` at
-    //    `parse_gyro_raw.py:1265-1270`). Effectively point-sampling,
-    //    preserving the VQF stream's full high-frequency content so
-    //    downstream stab can correct against frame-rate jitter.
-    Ok(resample_quats_to_frames_timed(
-        &sample_times,
-        &cori_equiv,
-        fps,
-        n_frames,
-        SROT_S * 0.5,
-        VQF_RESAMPLE_WINDOW_S,
-    ))
+    // 5. Resample to per-video-frame quaternions at each frame's
+    //    MID-EXPOSURE: `i/fps + SROT/2 − shutter_i/2` from the per-frame
+    //    SHUT stream (the DJI/X6 rule), window-averaged over SROT. Without
+    //    SHUT this is the readout midpoint, as before.
+    let times = gopro_frame_sample_times(fps, n_frames, &prep.shutter_s, SROT_S);
+    log_shutter(&prep.shutter_s, n_frames);
+    Ok(resample_quats_at_times(&sample_times, &cori_equiv, &times, VQF_RESAMPLE_WINDOW_S))
+}
+
+fn log_shutter(shutter_s: &[f32], n_frames: usize) {
+    let mut v: Vec<f32> = shutter_s.iter().copied().filter(|s| s.is_finite() && *s > 0.0).collect();
+    if v.is_empty() {
+        tracing::info!("GoPro pose timing: no SHUT stream — sampling at the readout midpoint");
+        return;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    tracing::info!(
+        "GoPro pose timing: mid-exposure from SHUT ({} of {} frames; shutter {:.2}–{:.2} ms, median {:.2} ms → sample {:.2} ms earlier than the readout midpoint at the median)",
+        v.len(), n_frames, v[0] * 1e3, v[v.len() - 1] * 1e3, v[v.len() / 2] * 1e3, v[v.len() / 2] * 500.0,
+    );
 }
 
 /// Multi-segment VQF: aggregate the raw IMU of all GoPro `.360` segments
@@ -357,7 +386,7 @@ pub fn vqf_cori_equivalent_stream_multi(
 ) -> Result<Vec<Quat>> {
     use vr180_core::gyro::{
         vqf,
-        resample::{resample_quats_to_frames_timed, cori_swap_yz, SROT_S},
+        resample::{resample_quats_at_times, gopro_frame_sample_times, cori_swap_yz, SROT_S},
     };
     use crate::decode::probe_video;
 
@@ -369,6 +398,7 @@ pub fn vqf_cori_equivalent_stream_multi(
     let mut acc_body: Vec<[f32; 3]> = Vec::new();
     let mut mag_body: Vec<[f32; 3]> = Vec::new();
     let mut gyro_times: Vec<f32> = Vec::new();
+    let mut shutter_all: Vec<f32> = Vec::new();
     let mut all_have_mag = true;
     let mut time_off = 0.0_f32;
 
@@ -376,6 +406,12 @@ pub fn vqf_cori_equivalent_stream_multi(
         let prep = prepare_for_vqf(seg)?;
         let seg_dur = probe_video(seg).map(|p| p.duration_sec as f32)
             .unwrap_or_else(|_| prep.gyro_times.last().copied().unwrap_or(0.0));
+        // Per-frame shutter, padded to the segment's frame count so the
+        // global frame index stays aligned across the chain.
+        let n_seg = (seg_dur * fps).round() as usize;
+        let mut shut = prep.shutter_s.clone();
+        shut.resize(n_seg, f32::NAN);
+        shutter_all.extend_from_slice(&shut);
         for &t in &prep.gyro_times { gyro_times.push(t + time_off); }
         gyro_body.extend_from_slice(&prep.gyro_body);
         acc_body.extend_from_slice(&prep.acc_body);
@@ -417,8 +453,9 @@ pub fn vqf_cori_equivalent_stream_multi(
             &cori_equiv, 1.0 / gyr_ts.max(1e-6), fps, n_frames,
             SROT_S * 0.5, VQF_RESAMPLE_WINDOW_S));
     }
-    Ok(resample_quats_to_frames_timed(
-        &gyro_times, &cori_equiv, fps, n_frames, SROT_S * 0.5, VQF_RESAMPLE_WINDOW_S))
+    let times = gopro_frame_sample_times(fps, n_frames, &shutter_all, SROT_S);
+    log_shutter(&shutter_all, n_frames);
+    Ok(resample_quats_at_times(&gyro_times, &cori_equiv, &times, VQF_RESAMPLE_WINDOW_S))
 }
 
 fn pick_mag_source(

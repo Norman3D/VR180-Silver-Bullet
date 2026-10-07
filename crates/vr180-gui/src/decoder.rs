@@ -5574,11 +5574,21 @@ pub(crate) fn build_per_eye_frames_multi(
             }
         };
 
+        // The RS ω window is centred on the instant the pose is sampled
+        // at — the centre row's mid-exposure, `i/fps + srot/2 − shutter/2`
+        // (per-frame SHUT; DJI parity) — so the per-row times
+        // `(row/cal_dim − 0.5)·srot` in the shader land on each row's own
+        // exposure. (The Python app centred the window on frame start.)
+        let shutter = if is_multi {
+            vr180_pipeline::imu::gopro_shutter_per_frame(segments, fps)
+        } else {
+            vr180_core::gyro::parse_shut(&gpmf)
+        };
+        let frame_times = vr180_core::gyro::gopro_frame_sample_times(
+            fps, n_frames_video, &shutter, srot_s);
         match angvel {
             Some(av) => (0..n_frames_video).map(|i| {
-                // Frame time base matches Python's export precompute
-                // (`t = start + i/fps`, frame start — not readout mid).
-                let t = i as f32 / fps.max(1e-6);
+                let t = frame_times[i];
                 let single = av.single_at(t);
                 let groups = av.groups_at(t, srot_s, RS_N_GROUPS);
                 (mk(single, &groups, left_f, back),

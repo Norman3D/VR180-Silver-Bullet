@@ -34,6 +34,25 @@ exposure trim cannot follow that.
   trims (CT / tint / exposure) were applied to the wrong eye; they now
   follow the eye they belong to.
 
+### GoPro .360: stabilization timed to each frame's exposure
+
+The GoPro orientation sample is now placed at the centre row's
+mid-exposure — frame start + readout/2 − shutter/2, from the per-frame
+shutter the camera records (the `SHUT` stream) — the same rule the DJI
+and X6 paths use, and the rolling-shutter correction is centred on that
+same instant instead of frame start. In daylight this changes nothing
+(a 1 ms shutter moves the sample by half a millisecond, and the old
+midpoint measured right to within ~1.6 ms); in low light it matters: at a
+1/30 s shutter the pose was sampled 16 ms late, which showed as shake that
+followed the motion. Measured on a dark running section, the locked
+residual drops by 12 % and the motion-correlated part of it disappears.
+
+Found while comparing a GoPro MAX, a DJI Osmo 360 and an Insta360 X6 on
+one rig: per unit of time the three pipelines leave the same residual on
+the same walk; the GoPro looks worse mainly because it records at 30 fps
+(each frame carries 1.7× the motion of a 50 fps frame) and, in the dark,
+because of this timing term.
+
 ## 2.5.1 — 2026-09-25
 
 ### macOS: side-by-side sources — 8-bit joins the zero-copy path, and it uses far less memory

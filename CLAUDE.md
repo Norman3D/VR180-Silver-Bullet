@@ -3,7 +3,7 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ Status: **Unreleased on `main` (2026-09-27): X6 automatic per-frame eye-exposure matching — item 15 below.** 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows artifacts + latest.json merge PENDING** — Windows box: pull, build installer (AppVer 2.5.1 already in windows.iss), `make-latest-json.mjs --version 2.5.1` (syncs the mac entry from the release), `gh release upload v2.5.1 … latest.json --clobber`. Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; Windows respin + latest.json merge pending from the Windows box) — reframed mode, file-derived stabilization timing, Insta360 X6
+## ⚡ Status: **Unreleased on `main`: X6 automatic per-frame eye-exposure matching (2026-09-27, item 15) + GoPro per-frame exposure timing from SHUT (2026-10-07, item 16).** 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows artifacts + latest.json merge PENDING** — Windows box: pull, build installer (AppVer 2.5.1 already in windows.iss), `make-latest-json.mjs --version 2.5.1` (syncs the mac entry from the release), `gh release upload v2.5.1 … latest.json --clobber`. Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; Windows respin + latest.json merge pending from the Windows box) — reframed mode, file-derived stabilization timing, Insta360 X6
 
 VR180 Silver Bullet **2.0** is feature-complete and building/running on both
 **macOS (Apple Silicon)** and **Windows (NVIDIA)**. The Windows GPU-resident
@@ -458,6 +458,47 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    cannot use (mostly sky / black) says so via `EyeMatchReadout::reason`.
    Known/accepted: the Windows arms are unverified here; the export does
    not publish a readout; Play stays enabled during an export.
+
+16. **GoPro stabilization investigation + per-frame exposure timing
+   (2026-10-07) — SHARED code, on `main`, unreleased.** The user rigged a
+   GoPro MAX (.360, 30 fps), an Osmo 360 and an X6 (both 50 fps in set 1,
+   ~30 fps in set 2) together and shot the same walk/run; the GoPro looked
+   clearly worse. MEASURED (scratchpad `stab/`: resid.py centre-crop phase
+   correlation, eye_rot.py whole-eye sphere fit of DIS flow, sweep_eval.py /
+   timing_fit.py on camera-lock harness exports, cameras aligned by audio
+   envelope): (a) on the user's soft-stab exports the residual per SECOND of
+   video is the same for all three (set 1: 1.7 / 1.8 / 1.9 deg/s; set 2 the
+   GoPro is ~1.4× by the centre metric) — the GoPro's per-frame residual is
+   1.6× because it is 30 fps; (b) under camera LOCK on the walking window the
+   GoPro leaves 0.20°/frame vs the X6's 0.056°, but that excess is
+   NOT the pipeline: phase ±4/±8 ms, a 1 ms point sample instead of the
+   15 ms box, VQF 6D / τ=100 s / fixed bias / plain integration, RS window
+   centre and RS off all leave it at 0.20–0.22°; the raw (unstabilized)
+   frames follow the pipeline's own rotation increments as well as the X6's
+   do (R² 0.88 both), the residual-vs-Δω regression puts the GoPro timing
+   error at 1.6 ms (the method recovers deliberate ±8 ms shifts as 7–8.5 ms),
+   and the residual field is the forward-walk parallax pattern (the GoPro
+   sits lower on the rig and its frames are 33 ms apart); (c) in the DARK
+   (set 2 end: 1/30 s shutter) the GoPro residual improves monotonically as
+   the pose is moved earlier (0.613 → 0.548 @ −8 ms → 0.542 @ −16.5 ms;
+   +16.5 ms → 0.764) and the Δω-correlated component vanishes — the missing
+   `−shutter/2` term. GoPro CORI on these clips is a constant (bias drift
+   0.2°/s): no in-camera stabilization, so the VQF path is used. WHAT
+   CHANGED: `vr180_core::gyro::parse_shut` (per-frame SHUT, type `f`),
+   `resample_quats_at_times` + `gopro_frame_sample_times(fps, n, shutter,
+   readout)` = `i/fps + readout/2 − shutter_i/2` (fallback to the readout
+   midpoint per frame when SHUT is absent/implausible); `imu.rs`
+   `vqf_cori_equivalent_stream(_multi)` sample there (`PreparedImu.shutter_s`,
+   `gopro_shutter_per_frame(segments, fps)` for chains); decoder.rs RS ω
+   window centred on the same instant (was frame start, a Python-parity
+   choice — now DJI parity, `t_mid`). Verified: core 53 / pipeline 45 tests
+   (new: SHUT parse, sample times, at-times resampler parity); dark lock
+   export 0.613 → 0.542°/frame (= the −16.5 ms probe), Δω-only R² 0.060 →
+   0.004; daylight 0.202 → 0.199 (unchanged). Not changed (measured not to
+   matter here): VQF 9D estimator, 15 ms pose window, RS factors; the GEOC
+   inter-lens extrinsics (ANGX/ANGY/ANGZ) remain unparsed — a static stereo
+   alignment question, not shake. Harnesses (gitignored): eac_stab_check
+   gained GOPRO_NO_STAB / GOPRO_RS_T_MS; rider_export uses the new times.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

@@ -19,12 +19,12 @@ pub mod rs_omega;
 pub mod stabilize;
 pub mod vqf;
 
-pub use cori_iori::{Quat, parse_cori, parse_cori_with_stmps, parse_iori, quat_to_euler_zyx, CoriBlockStmp};
+pub use cori_iori::{Quat, parse_cori, parse_cori_with_stmps, parse_iori, parse_shut, quat_to_euler_zyx, CoriBlockStmp};
 pub use gpmf::{GpmfEntry, GpmfWalker, FourCC};
 pub use raw::{ImuBlock, RawImu, parse_raw_imu};
 pub use resample::{
-    resample_quats_to_frames, resample_quats_to_frames_timed,
-    build_imu_sample_times, cori_swap_yz, SROT_S,
+    resample_quats_to_frames, resample_quats_to_frames_timed, resample_quats_at_times,
+    gopro_frame_sample_times, build_imu_sample_times, cori_swap_yz, SROT_S,
 };
 pub use rs_omega::{compute_per_frame_omega, GyroAngvel, SMOOTH_WINDOW_S};
 pub use stabilize::{

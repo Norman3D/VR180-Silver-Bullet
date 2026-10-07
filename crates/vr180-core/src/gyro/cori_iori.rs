@@ -186,6 +186,32 @@ pub fn parse_cori_with_stmps(gpmf: &[u8]) -> (Vec<Quat>, Vec<CoriBlockStmp>) {
     parse_quaternion_with_stmps(gpmf, CORI)
 }
 
+/// Per-frame exposure time in seconds from the `SHUT` stream ("Exposure
+/// time (shutter speed)", type `f`): one sample per video frame, sharing
+/// CORI's per-frame STMP blocks, so index `i` is frame `i`. Empty when the
+/// file carries no SHUT stream. Used to place each frame's pose sample at
+/// the centre row's MID-EXPOSURE (`readout/2 − shutter/2` into the frame),
+/// the rule the DJI and X6 paths follow; on a 1/30 s exposure the shutter
+/// half is 16 ms — a full frame of walking motion if ignored.
+pub fn parse_shut(gpmf: &[u8]) -> Vec<f32> {
+    let want = FourCC::new(b"SHUT");
+    let mut out = Vec::new();
+    for entry in GpmfWalker::new(gpmf) {
+        if entry.fourcc != want || entry.type_char != b'f' || entry.struct_size != 4 {
+            continue;
+        }
+        let n = entry.repeat as usize;
+        if entry.payload.len() < n * 4 {
+            continue;
+        }
+        for i in 0..n {
+            let b: [u8; 4] = entry.payload[i * 4..i * 4 + 4].try_into().unwrap();
+            out.push(f32::from_be_bytes(b));
+        }
+    }
+    out
+}
+
 fn parse_quaternion(gpmf: &[u8], want: FourCC) -> Vec<Quat> {
     parse_quaternion_with_stmps(gpmf, want).0
 }
@@ -255,6 +281,38 @@ pub fn quat_to_euler_zyx(q: Quat) -> (f32, f32, f32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shut_parses_big_endian_f32_per_frame() {
+        // Flat KLV: "SHUT", type 'f', size 4, repeat 3, payload = 3 × f32 BE.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"SHUT");
+        blob.push(b'f');
+        blob.push(4);
+        blob.extend_from_slice(&3u16.to_be_bytes());
+        for v in [0.001_f32, 0.0333, 0.0]  {
+            blob.extend_from_slice(&v.to_be_bytes());
+        }
+        let shut = super::parse_shut(&blob);
+        assert_eq!(shut.len(), 3);
+        assert!((shut[0] - 0.001).abs() < 1e-7 && (shut[1] - 0.0333).abs() < 1e-6 && shut[2] == 0.0);
+        // Wrong type is ignored (a 's' record with the same fourcc).
+        let mut bad = blob.clone();
+        bad[4] = b's';
+        assert!(super::parse_shut(&bad).is_empty());
+    }
+
+    #[test]
+    fn shut_count_matches_cori_on_the_fixture_when_present() {
+        let data = std::fs::read("tests/fixtures/GS010172.gpmf")
+            .expect("fixture missing — see crates/vr180-core/tests/fixtures/README");
+        let shut = super::parse_shut(&data);
+        let cori = super::parse_cori(&data);
+        if !shut.is_empty() {
+            assert_eq!(shut.len(), cori.len(), "one SHUT per frame");
+            assert!(shut.iter().all(|&s| s > 0.0 && s < 0.2), "exposures in (0, 200 ms)");
+        }
+    }
+
     use super::*;
 
     fn fixture() -> Vec<u8> {

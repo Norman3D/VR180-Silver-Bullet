@@ -302,17 +302,69 @@ pub fn resample_quats_to_frames_timed(
         aligned.push(q);
     }
 
-    let mut out = Vec::with_capacity(n_frames);
-    for i in 0..n_frames {
-        let t = i as f32 * dt_dst + time_offset_s;
+    let times: Vec<f32> = (0..n_frames).map(|i| i as f32 * dt_dst + time_offset_s).collect();
+    resample_at_times_aligned(&aligned, src_times, &times, window_s)
+}
+
+/// [`resample_quats_to_frames_timed`] at arbitrary instants: one output
+/// per entry of `times` (seconds on the same clock as `src_times`), each
+/// the window average (or linear sample when `window_s <= 0`) of the
+/// stream around that instant. Lets a caller place every frame's sample at
+/// its own mid-exposure (see [`gopro_frame_sample_times`]).
+pub fn resample_quats_at_times(
+    src_times: &[f32],
+    src_quats: &[Quat],
+    times: &[f32],
+    window_s: f32,
+) -> Vec<Quat> {
+    assert_eq!(src_times.len(), src_quats.len(),
+        "src_times and src_quats must have the same length");
+    if src_quats.is_empty() || times.is_empty() {
+        return Vec::new();
+    }
+    let mut aligned: Vec<Quat> = Vec::with_capacity(src_quats.len());
+    aligned.push(src_quats[0]);
+    for j in 1..src_quats.len() {
+        let mut q = src_quats[j];
+        if q.dot(aligned[j - 1]) < 0.0 {
+            q = Quat { w: -q.w, x: -q.x, y: -q.y, z: -q.z };
+        }
+        aligned.push(q);
+    }
+    resample_at_times_aligned(&aligned, src_times, times, window_s)
+}
+
+fn resample_at_times_aligned(aligned: &[Quat], src_times: &[f32], times: &[f32], window_s: f32) -> Vec<Quat> {
+    let mut out = Vec::with_capacity(times.len());
+    for &t in times {
         let q = if window_s <= 0.0 {
-            sample_linear_timed(&aligned, src_times, t)
+            sample_linear_timed(aligned, src_times, t)
         } else {
-            sample_window_average_timed(&aligned, src_times, t, window_s)
+            sample_window_average_timed(aligned, src_times, t, window_s)
         };
         out.push(q.normalize());
     }
     out
+}
+
+/// Pose sample instant for each GoPro video frame: the centre row's
+/// MID-EXPOSURE, `i/fps + readout/2 − shutter_i/2` — the same rule the
+/// DJI (`video_ts + readout/2 − shutter/2`) and X6 paths use. `shutter_s`
+/// is the per-frame exposure from the SHUT stream ([`crate::gyro::parse_shut`]);
+/// a missing or implausible value (≤ 0, longer than the frame period)
+/// falls back to the readout midpoint for that frame. Measured on real
+/// walking/running footage: in daylight (1 ms shutter) the readout
+/// midpoint is right to ~1.6 ms; at a 1/30 s shutter ignoring the term
+/// leaves a ~16 ms pose error that shows as shake tracking the motion.
+pub fn gopro_frame_sample_times(fps: f32, n_frames: usize, shutter_s: &[f32], readout_s: f32) -> Vec<f32> {
+    let dt = 1.0 / fps.max(1e-6);
+    (0..n_frames).map(|i| {
+        let base = i as f32 * dt + readout_s * 0.5;
+        match shutter_s.get(i) {
+            Some(&s) if s.is_finite() && s > 0.0 && s <= dt * 1.0001 => base - s * 0.5,
+            _ => base,
+        }
+    }).collect()
 }
 
 /// Linear time-interpolation: find the two source samples whose
@@ -399,6 +451,32 @@ pub fn cori_swap_yz(q: Quat) -> Quat {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gopro_sample_times_are_mid_exposure() {
+        let t = super::gopro_frame_sample_times(30.0, 4, &[0.001, 1.0 / 30.0, 0.0, f32::NAN], 0.015224);
+        let dt = 1.0 / 30.0;
+        assert!((t[0] - (0.0 + 0.007612 - 0.0005)).abs() < 1e-6, "short shutter: readout mid − shutter/2");
+        assert!((t[1] - (dt + 0.007612 - dt / 2.0)).abs() < 1e-6, "full-frame shutter: 16.7 ms earlier");
+        assert!((t[2] - (2.0 * dt + 0.007612)).abs() < 1e-6, "zero shutter → readout midpoint");
+        assert!((t[3] - (3.0 * dt + 0.007612)).abs() < 1e-6, "NaN shutter → readout midpoint");
+        // No SHUT at all → the classic readout-midpoint convention for every frame.
+        let t0 = super::gopro_frame_sample_times(30.0, 2, &[], 0.015224);
+        assert!((t0[1] - (dt + 0.007612)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resample_at_times_matches_frame_resampler() {
+        use super::*;
+        let src_times: Vec<f32> = (0..100).map(|i| i as f32 * 0.00125).collect();
+        let src: Vec<Quat> = src_times.iter().map(|&t| Quat { w: (t * 1.0).cos(), x: 0.0, y: (t * 1.0).sin(), z: 0.0 }).collect();
+        let a = resample_quats_to_frames_timed(&src_times, &src, 30.0, 3, 0.007612, 0.015224);
+        let times: Vec<f32> = (0..3).map(|i| i as f32 / 30.0 + 0.007612).collect();
+        let b = resample_quats_at_times(&src_times, &src, &times, 0.015224);
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x.w - y.w).abs() < 1e-6 && (x.x - y.x).abs() < 1e-6 && (x.y - y.y).abs() < 1e-6 && (x.z - y.z).abs() < 1e-6);
+        }
+    }
+
     use super::*;
 
     fn q(w: f32, x: f32, y: f32, z: f32) -> Quat { Quat { w, x, y, z } }
