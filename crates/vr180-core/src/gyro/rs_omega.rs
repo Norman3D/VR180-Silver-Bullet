@@ -165,8 +165,20 @@ impl GyroAngvel {
         fps: f32,
         fallback_duration_s: f32,
     ) -> Option<Self> {
-        let times = super::resample::build_imu_sample_times(
-            gyro_blocks, cori_stmps, fps, fallback_duration_s,
+        Self::build_with_skips(gyro_blocks, cori_stmps, None, fps, fallback_duration_s)
+    }
+
+    /// [`Self::build`] honouring the camera's dropped frames (`frame_skips`
+    /// = per-video-frame MSKP, see `build_imu_sample_times_with_skips`).
+    pub fn build_with_skips(
+        gyro_blocks: &[ImuBlock],
+        cori_stmps: &[super::cori_iori::CoriBlockStmp],
+        frame_skips: Option<&[i32]>,
+        fps: f32,
+        fallback_duration_s: f32,
+    ) -> Option<Self> {
+        let times = super::resample::build_imu_sample_times_with_skips(
+            gyro_blocks, cori_stmps, frame_skips, fps, fallback_duration_s,
         );
         if times.len() < 10 {
             return None;

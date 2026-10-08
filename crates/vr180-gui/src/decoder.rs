@@ -5341,8 +5341,11 @@ fn gather_multi_angvel(
         if let Ok(gpmf) = extract_gpmf_cached(seg) {
             let raw_imu = vr180_core::gyro::parse_raw_imu(&gpmf);
             let (_, stmps) = vr180_core::gyro::parse_cori_with_stmps(&gpmf);
-            if let Some(av) = vr180_core::gyro::GyroAngvel::build(
-                &raw_imu.gyro, &stmps, fps, dur.max(1e-3),
+            let skips = vr180_core::gyro::parse_mskp(&gpmf);
+            if let Some(av) = vr180_core::gyro::GyroAngvel::build_with_skips(
+                &raw_imu.gyro, &stmps,
+                if skips.is_empty() { None } else { Some(&skips) },
+                fps, dur.max(1e-3),
             ) {
                 for &t in &av.times { times.push(t + toff); }
                 raw.extend_from_slice(&av.raw);
@@ -5534,8 +5537,11 @@ pub(crate) fn build_per_eye_frames_multi(
             gather_multi_angvel(segments, fps)
         } else {
             let (_, cori_stmps) = vr180_core::gyro::parse_cori_with_stmps(&gpmf);
-            vr180_core::gyro::GyroAngvel::build(
-                &raw_imu.gyro, &cori_stmps, fps, probe.duration_sec as f32,
+            let skips = vr180_core::gyro::parse_mskp(&gpmf);
+            vr180_core::gyro::GyroAngvel::build_with_skips(
+                &raw_imu.gyro, &cori_stmps,
+                if skips.is_empty() { None } else { Some(&skips) },
+                fps, probe.duration_sec as f32,
             )
         };
 
@@ -5579,13 +5585,15 @@ pub(crate) fn build_per_eye_frames_multi(
         // (per-frame SHUT; DJI parity) — so the per-row times
         // `(row/cal_dim − 0.5)·srot` in the shader land on each row's own
         // exposure. (The Python app centred the window on frame start.)
-        let shutter = if is_multi {
-            vr180_pipeline::imu::gopro_shutter_per_frame(segments, fps)
+        let (shutter, frame_skips) = if is_multi {
+            (vr180_pipeline::imu::gopro_shutter_per_frame(segments, fps),
+             vr180_pipeline::imu::gopro_skips_per_frame(segments, fps))
         } else {
-            vr180_core::gyro::parse_shut(&gpmf)
+            (vr180_core::gyro::parse_shut(&gpmf), vr180_core::gyro::parse_mskp(&gpmf))
         };
         let frame_times = vr180_core::gyro::gopro_frame_sample_times(
-            fps, n_frames_video, &shutter, srot_s);
+            fps, n_frames_video, &shutter, srot_s,
+            if frame_skips.is_empty() { None } else { Some(&frame_skips) });
         match angvel {
             Some(av) => (0..n_frames_video).map(|i| {
                 let t = frame_times[i];

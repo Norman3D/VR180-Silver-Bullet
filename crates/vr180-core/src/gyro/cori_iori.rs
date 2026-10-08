@@ -212,6 +212,33 @@ pub fn parse_shut(gpmf: &[u8]) -> Vec<f32> {
     out
 }
 
+/// Per-frame cumulative count of sensor frames the camera DROPPED before
+/// video frame `i`, from the `MSKP` stream ("MRV Frame Skip", type `s`,
+/// one int16 per video frame, 0 or negative). When the encoder drops a
+/// sensor frame it repeats the previous image to keep the frame rate, the
+/// per-frame streams (CORI/SHUT/…) repeat that frame's entry, and MSKP
+/// steps down by one at the repeated frame — while the gyro timeline and
+/// the telemetry block timestamps keep running (that block is one frame
+/// period short). So video frame `i` shows sensor frame `i + mskp[i]`.
+/// Empty when the file carries no MSKP stream.
+pub fn parse_mskp(gpmf: &[u8]) -> Vec<i32> {
+    let want = FourCC::new(b"MSKP");
+    let mut out = Vec::new();
+    for entry in GpmfWalker::new(gpmf) {
+        if entry.fourcc != want || entry.type_char != b's' || entry.struct_size != 2 {
+            continue;
+        }
+        let n = entry.repeat as usize;
+        if entry.payload.len() < n * 2 {
+            continue;
+        }
+        for i in 0..n {
+            out.push(i16::from_be_bytes([entry.payload[i * 2], entry.payload[i * 2 + 1]]) as i32);
+        }
+    }
+    out
+}
+
 fn parse_quaternion(gpmf: &[u8], want: FourCC) -> Vec<Quat> {
     parse_quaternion_with_stmps(gpmf, want).0
 }
@@ -281,6 +308,19 @@ pub fn quat_to_euler_zyx(q: Quat) -> (f32, f32, f32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mskp_parses_big_endian_i16_per_frame() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"MSKP");
+        blob.push(b's');
+        blob.push(2);
+        blob.extend_from_slice(&4u16.to_be_bytes());
+        for v in [0i16, 0, -1, -1] {
+            blob.extend_from_slice(&v.to_be_bytes());
+        }
+        assert_eq!(super::parse_mskp(&blob), vec![0, 0, -1, -1]);
+    }
+
     #[test]
     fn shut_parses_big_endian_f32_per_frame() {
         // Flat KLV: "SHUT", type 'f', size 4, repeat 3, payload = 3 × f32 BE.

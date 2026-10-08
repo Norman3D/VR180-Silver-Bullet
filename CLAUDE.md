@@ -498,7 +498,38 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    matter here): VQF 9D estimator, 15 ms pose window, RS factors; the GEOC
    inter-lens extrinsics (ANGX/ANGY/ANGZ) remain unparsed — a static stereo
    alignment question, not shake. Harnesses (gitignored): eac_stab_check
-   gained GOPRO_NO_STAB / GOPRO_RS_T_MS; rider_export uses the new times.
+   gained GOPRO_NO_STAB / GOPRO_RS_T_MS / GOPRO_RS_F; rider_export takes
+   SMOOTH_MS / MAX_CORR / RESP and uses the new times.
+   SECOND PASS (2026-10-08, "set 2 is all 30 fps, look again"): whole-clip
+   whole-eye metric on the user's set-2 exports — slow residual identical
+   for all three (ratio 0.99, r 0.97) but the GoPro carried 3.4× the
+   frame-to-frame jitter (0.238° vs 0.071° rms), pitch-only, random frame
+   to frame. The SHUT fix took it to 0.144°; the rest sat in two seconds
+   (t = 73 and 107) that hold 66 % of the GoPro's remaining jitter energy —
+   both are DROPPED FRAMES: the source video repeats a frame (consecutive
+   diff ≈ 0, both tracks), the telemetry block covering it spans 29 frame
+   periods (0.9676 s, 772 gyro samples), the camera's `MSKP` stream steps
+   −1 at the repeat (`parse_mskp`), SHUT repeats too, and the container
+   hides it (uniform 33.333 ms PTS). `build_imu_sample_times_with_skips`
+   now anchors per frame (sensor frame of video frame i = i + MSKP[i]; the
+   hold is placed AFTER the repeat so the preceding frame maps with slope
+   1), `gopro_frame_sample_times(.., skips)` gives a repeated frame the
+   instant of the frame it copies (its lock residual 2.18° → 0.00°), and
+   the RS ω timeline, GRAV/ACCL/MNOR and the GUI's `GyroAngvel` all take
+   the skips. Also measured and REJECTED: fine phase sweep −4..+4 ms
+   (minimum at 0 on the walking window, flat on the dark one — no missing
+   constant), RS readout ×0.5/×2, factor sign flip, per-axis factors, ×5
+   (RS is live — ×50 moves pixels by 30 levels — but at these rates its
+   effect on the residual is a few %), VQF/GRAV coupling (GRAV drifts
+   slowly, spikes are single-frame), the rig blob in the GoPro's left third
+   (masking it changes nothing). Still open: a ~4° single-frame spike at
+   the peak of a 6 Hz ±160°/s mount oscillation (8000°/s², the clip's
+   worst second, coincident with the drop) that no variant touches, and a
+   residual pitch-only jitter excess of ~1.3× outside the drop seconds —
+   both candidates for an under-strength RS model (readout ×2 and factors
+   ×5 both nudge the burst the right way), left untuned by rule.
+   `VR180_GOPRO_PHASE_MS` remains as the GoPro twin of the DJI diagnostic
+   knob (default 0).
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

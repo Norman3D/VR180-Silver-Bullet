@@ -34,24 +34,37 @@ exposure trim cannot follow that.
   trims (CT / tint / exposure) were applied to the wrong eye; they now
   follow the eye they belong to.
 
-### GoPro .360: stabilization timed to each frame's exposure
+### GoPro .360: stabilization timed to each frame's exposure, and to the frames the camera actually dropped
 
-The GoPro orientation sample is now placed at the centre row's
-mid-exposure — frame start + readout/2 − shutter/2, from the per-frame
-shutter the camera records (the `SHUT` stream) — the same rule the DJI
-and X6 paths use, and the rolling-shutter correction is centred on that
-same instant instead of frame start. In daylight this changes nothing
-(a 1 ms shutter moves the sample by half a millisecond, and the old
-midpoint measured right to within ~1.6 ms); in low light it matters: at a
-1/30 s shutter the pose was sampled 16 ms late, which showed as shake that
-followed the motion. Measured on a dark running section, the locked
-residual drops by 12 % and the motion-correlated part of it disappears.
+Two timing gaps in the GoPro path, found by rigging a GoPro MAX, a DJI
+Osmo 360 and an Insta360 X6 together and stabilizing the same walk and
+run through all three.
 
-Found while comparing a GoPro MAX, a DJI Osmo 360 and an Insta360 X6 on
-one rig: per unit of time the three pipelines leave the same residual on
-the same walk; the GoPro looks worse mainly because it records at 30 fps
-(each frame carries 1.7× the motion of a 50 fps frame) and, in the dark,
-because of this timing term.
+- **Per-frame exposure.** The orientation sample now sits at the centre
+  row's mid-exposure — frame start + readout/2 − shutter/2, from the
+  per-frame shutter the camera records (`SHUT`) — the rule the DJI and X6
+  paths use, and the rolling-shutter correction is centred on that same
+  instant. In daylight nothing changes (a 1 ms shutter moves the sample
+  by half a millisecond; the old midpoint measured right to within
+  ~1.5 ms); in low light it matters: at a 1/30 s shutter the pose was
+  sampled 16 ms late, shake that followed the motion. On a dark running
+  section the locked residual drops 12 % and its motion-correlated part
+  disappears.
+- **Dropped frames.** When the camera's encoder falls behind it drops a
+  sensor frame and repeats the previous image to keep 30 fps; the gyro
+  and the telemetry block timestamps keep running, so that block is one
+  frame period short. The gyro timeline used to be stretched evenly over
+  the block's 30 video frames, mis-timing every frame after the repeat by
+  up to a frame period — a ~0.7 s burst of jerks per drop. The camera
+  marks these in its `MSKP` ("frame skip") stream; the gyro is now
+  re-anchored per frame from it, and a repeated frame receives the pose
+  and RS correction of the image it copies. The test clips had one to two
+  drops each, both under heavy motion.
+
+With both in place the GoPro's frame-to-frame jitter on the 30 fps test
+clip matches the Osmo and X6 second by second; the GoPro still looks
+worse than the 50 fps cameras simply because each 30 fps frame carries
+1.7× the motion.
 
 ## 2.5.1 — 2026-09-25
 
