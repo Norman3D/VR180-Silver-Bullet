@@ -3664,13 +3664,21 @@ impl App {
         };
         let has_out_dir = self.batch_out_dir.is_some();
         let clip_fps = self.clip.as_ref().map(|c| c.fps).unwrap_or(30.0);
+        let is_still = self.clip.as_ref().map(|c| c.source_kind.is_still()).unwrap_or(false);
         let res_label = match self.settings.reframe_aspect_if_active() {
             Some(aspect) => self.export_opts.reframe_size.label(aspect),
+            None if is_still && self.export_opts.resolution == ExportResolution::Native => {
+                let (ew, eh) = self.export_eye_dims();
+                format!("{} × {}", ew * 2, eh)
+            }
             None => self.export_opts.resolution.label().to_string(),
         };
         let h265_mbps = self.export_opts.effective_h265_mbps(
             self.settings.reframe_aspect_if_active(), clip_fps);
-        let fmt_label = format!("{} · {}{}{}",
+        let fmt_label = if is_still {
+            // A still has no codec / bitrate: container + size only.
+            format!("{} · {}", self.export_opts.still_format.label(), res_label)
+        } else { format!("{} · {}{}{}",
             self.export_opts.codec.label(),
             res_label,
             match self.export_opts.codec {
@@ -3680,7 +3688,7 @@ impl App {
             },
             if self.export_opts.beyondvr_hack && self.settings.reframe_aspect_if_active().is_none() {
                 format!(" · BeyondVR {:.0}%", self.export_opts.beyondvr_scale_pct)
-            } else { String::new() });
+            } else { String::new() }) };
         let summary = self.last_batch_summary.as_ref().map(|s| {
             let col = if s.failed > 0 { Color32::from_rgb(230, 160, 90) }
                       else { Color32::from_rgb(120, 200, 120) };
