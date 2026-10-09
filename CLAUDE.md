@@ -3,7 +3,7 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ Status: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
+## ⚡ Status: **Unreleased on `main`: X6 automatic per-frame eye-exposure matching (2026-09-27, item 15) + GoPro per-frame exposure timing from SHUT (2026-10-07, item 16).** 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
 
 VR180 Silver Bullet **2.0** is feature-complete and building/running on both
 **macOS (Apple Silicon)** and **Windows (NVIDIA)**. The Windows GPU-resident
@@ -382,6 +382,246 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    limited-expanded everywhere. Do NOT “fix” one side alone: whether GoPro's
    `pc` tag is truthful (a known GoPro quirk) needs a deliberate cross-platform
    decision with both boxes comparing against a reference.
+
+15. **Automatic per-frame eye-exposure matching for the X6 (2026-09-27) —
+   SHARED code, on `main`, unreleased.** Why: the X6's two sensors auto-expose
+   independently (shutter AND gain — trailer record 0x0009 is the right
+   sensor's AE log, the left gain is recorded nowhere), and the difference is
+   real in the image: measured after the LUT in linear light, the eyes sat up
+   to ~0.9 stops apart for ~20 s on a real post-mod clip (regression of
+   brightness-vs-shutter ratio: slope 0.5–0.8, r 0.87–0.99). The static
+   Matching Eyes trim cannot follow that. WHAT: three new compute passes in
+   `gpu.rs` + `shaders/eye_match_{hist,reduce}.wgsl`, `eye_offset_apply.wgsl`
+   — per-eye 1024-bin luma histogram of the central quarter of each PROJECTED
+   eye texture (one kernel for every path; workgroup-shared atomics — the
+   first `atomic<u32>`/`var<workgroup>` in the codebase, core WGSL, no
+   feature), a one-thread reduce (both eyes' clipped tails cut by RANK
+   jointly — I-Log black 0.091 → lo 0.12, white wall 0.835 → hi 0.80 — then
+   the mean shift of 5 quantiles across the remaining rank range → smoothed
+   per-eye ADDITIVE code offsets in a GPU buffer, `EyeMatchState`; snap on
+   |Δ| > 0.008 code, EMA α 0.3 below; min 4096 unclipped samples; reset on
+   seek; `reason` tells the UI why a frame was not measured), and an apply pass as STAGE 0 of the colour stack
+   (an exposure gain on log footage — additive, NOT the multiplicative CDL
+   gain the static trim uses). No readback in the frame loop; the GUI readout
+   uses a 3-deep async MAP_READ ring (`EyeMatchReadback`, never polls — Lesson
+   #1). API: `ColorStackPlan.auto_eye_match: Option<EyeMatchMode>`,
+   `Device::apply_color_stack_pair_16` (both eyes, ONE submit — the 16-bit
+   stack was refactored into `record_color_stack_16`; `apply_color_stack_
+   per_eye_16` is now a wrapper and bit-identical when the flag is off),
+   `apply_color_stack_to_sbs_bgra_matched`, `match_eyes_8` (CPU-fallback arm),
+   `create_eye_match_state`. Plumbing: `Settings.auto_eye_match/_mode`
+   (serde default) → `build_color_stack`; preview funnel
+   `compose_with_color_and_mode` gained an `eye_match` arg (fisheye arms pass
+   `eye_match_arg(state, kind, stab_idx, enabled)`, EAC arms `None`; the single-eye
+   RIGHT view now swaps AFTER grading — the per-eye trims used to land on the
+   wrong eye there); export arms use the pair API with a per-stream state;
+   `build_export_cfg` and `eye_match_arg` gate to `Insta360Insv`, so the
+   persisted flag is inert for OSV/GoPro. UI: checkbox + reference combo
+   (meet in the middle / to left / to right) + EV readout (÷ 0.067 code/stop)
+   in the Colour panel's Matching Eyes block, X6 only. **Edited blind for
+   Windows:** the pair-API swaps in `export_fisheye_osv_zerocopy_d3d11` and
+   `export_fisheye_osv_gpu_resident` and the state creation in
+   `run_fisheye_zerocopy` (pure Rust, same shape as the macOS arm; no cfg
+   gates touched — `EyeMatchFrame` import is ungated). Verified: gitignored
+   `examples/eye_match_check.rs` (synthetic eyes, 20 checks incl. modes,
+   snap/EMA/reset, black-eye rejection, 8-bit helper — ALL PASS); real clip
+   036 via `reframe_check` + `EYE_MATCH=avg|left`: the shaded segment went
+   from L/R −0.44 stops (off) to +0.01 mean / ±0.06 max (on), the equal-shutter
+   control segment −0.017 → −0.004, match-to-left leaves the left eye at
+   +0.0000 stops vs off; `cargo test -p vr180-pipeline` 45/45. The user
+   ran the GUI on real footage (preview + export work; app control for an
+   automated check was declined). ADVERSARIAL REVIEW (6 finders, 1-vote
+   verify) found one real defect, fixed: the valid-luma gate was on a
+   linear scale while the histogram sees I-Log CODES (black 0.091, white
+   wall 0.835 — measured), so clipped sky was never excluded and a per-eye
+   value gate truncates the brighter eye more → shift biased toward 0. Now
+   `EyeMatchTuning::insta360_ilog()` (lo 0.12 / hi 0.80, the default since
+   only the X6 is enabled) and the reduce cuts both tails by RANK jointly
+   (max clipped fraction over both eyes + 0.03 margin) and averages 5
+   quantiles across the valid rank range — harness cases with 20–32 % of
+   one eye on the white wall and I-Log-black padding recover the shift to
+   ±0.0001. Also from the review: same frame index = re-render, not a seek
+   (`frame_for_index`), `EyeMatchState::clear()` while the passes are off so
+   re-enabling starts fresh, readback ring collected oldest→newest, the
+   paused loops collect the readout each tick, the still allocates a state
+   only when it can use it (the still applies the raw per-frame difference,
+   the live preview its smoothing — ≤ snap apart), and the export's colour
+   panel says "applied per frame" instead of "measuring" (the export stops
+   the preview, which is the only readout source). SECOND PASS (3 finders):
+   the tail counts are half-open (`count_bins(eye, start, end)`) — WGSL
+   `select` evaluates both arms, so the old `count_range(…, lo_b - 1u)` would
+   have spun 2^32 iterations for a tuning with lo = 0 (latent; the CPU side
+   now clamps lo/hi too); the readout ring is generation-tagged and returns
+   only values that landed in the call (no stale flash after re-enable), the
+   walk stops at the first in-flight slot; the panel keys on `decoder_alive`
+   (an exited worker used to leave "Measuring…"), and a frame the reduce
+   cannot use (mostly sky / black) says so via `EyeMatchReadout::reason`.
+   Known/accepted: the Windows arms are unverified here; the export does
+   not publish a readout; Play stays enabled during an export.
+
+16. **GoPro stabilization investigation + per-frame exposure timing
+   (2026-10-07) — SHARED code, on `main`, unreleased.** The user rigged a
+   GoPro MAX (.360, 30 fps), an Osmo 360 and an X6 (both 50 fps in set 1,
+   ~30 fps in set 2) together and shot the same walk/run; the GoPro looked
+   clearly worse. MEASURED (scratchpad `stab/`: resid.py centre-crop phase
+   correlation, eye_rot.py whole-eye sphere fit of DIS flow, sweep_eval.py /
+   timing_fit.py on camera-lock harness exports, cameras aligned by audio
+   envelope): (a) on the user's soft-stab exports the residual per SECOND of
+   video is the same for all three (set 1: 1.7 / 1.8 / 1.9 deg/s; set 2 the
+   GoPro is ~1.4× by the centre metric) — the GoPro's per-frame residual is
+   1.6× because it is 30 fps; (b) under camera LOCK on the walking window the
+   GoPro leaves 0.20°/frame vs the X6's 0.056°, but that excess is
+   NOT the pipeline: phase ±4/±8 ms, a 1 ms point sample instead of the
+   15 ms box, VQF 6D / τ=100 s / fixed bias / plain integration, RS window
+   centre and RS off all leave it at 0.20–0.22°; the raw (unstabilized)
+   frames follow the pipeline's own rotation increments as well as the X6's
+   do (R² 0.88 both), the residual-vs-Δω regression puts the GoPro timing
+   error at 1.6 ms (the method recovers deliberate ±8 ms shifts as 7–8.5 ms),
+   and the residual field is the forward-walk parallax pattern (the GoPro
+   sits lower on the rig and its frames are 33 ms apart); (c) in the DARK
+   (set 2 end: 1/30 s shutter) the GoPro residual improves monotonically as
+   the pose is moved earlier (0.613 → 0.548 @ −8 ms → 0.542 @ −16.5 ms;
+   +16.5 ms → 0.764) and the Δω-correlated component vanishes — the missing
+   `−shutter/2` term. GoPro CORI on these clips is a constant (bias drift
+   0.2°/s): no in-camera stabilization, so the VQF path is used. WHAT
+   CHANGED: `vr180_core::gyro::parse_shut` (per-frame SHUT, type `f`),
+   `resample_quats_at_times` + `gopro_frame_sample_times(fps, n, shutter,
+   readout)` = `i/fps + readout/2 − shutter_i/2` (fallback to the readout
+   midpoint per frame when SHUT is absent/implausible); `imu.rs`
+   `vqf_cori_equivalent_stream(_multi)` sample there (`PreparedImu.shutter_s`,
+   `gopro_shutter_per_frame(segments, fps)` for chains); decoder.rs RS ω
+   window centred on the same instant (was frame start, a Python-parity
+   choice — now DJI parity, `t_mid`). Verified: core 53 / pipeline 45 tests
+   (new: SHUT parse, sample times, at-times resampler parity); dark lock
+   export 0.613 → 0.542°/frame (= the −16.5 ms probe), Δω-only R² 0.060 →
+   0.004; daylight 0.202 → 0.199 (unchanged). Not changed (measured not to
+   matter here): VQF 9D estimator, 15 ms pose window, RS factors; the GEOC
+   inter-lens extrinsics (ANGX/ANGY/ANGZ) remain unparsed — a static stereo
+   alignment question, not shake. Harnesses (gitignored): eac_stab_check
+   gained GOPRO_NO_STAB / GOPRO_RS_T_MS / GOPRO_RS_F; rider_export takes
+   SMOOTH_MS / MAX_CORR / RESP and uses the new times.
+   SECOND PASS (2026-10-08, "set 2 is all 30 fps, look again"): whole-clip
+   whole-eye metric on the user's set-2 exports — slow residual identical
+   for all three (ratio 0.99, r 0.97) but the GoPro carried 3.4× the
+   frame-to-frame jitter (0.238° vs 0.071° rms), pitch-only, random frame
+   to frame. The SHUT fix took it to 0.144°; the rest sat in two seconds
+   (t = 73 and 107) that hold 66 % of the GoPro's remaining jitter energy —
+   both are DROPPED FRAMES: the source video repeats a frame (consecutive
+   diff ≈ 0, both tracks), the telemetry block covering it spans 29 frame
+   periods (0.9676 s, 772 gyro samples), the camera's `MSKP` stream steps
+   −1 at the repeat (`parse_mskp`), SHUT repeats too, and the container
+   hides it (uniform 33.333 ms PTS). `build_imu_sample_times_with_skips`
+   now anchors per frame (sensor frame of video frame i = i + MSKP[i]; the
+   hold is placed AFTER the repeat so the preceding frame maps with slope
+   1), `gopro_frame_sample_times(.., skips)` gives a repeated frame the
+   instant of the frame it copies (its lock residual 2.18° → 0.00°), and
+   the RS ω timeline, GRAV/ACCL/MNOR and the GUI's `GyroAngvel` all take
+   the skips. Also measured and REJECTED: fine phase sweep −4..+4 ms
+   (minimum at 0 on the walking window, flat on the dark one — no missing
+   constant), RS readout ×0.5/×2, factor sign flip, per-axis factors, ×5
+   (RS is live — ×50 moves pixels by 30 levels — but at these rates its
+   effect on the residual is a few %), VQF/GRAV coupling (GRAV drifts
+   slowly, spikes are single-frame), the rig blob in the GoPro's left third
+   (masking it changes nothing). Still open: a ~4° single-frame spike at
+   the peak of a 6 Hz ±160°/s mount oscillation (8000°/s², the clip's
+   worst second, coincident with the drop) that no variant touches, and a
+   residual pitch-only jitter excess of ~1.3× outside the drop seconds —
+   both candidates for an under-strength RS model (readout ×2 and factors
+   ×5 both nudge the burst the right way), left untuned by rule.
+   `VR180_GOPRO_PHASE_MS` remains as the GoPro twin of the DJI diagnostic
+   knob (default 0).
+   OPEN after the 2026-10-09 pre-push review: (a) a dropped frame that is the
+   FIRST frame of a telemetry block charges the shortened span to the
+   previous block (`real = n + skip(f1) − skip(f0)`); which block the
+   firmware stamps short is unverified — needs a clip with a boundary drop;
+   (b) `gopro_shutter_per_frame`/`gopro_skips_per_frame` re-extract each
+   chapter's GPMF uncached on every multi-chapter stab rebuild in the GUI
+   (slow on SMB) — should take the cached blobs; (c) the headless
+   `vr180-render` CLI still centres its RS window on frame start with no
+   MSKP/SHUT (it has pre-existing compile errors from wgpu drift anyway).
+   THIRD PASS (2026-10-08, "the mount is fine — look carefully at RS"):
+   the RS term was MEASURED for the first time (scratchpad `stab/rs_probe*.py`:
+   GOPRO_NO_STAB exports with RS off / on / ×2 / −1, DIS flow → Kabsch →
+   9-parameter fit of the residual on the row-time and column-time RS
+   bases → slope vs the gyro's Δω at the frame instants). Sign RIGHT (the
+   derivation: the shader's Y↔Z swap is improper, so `r + (w×r)·Δt` with
+   the raw gyro IS the physical correction — and the old memory claim
+   "CORI integrates −GYRO" is false in this code's conventions: CORI
+   increments vs ∫gyro slope +0.994); axis RIGHT (rows vertical, top row
+   first, T_cols ≈ 0); BOTH EYES identical (L/R slopes agree to 0.1 ms;
+   GEOC ANGY = 180.26°, ANGX/ANGZ < 1°: the back lens is a pure yaw of the
+   front, same sensor "up"); magnitude: each unit of factor removes
+   15.3 ± 0.5 ms (= the file's SROT 15.224 within 1 %). The UNCORRECTED
+   readout read 17.2 ms over the full field but 15.6 ± 0.5 in the far
+   field (sky/façades) and 13.7 on the near ground — walking parallax
+   correlates with pitch acceleration and biases the absolute number; an
+   independent skew fit on the raw EAC faces gave 17.7–18.3 (same bias).
+   Three principled changes landed, none moves the lock residual
+   measurably (walking 0.197→0.197, dark 0.541→0.549, burst 0.775→0.753 —
+   noise): the readout now comes from the file's `SROT`
+   (`vr180_pipeline::imu::gopro_readout_s`, fallback `SROT_S`; GUI seeds
+   `rs_readout_ms` from it per clip, the VQF pose instant uses the same
+   value); the shader's row estimate uses the camera-frame ray
+   (`xr,yr,zr`) instead of the pre-rotation output ray in both EAC shaders;
+   `GyroAngvel::groups_at` returns the MEAN rate over [t_ref, t_row]
+   (running trapezoid integral, `from_parts` for merged chapters) so the
+   per-row term is the integrated angle. CALM-SEGMENT CHECK (rotation
+   without walking: 243 @ 0–8 s and 78–88 s, 244 @ 2–6 s and 96.5–99.5 s;
+   the elevator segment 244 @ 112–117 s has no far field and was dropped):
+   far-field uncorrected readout **15.60 ± 0.20 ms**, each unit of factor
+   removes 14.81 ± 0.21, residual after the 15.224 ms correction
+   **+0.78 ± 0.15 ms** (the correction nulls at an effective 16.0 ± 0.2 ms) → the true
+   readout is 3–5 % above the file's SROT, an 0.08° edge-to-edge error at
+   100 °/s — real but not visible, and by rule left to the file (a
+   per-camera readout self-calibration from footage would be the
+   file-derived way to close it). T_cols ≈ 0 (rows-only model holds).
+   The 1.07 yaw scale was near-field lever-arm parallax: far-field-only
+   Kabsch gives 1.01–1.02 for yaw and 0.99–1.01 for pitch/roll. By-product:
+   the fitted gyro clock offset drops by one frame between the calm
+   segments on either side of a dropped frame (243: −33.4 ms exactly;
+   244 across the 73.2 s drop: −36 ± 3 ms) and the correction nulls on
+   both far sides — the MSKP re-anchoring verified independently (244's
+   second drop at 107.6 s is followed only by the unusable elevator
+   segment, so it is unverified).
+
+17. **Osmo 360 "sometimes a roll residue, X6 almost perfect" (2026-10-09) —
+   investigation, diagnostic knob only, nothing user-visible changed.**
+   Same rig clips as item 16 (set 2: Osmo 0017 / X6 059 / GoPro 244; audio
+   offsets t_osmo = t_x6 + 3.332 = t_gopro + 1.016). MEASURED EQUAL between
+   Osmo and X6 — so ruled out: per-frame roll jitter of the real exports
+   (0.307 vs 0.304°/frame), the orientation inputs at the frame level
+   (0.03°/frame roll after sub-frame alignment), the shared smoother's
+   correction at identical settings (same to 0.1°), the table-predicted
+   output motion at identical settings (0.98–1.05× per band, corr ≥ 0.993),
+   inter-eye roll of the real exports (0.2–0.4° mean, all three cameras),
+   static horizon tilt. MEASURED DIFFERENT: registering the real soft-stab
+   exports to each other once per second (scratchpad `stab/cross_cam.py`,
+   far-field DIS→Kabsch) puts the Osmo horizon within ±0.3° of the GoPro's
+   except ONE Osmo-only transient at the first big turn (GoPro clock
+   29–32 s, correction yaw +27°): a rise over ~2 s to a +1.5° peak held
+   ~0.5 s, back to 0 (0.1 s zoom; the X6 stays <0.5° there; a second
+   candidate at 62 s is ≤0.45° = noise); the X6 wanders ±1° slowly against
+   both. Set 1 (0016/058/243): all three horizons agree to ±0.3° (roll std
+   0.12°, p95 0.23–0.28°) for the whole clip — no Osmo event at all. Hand-eye comparison of the lock tables
+   (data-audit agent): the Osmo's in-camera fused estimate shifts its tilt
+   by 1–4° at each ~90° heading turn and holds it between turns (frame-
+   invariant tilt-change magnitude up to 9° late in the clip); the X6's
+   gyro-only integration (100 s trim) does not. In soft-stab a slow
+   world-frame error cancels — actual and anchor carry it — leaving only the
+   smoother-lag transient of each step (≈1–1.5° for ~τ at each turn): that
+   is the roll residue. Not fixable from the file for the Osmo 360 I (no raw
+   gyro; `[2.10]` is a 30 Hz accelerometer, gait-aliased; the dead
+   `horizon_lock_quat`/`smooth_gravity_ema` would make it worse); the 360 II
+   writes `[3.3.5]` 1 kHz gyro+gravity, where the X6 treatment would apply.
+   Code: `dji_imu::apply_lock_ref_diag` + `VR180_LOCK_REF_FRAME=<k0>`
+   (fisheye_export, both arms) re-anchors a camera-lock export to frame k0 —
+   a lock anchored at frame 0 points wherever the camera pointed at record
+   start. MEASUREMENT TRAPS (see the memory note): `acos((trace−1)/2)` on
+   f32 tables floors steps <0.03° to exactly 0 (fake "frozen" output — use
+   the antisymmetric part); body-frame rotation-vector "disagreement"
+   between two cameras mixes heading disagreement into roll/pitch (fake
+   multi-degree roll — use image registration or frame-invariant
+   magnitudes); walking-scene lock residuals are parallax-dominated.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

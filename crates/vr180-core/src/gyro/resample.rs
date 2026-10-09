@@ -200,6 +200,28 @@ pub fn build_imu_sample_times(
     fps: f32,
     fallback_duration_s: f32,
 ) -> Vec<f32> {
+    build_imu_sample_times_with_skips(imu_blocks, cori_stmps, None, fps, fallback_duration_s)
+}
+
+/// [`build_imu_sample_times`] that honours the camera's dropped frames.
+///
+/// `frame_skips` is the per-video-frame cumulative drop count from the
+/// MSKP stream ([`super::cori_iori::parse_mskp`]): video frame `i` shows
+/// sensor frame `i + skips[i]`. Where the camera dropped a sensor frame and
+/// repeated the previous image, the telemetry block is one frame period
+/// SHORT while the video still has 30 frames; spreading the block's gyro
+/// uniformly over those 30 frames (the plain anchors) mis-times every
+/// frame after the repeat by up to a frame period — one frame of walking
+/// motion applied to the wrong image, a ~0.7 s burst of jerks. With the
+/// skips the anchors are per frame: real frames keep the sensor period,
+/// a repeated frame holds the previous sensor instant.
+pub fn build_imu_sample_times_with_skips(
+    imu_blocks: &[super::raw::ImuBlock],
+    cori_stmps: &[super::cori_iori::CoriBlockStmp],
+    frame_skips: Option<&[i32]>,
+    fps: f32,
+    fallback_duration_s: f32,
+) -> Vec<f32> {
     let total_samples: usize = imu_blocks.iter().map(|b| b.samples.len()).sum();
     if total_samples == 0 {
         return Vec::new();
@@ -225,23 +247,60 @@ pub fn build_imu_sample_times(
     // "end of last block" anchor so samples past the last CORI block
     // don't clamp to a flat value.
     let cori_start_us = cori_stmps[0].stmp_us;
-    let mut anchor_stmp_s: Vec<f32> = Vec::with_capacity(cori_stmps.len() + 1);
-    let mut anchor_frame_s: Vec<f32> = Vec::with_capacity(cori_stmps.len() + 1);
+    // Usable skip table: cumulative, non-positive, non-increasing. Anything
+    // else is ignored (plain block anchors).
+    let skips: Option<&[i32]> = frame_skips.filter(|sk| usable_skip_table(sk));
+    let skip_at = |i: u32| -> i64 {
+        match skips {
+            Some(sk) => sk.get(i as usize).or(sk.last()).copied().unwrap_or(0) as i64,
+            None => 0,
+        }
+    };
+    // Per-frame anchors: (sensor time of the frame's capture, video time i/fps).
+    let n_video: u32 = cori_stmps.iter().map(|c| c.n_samples).sum();
+    let mut anchor_stmp_s: Vec<f32> = Vec::with_capacity(n_video as usize + 1);
+    let mut anchor_frame_s: Vec<f32> = Vec::with_capacity(n_video as usize + 1);
     let mut cumulative_frames: u32 = 0;
-    for c in cori_stmps {
+    let mut prev_period: Option<f64> = None;
+    let mut last_t = f64::NEG_INFINITY;
+    for (k, c) in cori_stmps.iter().enumerate() {
         let stmp_s = (c.stmp_us.saturating_sub(cori_start_us)) as f64 / 1e6;
-        let frame_s = cumulative_frames as f64 / fps as f64;
-        anchor_stmp_s.push(stmp_s as f32);
-        anchor_frame_s.push(frame_s as f32);
-        cumulative_frames += c.n_samples;
+        let f0 = cumulative_frames;
+        let f1 = f0 + c.n_samples;
+        // Sensor frames actually captured in this block = video frames + drops.
+        let real = (c.n_samples as i64 + skip_at(f1) - skip_at(f0)).max(1) as f64;
+        let period = if k + 1 < cori_stmps.len() {
+            let next = (cori_stmps[k + 1].stmp_us.saturating_sub(cori_start_us)) as f64 / 1e6;
+            let p = (next - stmp_s) / real;
+            if p > 0.0 { p } else { prev_period.unwrap_or(1.0 / fps as f64) }
+        } else {
+            prev_period.unwrap_or(1.0 / fps as f64)
+        };
+        prev_period = Some(period);
+        for i in f0..f1 {
+            // The skip count of the PREVIOUS frame: a repeated video frame
+            // keeps the sensor period (so the frame before it maps with
+            // slope 1 over its whole exposure), and the frame after it
+            // starts the hold. The repeated frame itself takes its sample
+            // instant from the frame it copies (`gopro_frame_sample_times`).
+            let sensor_idx = (i as i64 - f0 as i64) + skip_at(i.saturating_sub(1).max(f0)) - skip_at(f0);
+            let mut t = stmp_s + sensor_idx as f64 * period;
+            // A repeated frame shares its sensor instant with the previous
+            // video frame; keep the table strictly increasing (1 µs step) so
+            // the interpolation stays well defined.
+            if t <= last_t { t = last_t + 1e-6; }
+            last_t = t;
+            anchor_stmp_s.push(t as f32);
+            anchor_frame_s.push((i as f64 / fps as f64) as f32);
+        }
+        cumulative_frames = f1;
     }
-    // End-of-last-block anchor.
-    if let Some(last) = cori_stmps.last() {
-        let end_stmp_s = (last.stmp_us.saturating_sub(cori_start_us)) as f64 / 1e6
-            + last.n_samples as f64 / fps as f64;
-        let end_frame_s = cumulative_frames as f64 / fps as f64;
-        anchor_stmp_s.push(end_stmp_s as f32);
-        anchor_frame_s.push(end_frame_s as f32);
+    // End-of-last-frame anchor (one more period).
+    if let Some(p) = prev_period {
+        let mut t = last_t + p;
+        if t <= last_t { t = last_t + 1e-6; }
+        anchor_stmp_s.push(t as f32);
+        anchor_frame_s.push((cumulative_frames as f64 / fps as f64) as f32);
     }
 
     // Per-sample STMP-space times, then mapped through the anchors.
@@ -302,15 +361,88 @@ pub fn resample_quats_to_frames_timed(
         aligned.push(q);
     }
 
-    let mut out = Vec::with_capacity(n_frames);
-    for i in 0..n_frames {
-        let t = i as f32 * dt_dst + time_offset_s;
+    let times: Vec<f32> = (0..n_frames).map(|i| i as f32 * dt_dst + time_offset_s).collect();
+    resample_at_times_aligned(&aligned, src_times, &times, window_s)
+}
+
+/// [`resample_quats_to_frames_timed`] at arbitrary instants: one output
+/// per entry of `times` (seconds on the same clock as `src_times`), each
+/// the window average (or linear sample when `window_s <= 0`) of the
+/// stream around that instant. Lets a caller place every frame's sample at
+/// its own mid-exposure (see [`gopro_frame_sample_times`]).
+pub fn resample_quats_at_times(
+    src_times: &[f32],
+    src_quats: &[Quat],
+    times: &[f32],
+    window_s: f32,
+) -> Vec<Quat> {
+    assert_eq!(src_times.len(), src_quats.len(),
+        "src_times and src_quats must have the same length");
+    if src_quats.is_empty() || times.is_empty() {
+        return Vec::new();
+    }
+    let mut aligned: Vec<Quat> = Vec::with_capacity(src_quats.len());
+    aligned.push(src_quats[0]);
+    for j in 1..src_quats.len() {
+        let mut q = src_quats[j];
+        if q.dot(aligned[j - 1]) < 0.0 {
+            q = Quat { w: -q.w, x: -q.x, y: -q.y, z: -q.z };
+        }
+        aligned.push(q);
+    }
+    resample_at_times_aligned(&aligned, src_times, times, window_s)
+}
+
+fn resample_at_times_aligned(aligned: &[Quat], src_times: &[f32], times: &[f32], window_s: f32) -> Vec<Quat> {
+    let mut out = Vec::with_capacity(times.len());
+    for &t in times {
         let q = if window_s <= 0.0 {
-            sample_linear_timed(&aligned, src_times, t)
+            sample_linear_timed(aligned, src_times, t)
         } else {
-            sample_window_average_timed(&aligned, src_times, t, window_s)
+            sample_window_average_timed(aligned, src_times, t, window_s)
         };
         out.push(q.normalize());
+    }
+    out
+}
+
+/// Pose sample instant for each GoPro video frame: the centre row's
+/// MID-EXPOSURE, `i/fps + readout/2 − shutter_i/2` — the same rule the
+/// DJI (`video_ts + readout/2 − shutter/2`) and X6 paths use. `shutter_s`
+/// is the per-frame exposure from the SHUT stream ([`crate::gyro::parse_shut`]);
+/// a missing or implausible value (≤ 0, longer than the frame period)
+/// falls back to the readout midpoint for that frame. Measured on real
+/// walking/running footage: in daylight (1 ms shutter) the readout
+/// midpoint is right to ~1.6 ms; at a 1/30 s shutter ignoring the term
+/// leaves a ~16 ms pose error that shows as shake tracking the motion.
+///
+/// `frame_skips` (MSKP, see [`build_imu_sample_times_with_skips`]): a video
+/// frame that repeats the previous image gets the previous frame's instant,
+/// so it receives the same pose and RS correction as the image it copies.
+/// A usable MSKP table: cumulative, non-positive, non-increasing. Both
+/// consumers (the gyro timeline and the frame sample times) apply this
+/// same test so a malformed table is ignored by both, never by one.
+pub fn usable_skip_table(sk: &[i32]) -> bool {
+    !sk.is_empty() && sk[0] <= 0 && sk.windows(2).all(|w| w[1] <= w[0])
+}
+
+pub fn gopro_frame_sample_times(fps: f32, n_frames: usize, shutter_s: &[f32], readout_s: f32, frame_skips: Option<&[i32]>) -> Vec<f32> {
+    let dt = 1.0 / fps.max(1e-6);
+    let frame_skips = frame_skips.filter(|sk| usable_skip_table(sk));
+    let mut out: Vec<f32> = Vec::with_capacity(n_frames);
+    for i in 0..n_frames {
+        let repeat = i > 0 && frame_skips.map_or(false, |sk| {
+            matches!((sk.get(i), sk.get(i - 1)), (Some(a), Some(b)) if a < b)
+        });
+        if repeat {
+            out.push(out[i - 1]);
+            continue;
+        }
+        let base = i as f32 * dt + readout_s * 0.5;
+        out.push(match shutter_s.get(i) {
+            Some(&s) if s.is_finite() && s > 0.0 && s <= dt * 1.0001 => base - s * 0.5,
+            _ => base,
+        });
     }
     out
 }
@@ -399,6 +531,74 @@ pub fn cori_swap_yz(q: Quat) -> Quat {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dropped_frame_holds_the_sensor_instant() {
+        use super::super::raw::ImuBlock;
+        use super::super::cori_iori::CoriBlockStmp;
+        // 30 fps-like clip with a 10 ms frame period for round numbers:
+        // block 0 = video frames 0..3 (frame 1 repeats frame 0 → 2 real
+        // frames, block spans 2 periods), block 1 = frames 3..6 (3 real).
+        let period_us = 10_000u64;
+        let stmps = vec![
+            CoriBlockStmp { stmp_us: 1_000_000, n_samples: 3 },
+            CoriBlockStmp { stmp_us: 1_000_000 + 2 * period_us, n_samples: 3 },
+        ];
+        let skips = [0, -1, -1, -1, -1, -1];
+        // Gyro: block A = 10 samples spread over the 50 ms to block B's
+        // stamp (5 ms apart, sensor time j*5 ms), block B = 1 sample.
+        let gyro = vec![
+            ImuBlock { stmp_us: Some(1_000_000), scal: 1.0, samples: vec![[0.0; 3]; 10] },
+            ImuBlock { stmp_us: Some(1_050_000), scal: 1.0, samples: vec![[0.0; 3]; 1] },
+        ];
+        let fps = 100.0; // frame period 10 ms in VIDEO time
+        let t = super::build_imu_sample_times_with_skips(&gyro, &stmps, Some(&skips), fps, 0.05);
+        let video_of = |sensor_ms: f64| -> f32 {
+            let j = (sensor_ms / 5.0).round() as usize; t[j]
+        };
+        // sensor 0..10 ms (frame 0's period) maps with slope 1 onto video
+        // frame 0; the hold sits AFTER the repeated frame 1, so sensor
+        // 15 ms (half-way through sensor frame 1, shown by video frame 2)
+        // lands at 25 ms video time, and sensor 20 ms (= video frame 3,
+        // block 1 start) at 30 ms.
+        assert!((video_of(0.0) - 0.0).abs() < 1e-4);
+        assert!((video_of(5.0) - 0.005).abs() < 1e-4, "slope 1 before the repeat, got {}", video_of(5.0));
+        assert!((video_of(15.0) - 0.025).abs() < 1e-4, "sensor frame 1 half-way → video frame 2.5, got {}", video_of(15.0));
+        assert!((video_of(20.0) - 0.030).abs() < 1e-4, "got {}", video_of(20.0));
+        // The repeated frame samples at the instant of the frame it copies.
+        let ts = super::gopro_frame_sample_times(fps, 4, &[], 0.0, Some(&skips));
+        assert!(ts[1] == ts[0] && ts[2] > ts[1] && ts[3] > ts[2]);
+        // Without skips the same block is stretched: sensor 20 ms ↔ video 30 ms still
+        // (block anchor), but sensor 10 ms lands at 15 ms (uniform spread) — the bug.
+        let t0 = super::build_imu_sample_times_with_skips(&gyro, &stmps, None, fps, 0.05);
+        assert!((t0[2] - 0.015).abs() < 1e-4, "plain anchors spread the block uniformly: {}", t0[2]);
+    }
+
+    #[test]
+    fn gopro_sample_times_are_mid_exposure() {
+        let t = super::gopro_frame_sample_times(30.0, 4, &[0.001, 1.0 / 30.0, 0.0, f32::NAN], 0.015224, None);
+        let dt = 1.0 / 30.0;
+        assert!((t[0] - (0.0 + 0.007612 - 0.0005)).abs() < 1e-6, "short shutter: readout mid − shutter/2");
+        assert!((t[1] - (dt + 0.007612 - dt / 2.0)).abs() < 1e-6, "full-frame shutter: 16.7 ms earlier");
+        assert!((t[2] - (2.0 * dt + 0.007612)).abs() < 1e-6, "zero shutter → readout midpoint");
+        assert!((t[3] - (3.0 * dt + 0.007612)).abs() < 1e-6, "NaN shutter → readout midpoint");
+        // No SHUT at all → the classic readout-midpoint convention for every frame.
+        let t0 = super::gopro_frame_sample_times(30.0, 2, &[], 0.015224, None);
+        assert!((t0[1] - (dt + 0.007612)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resample_at_times_matches_frame_resampler() {
+        use super::*;
+        let src_times: Vec<f32> = (0..100).map(|i| i as f32 * 0.00125).collect();
+        let src: Vec<Quat> = src_times.iter().map(|&t| Quat { w: (t * 1.0).cos(), x: 0.0, y: (t * 1.0).sin(), z: 0.0 }).collect();
+        let a = resample_quats_to_frames_timed(&src_times, &src, 30.0, 3, 0.007612, 0.015224);
+        let times: Vec<f32> = (0..3).map(|i| i as f32 / 30.0 + 0.007612).collect();
+        let b = resample_quats_at_times(&src_times, &src, &times, 0.015224);
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x.w - y.w).abs() < 1e-6 && (x.x - y.x).abs() < 1e-6 && (x.y - y.y).abs() < 1e-6 && (x.z - y.z).abs() < 1e-6);
+        }
+    }
+
     use super::*;
 
     fn q(w: f32, x: f32, y: f32, z: f32) -> Quat { Quat { w, x, y, z } }

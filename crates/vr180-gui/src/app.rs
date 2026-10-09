@@ -759,6 +759,18 @@ fn tr(en: &'static str) -> &'static str {
         "Eye Tint (±)" => "双目色调 (±)",
         "Eye Exposure (±EV)" => "双目曝光 (±EV)",
         "Reset matching" => "重置匹配",
+        "Auto-match eye exposure (per frame)" => "逐帧自动匹配双目曝光",
+        "The X6's two sensors auto-expose independently; this measures the brightness difference between the eyes every frame and cancels it before the LUT."
+            => "X6 的两个传感器独立自动曝光；此功能逐帧测量两眼亮度差，并在套用 LUT 之前抵消。",
+        "Reference" => "基准",
+        "Meet in the middle" => "两眼折中",
+        "Match to left eye" => "以左眼为准",
+        "Match to right eye" => "以右眼为准",
+        "Measured L−R" => "实测 左−右",
+        "applied" => "已施加",
+        "Measuring…" => "测量中…",
+        "Applied per frame — the live readout shows while previewing." => "逐帧施加中——实测值在预览时显示。",
+        "No usable content in the frame (clipped or too dark) — no correction applied." => "画面中没有可用内容（过曝或过暗）——未施加校正。",
         "Browse…" => "浏览…",
         "Clear" => "清除",
         "Use built-in Osmo 360 D-LogM→709" => "使用内置 Osmo 360 D-LogM→709",
@@ -1474,6 +1486,11 @@ impl App {
             eye_h = side;
         }
         let mut color_stack = settings.build_color_stack();
+        // Automatic eye-exposure matching is an X6 feature (independent
+        // per-sensor AE); never let the persisted flag leak onto other sources.
+        if !matches!(source_kind, vr180_pipeline::SourceKind::Insta360Insv) {
+            color_stack.auto_eye_match = None;
+        }
         // "BeyondVR Hack" — final-stage per-eye scale. Half-equirect SBS
         // output only; the preview plan (built separately) never sets it.
         if opts.beyondvr_hack
@@ -2092,7 +2109,7 @@ impl App {
                 // no-firmware RS from the GoPro CORI stream (the toggle still
                 // overrides). Non-EAC sources fall back to the default.
                 settings.rs_mode = crate::decoder::detect_rs_mode_for_path(&path, source_kind);
-                settings.rs_readout_ms = crate::decoder::default_rs_readout_ms();
+                settings.rs_readout_ms = crate::decoder::detect_rs_readout_ms_for_path(&path, source_kind);
                 // OSMO 360 II ("Osmo OQ002"): streams arrive eye-swapped
                 // relative to the I after the VR180 mod — seed the swap
                 // (the toggle still overrides per clip).
@@ -3070,7 +3087,12 @@ impl App {
         // and gen isn't bumped on frame 0.
         if !meta.preserve_clip_settings {
             self.settings.rs_mode = meta.detected_rs_mode;
-            self.settings.rs_readout_ms = crate::decoder::default_rs_readout_ms();
+            // Readout from the file's SROT (the loader already found it);
+            // the constant is only the no-SROT fallback.
+            self.settings.rs_readout_ms = match meta.srot_ms {
+                Some(ms) if ms > 0.5 && ms < 100.0 => ms,
+                _ => crate::decoder::default_rs_readout_ms(),
+            };
         }
         self.last_pushed_settings = self.settings.clone();
 
@@ -3206,6 +3228,7 @@ impl App {
             imu_ready: std::sync::atomic::AtomicBool::new(false),
             imu_progress: Default::default(),
             stab_loading: std::sync::atomic::AtomicBool::new(false),
+            eye_match_readout: parking_lot::Mutex::new(None),
         });
         let pipeline = self.pipeline.clone();
         let control_for_thread = control.clone();
@@ -5314,6 +5337,13 @@ impl App {
         // Deferred: the picker must not run inside the egui frame (see
         // the `dialog_tx` field comment). Also `s` borrows self below.
         let mut browse_lut = false;
+        // Latest automatic eye-exposure measurement (X6 preview), for the readout.
+        // Only the preview worker feeds it — an export stops playback, so the
+        // panel then says the offset is applied rather than "measuring".
+        let preview_running = self.decoder_alive;
+        let eye_match_readout = if self.decoder_alive {
+            self.control.as_ref().and_then(|c| *c.eye_match_readout.lock())
+        } else { None };
         let s = &mut self.settings;
 
         // CDL: lift / gamma / gain / shadow / highlight.
@@ -5362,6 +5392,56 @@ impl App {
         fine_slider(ui, 1.0, &mut s.eye_match_exposure, -0.5..=0.5, tr("Eye Exposure (±EV)"), 2, 1.0, 0.01);
         if ui.button(tr("Reset matching")).clicked() {
             s.eye_match_ct = 0.0; s.eye_match_tint = 0.0; s.eye_match_exposure = 0.0;
+        }
+        // ── Automatic per-frame eye-exposure matching — X6 only. Its two
+        //    sensors auto-expose independently (shutter and gain), so the eyes
+        //    differ by up to ~1 stop and the difference moves with the AE.
+        //    Measured on the GPU every frame, cancelled as a log-domain code
+        //    offset before the LUT; the static trim above still composes. ──
+        if matches!(kind, Some(vr180_pipeline::SourceKind::Insta360Insv)) {
+            use vr180_pipeline::gpu::EyeMatchMode;
+            ui.add_space(4.0);
+            ui.checkbox(&mut s.auto_eye_match, tr("Auto-match eye exposure (per frame)"))
+                .on_hover_text(tr("The X6's two sensors auto-expose independently; this measures the brightness difference between the eyes every frame and cancels it before the LUT."));
+            if s.auto_eye_match {
+                let mode_label = |m: EyeMatchMode| match m {
+                    EyeMatchMode::Average => tr("Meet in the middle"),
+                    EyeMatchMode::ToLeft  => tr("Match to left eye"),
+                    EyeMatchMode::ToRight => tr("Match to right eye"),
+                };
+                ui.horizontal(|ui| {
+                    ui.label(tr("Reference"));
+                    egui::ComboBox::from_id_source("auto_eye_match_mode")
+                        .selected_text(mode_label(s.auto_eye_match_mode))
+                        .show_ui(ui, |ui| {
+                            for m in [EyeMatchMode::Average, EyeMatchMode::ToLeft, EyeMatchMode::ToRight] {
+                                ui.selectable_value(&mut s.auto_eye_match_mode, m, mode_label(m));
+                            }
+                        });
+                });
+                match eye_match_readout {
+                    Some(r) if r.valid != 0 => {
+                        let ev = vr180_pipeline::gpu::ILOG_CODE_PER_STOP;
+                        ui.label(RichText::new(format!(
+                            "{}: {:+.2} EV · {}: L {:+.2} / R {:+.2} EV",
+                            tr("Measured L−R"), r.d / ev, tr("applied"), r.off_l / ev, r.off_r / ev,
+                        )).small().color(Color32::GRAY));
+                    }
+                    Some(r) if r.reason != 0 => {
+                        ui.label(RichText::new(tr(
+                            "No usable content in the frame (clipped or too dark) — no correction applied."
+                        )).small().color(Color32::GRAY));
+                    }
+                    _ if !preview_running => {
+                        ui.label(RichText::new(tr(
+                            "Applied per frame — the live readout shows while previewing."
+                        )).small().color(Color32::GRAY));
+                    }
+                    _ => {
+                        ui.label(RichText::new(tr("Measuring…")).small().color(Color32::GRAY));
+                    }
+                }
+            }
         }
 
         ui.separator();

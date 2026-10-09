@@ -15,7 +15,7 @@ use crate::fisheye_decode::{
     BrawFisheyeIter, DualStreamFisheyeIter, FisheyePair, FisheyePairIter,
     SbsFisheyeIter, SegmentedFisheyeIter,
 };
-use crate::gpu::{ColorStackPlan, Device, EquirectRotation, FisheyeCalib};
+use crate::gpu::{ColorStackPlan, Device, EquirectRotation, FisheyeCalib, EyeMatchFrame};
 use crate::source_kind::SourceKind;
 use crate::{Error, Result};
 
@@ -1035,7 +1035,7 @@ fn export_fisheye_inner(
                     } else { f32::INFINITY };
                     crate::dji_imu::compute_dji_stabilization(
                         osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps, cfg.dji_responsiveness,
-                    ).ok().map(|s| s.per_frame)
+                    ).ok().map(|s| { let mut v = s.per_frame; crate::dji_imu::apply_lock_ref_diag(&mut v, cfg.dji_smooth_ms); v })
                 })
             }
             SourceKind::BlackmagicRaw => {
@@ -1173,6 +1173,17 @@ fn export_fisheye_inner(
     if color_any {
         tracing::info!("fisheye_export: color stack active (CDL/LUT/grade)");
     }
+    // Automatic eye-exposure matching: one GPU-resident state per export
+    // stream (histograms + smoothed offsets), consumed by the pair stack APIs.
+    let eye_match_state = pipeline.create_eye_match_state();
+    let eye_match = || Some((&eye_match_state, EyeMatchFrame::default()));
+    // The 8-bit CPU fallback grades on the CPU after the offset was applied
+    // on the GPU, so "anything left to grade?" must not count that stage.
+    let color_any_cpu = {
+        let mut p = color_plan.clone();
+        p.auto_eye_match = None;
+        p.any_active()
+    };
     let projection = cfg.projection;
     // Per-row rolling-shutter for the PORTABLE path — parity with the
     // zero-copy paths (macOS p010, Windows readback / GPU-resident). The
@@ -1310,9 +1321,9 @@ fn export_fisheye_inner(
                 let encode_pb = crate::interop_macos::create_bgra_encode_buffer(
                     &pipeline.device, sbs_w, sbs_h,
                 )?;
-                pipeline.apply_color_stack_to_sbs_bgra(
+                pipeline.apply_color_stack_to_sbs_bgra_matched(
                     &left_tex, &right_tex, &encode_pb.wgpu_tex,
-                    cfg.eye_w, cfg.eye_h, &color_plan,
+                    cfg.eye_w, cfg.eye_h, &color_plan, eye_match(),
                 )?;
                 encoder.encode_pixel_buffer(&encode_pb)?;
             }
@@ -1329,11 +1340,8 @@ fn export_fisheye_inner(
                     rot_left, rot_right, calib_left, calib_right,
                     projection, (rs_rows_l.as_deref(), rs_rows_r.as_deref()),
                 )?;
-                let left_g = pipeline.apply_color_stack_per_eye_16(
-                    &left_tex_16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true),
-                )?;
-                let right_g = pipeline.apply_color_stack_per_eye_16(
-                    &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false),
+                let (left_g, right_g) = pipeline.apply_color_stack_pair_16(
+                    &left_tex_16, &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan, eye_match(),
                 )?;
                 let l_final = left_g .as_ref().unwrap_or(&left_tex_16);
                 let r_final = right_g.as_ref().unwrap_or(&right_tex_16);
@@ -1366,11 +1374,8 @@ fn export_fisheye_inner(
                 rot_left, rot_right, calib_left, calib_right,
                 projection, (rs_rows_l.as_deref(), rs_rows_r.as_deref()),
             )?;
-            let left_g = pipeline.apply_color_stack_per_eye_16(
-                &left_tex_16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true),
-            )?;
-            let right_g = pipeline.apply_color_stack_per_eye_16(
-                &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false),
+            let (left_g, right_g) = pipeline.apply_color_stack_pair_16(
+                &left_tex_16, &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan, eye_match(),
             )?;
             let l_final = left_g .as_ref().unwrap_or(&left_tex_16);
             let r_final = right_g.as_ref().unwrap_or(&right_tex_16);
@@ -1384,11 +1389,16 @@ fn export_fisheye_inner(
             // legacy CPU roundtrip on the SBS readback below (acceptable
             // since this path is already CPU-bound).
             let (left_tex, right_tex) = project_8((rs_rows_l.as_deref(), rs_rows_r.as_deref()))?;
+            // Automatic eye-exposure offset on the GPU first (8-bit), then the
+            // rest of the grade on the CPU as before.
+            let (left_tex, right_tex) = pipeline
+                .match_eyes_8(&left_tex, &right_tex, cfg.eye_w, cfg.eye_h, &color_plan, eye_match())?
+                .unwrap_or((left_tex, right_tex));
             let sbs_tex = pipeline.compose_sbs_textures(
                 &left_tex, &right_tex, cfg.eye_w, cfg.eye_h,
             )?;
             let sbs_rgb8 = pipeline.read_texture_rgb8(&sbs_tex, sbs_w, sbs_h)?;
-            let mut graded = if color_any {
+            let mut graded = if color_any_cpu {
                 apply_color_stack_rgb8_sbs(
                     &*pipeline, &color_plan, sbs_rgb8, sbs_w, sbs_h, cfg.eye_w)?
             } else {
@@ -2595,7 +2605,7 @@ fn export_fisheye_osv_zerocopy_p010(
             } else { f32::INFINITY };
             crate::dji_imu::compute_dji_stabilization(
                 osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps, cfg.dji_responsiveness,
-            ).ok().map(|s| s.per_frame)
+            ).ok().map(|s| { let mut v = s.per_frame; crate::dji_imu::apply_lock_ref_diag(&mut v, cfg.dji_smooth_ms); v })
         })
     } else { None };
     tracing::info!(
@@ -2691,6 +2701,8 @@ fn export_fisheye_osv_zerocopy_p010(
     let dt = 1.0 / cfg.fps as f64;
     let t_start = std::time::Instant::now();
     let mut frame_idx: u64 = 0;
+    // Automatic eye-exposure matching (X6): GPU-resident state for this stream.
+    let eye_match_state = pipeline.create_eye_match_state();
 
     while let Some(frame) = decoder.next_frame(&pipeline.device)? {
         if cancel.load(Ordering::SeqCst) {
@@ -2851,11 +2863,9 @@ fn export_fisheye_osv_zerocopy_p010(
         // 16-bit color stack — runs only when active. Stays Rgba16Unorm
         // so VT sees full 10-bit precision when the user has added a
         // grade.
-        let left_g = pipeline.apply_color_stack_per_eye_16(
-            &left_eq, cfg.eye_w, cfg.eye_h, &cfg.color_stack.for_eye(true),
-        )?;
-        let right_g = pipeline.apply_color_stack_per_eye_16(
-            &right_eq, cfg.eye_w, cfg.eye_h, &cfg.color_stack.for_eye(false),
+        let (left_g, right_g) = pipeline.apply_color_stack_pair_16(
+            &left_eq, &right_eq, cfg.eye_w, cfg.eye_h, &cfg.color_stack,
+            Some((&eye_match_state, EyeMatchFrame::default())),
         )?;
         let l_final = left_g .as_ref().unwrap_or(&left_eq);
         let r_final = right_g.as_ref().unwrap_or(&right_eq);
@@ -3018,6 +3028,8 @@ fn export_fisheye_osv_zerocopy_d3d11(
 
     let dt = 1.0 / cfg.fps as f64;
     let color_plan = cfg.color_stack.clone();
+    // Automatic eye-exposure matching (X6): GPU-resident state for this stream.
+    let eye_match_state = pipeline.create_eye_match_state();
     let readout_s = crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, dji_osv_imu.as_ref()) / 1000.0;
 
     // ── 3-stage pipeline ───────────────────────────────────────────
@@ -3263,11 +3275,9 @@ fn export_fisheye_osv_zerocopy_d3d11(
             };
 
             // 16-bit color stack per eye.
-            let left_g = pipeline.apply_color_stack_per_eye_16(
-                &left16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true),
-            )?;
-            let right_g = pipeline.apply_color_stack_per_eye_16(
-                &right16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false),
+            let (left_g, right_g) = pipeline.apply_color_stack_pair_16(
+                &left16, &right16, cfg.eye_w, cfg.eye_h, &color_plan,
+                Some((&eye_match_state, EyeMatchFrame::default())),
             )?;
             let l_final = left_g.as_ref().unwrap_or(&left16);
             let r_final = right_g.as_ref().unwrap_or(&right16);
@@ -3532,6 +3542,8 @@ fn export_fisheye_osv_gpu_resident(
 
     let dt = 1.0 / cfg.fps as f64;
     let color_plan = cfg.color_stack.clone();
+    // Automatic eye-exposure matching (X6): GPU-resident state for this stream.
+    let eye_match_state = pipeline.create_eye_match_state();
     let readout_s = crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, dji_osv_imu.as_ref()) / 1000.0;
 
     // Decode sub-thread (D3D11/NVDEC only — never touches CUDA/wgpu), so the
@@ -3631,8 +3643,10 @@ fn export_fisheye_osv_gpu_resident(
                     &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 31)?,
             )
         };
-        let left_g = pipeline.apply_color_stack_per_eye_16(&left16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true))?;
-        let right_g = pipeline.apply_color_stack_per_eye_16(&right16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false))?;
+        let (left_g, right_g) = pipeline.apply_color_stack_pair_16(
+            &left16, &right16, cfg.eye_w, cfg.eye_h, &color_plan,
+            Some((&eye_match_state, EyeMatchFrame::default())),
+        )?;
         let l_final = left_g.as_ref().unwrap_or(&left16);
         let r_final = right_g.as_ref().unwrap_or(&right16);
 

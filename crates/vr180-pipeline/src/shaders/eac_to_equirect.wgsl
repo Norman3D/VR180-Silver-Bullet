@@ -223,18 +223,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var xn: f32 = xr;
     var yn: f32 = yr;
     var zn: f32 = zr;
-    // Direction the sensor-row estimate below is taken from: the legacy
-    // half-equirect keeps the pre-rotation basis (parity with the reference
-    // pipeline); a reframed view can be aimed anywhere, so it uses the
-    // rotated (camera-frame) direction, which is the physical one.
-    let rs_dir = select(dir_world, vec3<f32>(xr, yr, zr), lens.proj_mode > 0.5);
+    // The sensor row a pixel came from is a property of the CAMERA-frame
+    // direction (after the stabilization rotation, before the RS term):
+    // that is the ray the lens actually imaged. The reference pipeline
+    // used the pre-rotation output direction instead ("R is small"), which
+    // is off by the full applied rotation — tens of degrees in camera-lock
+    // mode, up to the elastic clamp in soft-stab.
+    let rs_dir = vec3<f32>(xr, yr, zr);
     if (rs.srot_s > 0.0) {
-        // Polar angle from optical axis (+Z) — computed from the
-        // PRE-rotation output direction (`dir_world`), matching the
-        // Python pipeline, which precomputes the per-pixel readout
-        // time from the identity (unrotated) direction grid ("R is
-        // always a small rotation" approximation). Keeping the same
-        // basis keeps the two apps' RS per-pixel timing identical.
+        // Polar angle from the optical axis (+Z).
         let cos_theta = clamp(rs_dir.z, -1.0, 1.0);
         let theta = acos(cos_theta);
         let sin_theta = sqrt(max(0.0, 1.0 - rs_dir.z * rs_dir.z));

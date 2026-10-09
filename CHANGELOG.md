@@ -2,6 +2,97 @@
 
 ## Unreleased
 
+### Insta360 X6: automatic per-frame eye-exposure matching
+
+The X6's two sensors auto-expose independently — shutter *and* gain — so the
+two eyes of a VR180 clip differ in brightness, and the difference moves with
+the light: on real post-mod footage the eyes sat up to about a stop apart
+for seconds at a time, then drifted back. The static "Matching Eyes"
+exposure trim cannot follow that.
+
+- **Auto-match eye exposure (per frame)** — a new switch in the Colour
+  panel's Matching Eyes section, shown for X6 clips. Every frame, the
+  brightness of the two eyes is measured on the GPU over the central region
+  both eyes share (a luma histogram; the mean shift of five quantiles across
+  the rank range both eyes keep once their clipped tails are cut is robust
+  to the content only one eye sees), and the difference is
+  cancelled with a log-domain code offset before the LUT — on I-Log that is
+  an exposure gain, so colour is untouched. Clipped highlights and crushed
+  blacks are cut out by rank, jointly for both eyes, so sky in the frame
+  does not water the correction down. The frame loop never waits on the
+  GPU: the export reads nothing back, and the preview's readout arrives
+  through a small asynchronous copy ring. A reference picker chooses
+  whether the eyes meet in the middle (default) or one eye follows the
+  other; a readout shows the measured difference and the offsets applied,
+  in EV.
+- Temporal behaviour: the camera's AE steps are taken at once (a lagged
+  step would leave the eyes mismatched for several frames); the small
+  frame-to-frame jitter is low-passed. A seek resets the smoothing.
+- The static Eye Exposure trim still composes on top, and the whole thing
+  is off for other cameras, whose sensors expose together.
+- Also fixed in the preview: in the single-eye "right" view the per-eye
+  trims (CT / tint / exposure) were applied to the wrong eye; they now
+  follow the eye they belong to.
+
+### GoPro .360: stabilization timed to each frame's exposure, and to the frames the camera actually dropped
+
+Two timing gaps in the GoPro path, found by rigging a GoPro MAX, a DJI
+Osmo 360 and an Insta360 X6 together and stabilizing the same walk and
+run through all three.
+
+- **Per-frame exposure.** The orientation sample now sits at the centre
+  row's mid-exposure — frame start + readout/2 − shutter/2, from the
+  per-frame shutter the camera records (`SHUT`) — the rule the DJI and X6
+  paths use, and the rolling-shutter correction is centred on that same
+  instant. In daylight nothing changes (a 1 ms shutter moves the sample
+  by half a millisecond; the old midpoint measured right to within
+  ~1.5 ms); in low light it matters: at a 1/30 s shutter the pose was
+  sampled 16 ms late, shake that followed the motion. On a dark running
+  section the locked residual drops 12 % and its motion-correlated part
+  disappears.
+- **Dropped frames.** When the camera's encoder falls behind it drops a
+  sensor frame and repeats the previous image to keep 30 fps; the gyro
+  and the telemetry block timestamps keep running, so that block is one
+  frame period short. The gyro timeline used to be stretched evenly over
+  the block's 30 video frames, mis-timing every frame after the repeat by
+  up to a frame period — a ~0.7 s burst of jerks per drop. The camera
+  marks these in its `MSKP` ("frame skip") stream; the gyro is now
+  re-anchored per frame from it, and a repeated frame receives the pose
+  and RS correction of the image it copies. The test clips had one to two
+  drops each, both under heavy motion.
+
+With both in place the GoPro's frame-to-frame jitter on the 30 fps test
+clip matches the Osmo and X6 second by second; the GoPro still looks
+worse than the 50 fps cameras simply because each 30 fps frame carries
+1.7× the motion.
+
+### GoPro .360: rolling-shutter correction audited and tightened
+
+The GoPro rolling-shutter term was measured directly for the first time:
+raw (unstabilized) frames exported with the correction off, on, doubled
+and negated, and the residual inter-frame warp regressed against the
+change in angular rate. The result: the correction has the right sign and
+the right axis (the sensor is read top to bottom, on both lenses, and the
+left eye behaves exactly like the right), and each unit of correction
+removes 15.3 ms of readout — the file's 15.224 ms within 1 %. Three
+things that were assumptions are now derived or physical:
+
+- **Readout time from the file.** The per-row RS window and the
+  mid-exposure pose instant now take the sensor readout from the
+  recording's `SROT` setting; 15.224 ms is only the fallback for a file
+  without one.
+- **The sensor row of a pixel is computed from the ray the lens actually
+  imaged** (the camera-frame direction after the stabilization rotation),
+  not from the output direction before it. The old choice was a
+  small-rotation approximation inherited from the reference pipeline; it
+  was off by the whole applied rotation, which in camera-lock mode is
+  tens of degrees.
+- **Each row group carries the camera's mean rate between the reference
+  row and that row**, so the per-row correction is the integrated
+  rotation rather than the instantaneous rate at the row — the two differ
+  by half the angular acceleration times the row offset squared, which
+  only matters in jolts.
+
 ### The app is just "VR180 Silver Bullet" now
 - The Windows installer, its Start-menu and desktop shortcuts, the Add/Remove
   Programs entry and the executable's own name (Task Manager, Properties) all
