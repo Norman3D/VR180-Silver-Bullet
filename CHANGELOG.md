@@ -66,6 +66,33 @@ clip matches the Osmo and X6 second by second; the GoPro still looks
 worse than the 50 fps cameras simply because each 30 fps frame carries
 1.7× the motion.
 
+### GoPro .360: rolling-shutter correction audited and tightened
+
+The GoPro rolling-shutter term was measured directly for the first time:
+raw (unstabilized) frames exported with the correction off, on, doubled
+and negated, and the residual inter-frame warp regressed against the
+change in angular rate. The result: the correction has the right sign and
+the right axis (the sensor is read top to bottom, on both lenses, and the
+left eye behaves exactly like the right), and each unit of correction
+removes 15.3 ms of readout — the file's 15.224 ms within 1 %. Three
+things that were assumptions are now derived or physical:
+
+- **Readout time from the file.** The per-row RS window and the
+  mid-exposure pose instant now take the sensor readout from the
+  recording's `SROT` setting; 15.224 ms is only the fallback for a file
+  without one.
+- **The sensor row of a pixel is computed from the ray the lens actually
+  imaged** (the camera-frame direction after the stabilization rotation),
+  not from the output direction before it. The old choice was a
+  small-rotation approximation inherited from the reference pipeline; it
+  was off by the whole applied rotation, which in camera-lock mode is
+  tens of degrees.
+- **Each row group carries the camera's mean rate between the reference
+  row and that row**, so the per-row correction is the integrated
+  rotation rather than the instantaneous rate at the row — the two differ
+  by half the angular acceleration times the row offset squared, which
+  only matters in jolts.
+
 ## 2.5.1 — 2026-09-25
 
 ### macOS: side-by-side sources — 8-bit joins the zero-copy path, and it uses far less memory

@@ -153,6 +153,12 @@ pub struct GyroAngvel {
     pub times: Vec<f32>,
     pub raw: Vec<[f32; 3]>,
     pub smoothed: Vec<[f32; 3]>,
+    /// Running integral of `raw` (trapezoid, rad) at each sample time —
+    /// `cum[i] = ∫_{times[0]}^{times[i]} ω dt`. Lets a row group carry the
+    /// MEAN rate between the frame's reference instant and the row's
+    /// instant, so `ω_group · Δt` is the integrated angle, not the
+    /// instantaneous rate at the row.
+    pub cum: Vec<[f64; 3]>,
 }
 
 impl GyroAngvel {
@@ -223,7 +229,50 @@ impl GyroAngvel {
             }
         }
 
-        Some(Self { times, raw, smoothed })
+        Some(Self::from_parts(times, raw, smoothed))
+    }
+
+    /// Assemble from already-built streams (e.g. several chapters merged
+    /// on one timeline); computes the running integral.
+    pub fn from_parts(times: Vec<f32>, raw: Vec<[f32; 3]>, smoothed: Vec<[f32; 3]>) -> Self {
+        // Trapezoid running integral of the raw rate (rad), for the
+        // mean-rate row groups.
+        let n = raw.len().min(times.len());
+        let mut cum = vec![[0.0_f64; 3]; n];
+        for i in 1..n {
+            let dt = (times[i] - times[i - 1]).max(0.0) as f64;
+            for ax in 0..3 {
+                cum[i][ax] = cum[i - 1][ax]
+                    + 0.5 * (raw[i - 1][ax] as f64 + raw[i][ax] as f64) * dt;
+            }
+        }
+        Self { times, raw, smoothed, cum }
+    }
+
+    /// `∫_{times[0]}^{t} ω dt` (rad), exact for the piecewise-linear raw
+    /// stream; clamped to the stream's span.
+    fn integral_at(&self, t: f32) -> [f64; 3] {
+        let times = &self.times;
+        let n = times.len();
+        let t = t.clamp(times[0], times[n - 1]);
+        let mut idx = match times.binary_search_by(|x| x.partial_cmp(&t)
+            .unwrap_or(std::cmp::Ordering::Equal)) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+        idx = idx.min(n - 2);
+        let (t0, t1) = (times[idx], times[idx + 1]);
+        let dt = (t1 - t0) as f64;
+        if dt < 1e-9 { return self.cum[idx]; }
+        let a = (((t - t0) as f64) / dt).clamp(0.0, 1.0);
+        let (s0, s1) = (self.raw[idx], self.raw[idx + 1]);
+        let mut out = self.cum[idx];
+        for ax in 0..3 {
+            let (v0, v1) = (s0[ax] as f64, s1[ax] as f64);
+            // ∫_0^{a·dt} (v0 + (v1 − v0)·τ/dt) dτ
+            out[ax] += v0 * a * dt + 0.5 * (v1 - v0) * a * a * dt;
+        }
+        out
     }
 
     fn lerp_at(stream: &[[f32; 3]], times: &[f32], t: f32) -> [f32; 3] {
@@ -254,15 +303,35 @@ impl GyroAngvel {
         Self::lerp_at(&self.smoothed, &self.times, t)
     }
 
-    /// RAW ω at `n_groups` row-times spanning `t ± srot/2` — Python's
-    /// `get_perscanline_rs_angvel` (without factors; caller applies).
+    /// Per-row-group rate for `n_groups` row instants spanning
+    /// `t ± srot/2` (without factors; caller applies). Group `g` sits at
+    /// `t_g = t + (g/(n−1) − ½)·srot` and carries the MEAN raw rate over
+    /// `[t, t_g]`, i.e. `(∫_t^{t_g} ω dt) / (t_g − t)`: the shader multiplies
+    /// it by the pixel's row offset `t_g − t`, so the product is the
+    /// integrated camera rotation between the reference row and that
+    /// row — exact under angular acceleration, where the instantaneous
+    /// rate at the row (the previous definition) overshoots by `α·Δt²/2`.
+    /// Groups within a microsecond of `t` degrade to the instantaneous rate.
     pub fn groups_at(&self, t: f32, srot_s: f32, n_groups: usize) -> Vec<[f32; 3]> {
         let n_groups = n_groups.max(2);
+        let base = self.integral_at(t);
         (0..n_groups).map(|g| {
             let frac = g as f32 / (n_groups - 1) as f32; // 0..=1
             let gt = t + (frac - 0.5) * srot_s;
-            Self::lerp_at(&self.raw, &self.times, gt)
+            let span = (gt - t) as f64;
+            if span.abs() < 1e-6 {
+                return Self::lerp_at(&self.raw, &self.times, gt);
+            }
+            let end = self.integral_at(gt);
+            let mut out = [0.0_f32; 3];
+            for ax in 0..3 { out[ax] = ((end[ax] - base[ax]) / span) as f32; }
+            out
         }).collect()
+    }
+
+    /// RAW ω lerped at `t` (instantaneous rate).
+    pub fn raw_at(&self, t: f32) -> [f32; 3] {
+        Self::lerp_at(&self.raw, &self.times, t)
     }
 }
 
@@ -327,6 +396,44 @@ mod tests {
             assert!((s[1] - 1.0).abs() < 1e-6);
             assert!((s[2] - 3.0).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn row_groups_carry_the_mean_rate_over_their_interval() {
+        // Linear angular acceleration on shader X: ω(t) = α·t. The group at
+        // row instant t_g must carry (∫_t^{t_g} ω)/(t_g − t) = α·(t + t_g)/2,
+        // so ω_g·(t_g − t) is the integrated angle — not α·t_g (the
+        // instantaneous rate at the row, which overshoots by α·Δt²/2).
+        use super::super::cori_iori::CoriBlockStmp;
+        let alpha = 3.0_f32; // rad/s²
+        let rate = 800.0_f32;
+        let mut blocks = Vec::new();
+        for b in 0..2u64 {
+            let samples: Vec<[f32; 3]> = (0..800).map(|i| {
+                let t = b as f32 + i as f32 / rate;
+                [0.0, alpha * t, 0.0] // raw[1] → shader X
+            }).collect();
+            blocks.push(ImuBlock { samples, scal: 1.0, stmp_us: Some(b * 1_000_000) });
+        }
+        let cori = vec![
+            CoriBlockStmp { stmp_us: 0, n_samples: 30 },
+            CoriBlockStmp { stmp_us: 1_000_000, n_samples: 30 },
+        ];
+        let av = GyroAngvel::build(&blocks, &cori, 30.0, 2.0).expect("angvel");
+        let (t, srot) = (1.0_f32, 0.016_f32);
+        let groups = av.groups_at(t, srot, 32);
+        assert_eq!(groups.len(), 32);
+        for (g, w) in groups.iter().enumerate() {
+            let gt = t + (g as f32 / 31.0 - 0.5) * srot;
+            let expect = alpha * (t + gt) / 2.0;
+            assert!((w[0] - expect).abs() < 2e-4, "group {g}: {} vs mean {expect} (instantaneous would be {})", w[0], alpha * gt);
+            assert!(w[1].abs() < 1e-5 && w[2].abs() < 1e-5);
+        }
+        // Edge rows: the product with the row offset is the integrated angle.
+        let dt = -0.5 * srot;
+        let got = groups[0][0] * dt;
+        let want = alpha * ((t + dt).powi(2) - t.powi(2)) / 2.0;
+        assert!((got - want).abs() < 2e-6, "{got} vs {want}");
     }
 
     #[test]

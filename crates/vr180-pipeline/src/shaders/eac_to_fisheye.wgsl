@@ -207,16 +207,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var xn: f32 = xr;
     var yn: f32 = yr;
     var zn: f32 = zr;
+    // The sensor row a pixel came from is a property of the CAMERA-frame
+    // direction (after the stabilization rotation, before the RS term) —
+    // the ray the lens actually imaged. Same as eac_to_equirect.wgsl.
+    let rs_dir = vec3<f32>(xr, yr, zr);
     if (rs.srot_s > 0.0) {
-        // Polar angle from optical axis (+Z) — computed from the
-        // PRE-rotation output direction (`dir_world`), matching the
-        // Python pipeline, which precomputes the per-pixel readout
-        // time from the identity (unrotated) direction grid ("R is
-        // always a small rotation" approximation). Keeping the same
-        // basis keeps the two apps' RS per-pixel timing identical.
-        let cos_theta = clamp(dir_world.z, -1.0, 1.0);
+        // Polar angle from the optical axis (+Z).
+        let cos_theta = clamp(rs_dir.z, -1.0, 1.0);
         let theta = acos(cos_theta);
-        let sin_theta = sqrt(max(0.0, 1.0 - dir_world.z * dir_world.z));
+        let sin_theta = sqrt(max(0.0, 1.0 - rs_dir.z * rs_dir.z));
         // KLNS polynomial: r = c0·θ + c1·θ³ + c2·θ⁵ + c3·θ⁷ + c4·θ⁹.
         // Horner form for stability.
         let theta2 = theta * theta;
@@ -230,9 +229,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let center_y = rs.cal_dim * 0.5 + rs.ctry;
         var sensor_y: f32;
         if (sin_theta > 1e-6) {
-            sensor_y = center_y - r_klns * dir_world.y / sin_theta;
+            sensor_y = center_y - r_klns * rs_dir.y / sin_theta;
         } else {
-            sensor_y = center_y - rs.klns_c0 * dir_world.y;
+            sensor_y = center_y - rs.klns_c0 * rs_dir.y;
         }
         // Normalized time offset ∈ [-0.5, +0.5] → seconds.
         let t_norm = sensor_y / rs.cal_dim - 0.5;

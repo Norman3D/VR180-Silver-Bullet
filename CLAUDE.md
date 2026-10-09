@@ -530,6 +530,50 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    ×5 both nudge the burst the right way), left untuned by rule.
    `VR180_GOPRO_PHASE_MS` remains as the GoPro twin of the DJI diagnostic
    knob (default 0).
+   THIRD PASS (2026-10-08, "the mount is fine — look carefully at RS"):
+   the RS term was MEASURED for the first time (scratchpad `stab/rs_probe*.py`:
+   GOPRO_NO_STAB exports with RS off / on / ×2 / −1, DIS flow → Kabsch →
+   9-parameter fit of the residual on the row-time and column-time RS
+   bases → slope vs the gyro's Δω at the frame instants). Sign RIGHT (the
+   derivation: the shader's Y↔Z swap is improper, so `r + (w×r)·Δt` with
+   the raw gyro IS the physical correction — and the old memory claim
+   "CORI integrates −GYRO" is false in this code's conventions: CORI
+   increments vs ∫gyro slope +0.994); axis RIGHT (rows vertical, top row
+   first, T_cols ≈ 0); BOTH EYES identical (L/R slopes agree to 0.1 ms;
+   GEOC ANGY = 180.26°, ANGX/ANGZ < 1°: the back lens is a pure yaw of the
+   front, same sensor "up"); magnitude: each unit of factor removes
+   15.3 ± 0.5 ms (= the file's SROT 15.224 within 1 %). The UNCORRECTED
+   readout read 17.2 ms over the full field but 15.6 ± 0.5 in the far
+   field (sky/façades) and 13.7 on the near ground — walking parallax
+   correlates with pitch acceleration and biases the absolute number; an
+   independent skew fit on the raw EAC faces gave 17.7–18.3 (same bias).
+   Three principled changes landed, none moves the lock residual
+   measurably (walking 0.197→0.197, dark 0.541→0.549, burst 0.775→0.753 —
+   noise): the readout now comes from the file's `SROT`
+   (`vr180_pipeline::imu::gopro_readout_s`, fallback `SROT_S`; GUI seeds
+   `rs_readout_ms` from it per clip, the VQF pose instant uses the same
+   value); the shader's row estimate uses the camera-frame ray
+   (`xr,yr,zr`) instead of the pre-rotation output ray in both EAC shaders;
+   `GyroAngvel::groups_at` returns the MEAN rate over [t_ref, t_row]
+   (running trapezoid integral, `from_parts` for merged chapters) so the
+   per-row term is the integrated angle. CALM-SEGMENT CHECK (rotation
+   without walking: 243 @ 0–8 s and 78–88 s, 244 @ 2–6 s and 96.5–99.5 s;
+   the elevator segment 244 @ 112–117 s has no far field and was dropped):
+   far-field uncorrected readout **15.60 ± 0.20 ms**, each unit of factor
+   removes 14.81 ± 0.21, residual after the 15.224 ms correction
+   **+0.78 ± 0.15 ms** (the correction nulls at an effective 16.0 ± 0.2 ms) → the true
+   readout is 3–5 % above the file's SROT, an 0.08° edge-to-edge error at
+   100 °/s — real but not visible, and by rule left to the file (a
+   per-camera readout self-calibration from footage would be the
+   file-derived way to close it). T_cols ≈ 0 (rows-only model holds).
+   The 1.07 yaw scale was near-field lever-arm parallax: far-field-only
+   Kabsch gives 1.01–1.02 for yaw and 0.99–1.01 for pitch/roll. By-product:
+   the fitted gyro clock offset drops by one frame between the calm
+   segments on either side of a dropped frame (243: −33.4 ms exactly;
+   244 across the 73.2 s drop: −36 ± 3 ms) and the correction nulls on
+   both far sides — the MSKP re-anchoring verified independently (244's
+   second drop at 107.6 s is followed only by the unusable elevator
+   segment, so it is unverified).
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

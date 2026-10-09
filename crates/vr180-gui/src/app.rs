@@ -2109,7 +2109,7 @@ impl App {
                 // no-firmware RS from the GoPro CORI stream (the toggle still
                 // overrides). Non-EAC sources fall back to the default.
                 settings.rs_mode = crate::decoder::detect_rs_mode_for_path(&path, source_kind);
-                settings.rs_readout_ms = crate::decoder::default_rs_readout_ms();
+                settings.rs_readout_ms = crate::decoder::detect_rs_readout_ms_for_path(&path, source_kind);
                 // OSMO 360 II ("Osmo OQ002"): streams arrive eye-swapped
                 // relative to the I after the VR180 mod — seed the swap
                 // (the toggle still overrides per clip).
@@ -3087,7 +3087,12 @@ impl App {
         // and gen isn't bumped on frame 0.
         if !meta.preserve_clip_settings {
             self.settings.rs_mode = meta.detected_rs_mode;
-            self.settings.rs_readout_ms = crate::decoder::default_rs_readout_ms();
+            // Readout from the file's SROT (the loader already found it);
+            // the constant is only the no-SROT fallback.
+            self.settings.rs_readout_ms = match meta.srot_ms {
+                Some(ms) if ms > 0.5 && ms < 100.0 => ms,
+                _ => crate::decoder::default_rs_readout_ms(),
+            };
         }
         self.last_pushed_settings = self.settings.clone();
 

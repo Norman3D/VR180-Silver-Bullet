@@ -43,6 +43,8 @@ use vr180_pipeline::decode::HwDecode;
 use vr180_pipeline::decode::iter_stream_pairs;
 
 /// PER-CLIP GoPro RS defaults. `rs_mode` + `rs_readout_ms` are `#[serde(skip)]`
+/// (the readout is re-read from each clip's SROT at load — see
+/// `detect_rs_readout_ms_for_path`; the default is only the no-SROT fallback)
 /// and re-seeded to these on every clip load (see `app.rs`), so a prior clip's
 /// tweak never carries over — same lifecycle as the IMU phase. (`rs_correct`
 /// stays a persisted preference.) 15.224 ms is the GoPro Max firmware SROT.
@@ -107,6 +109,18 @@ pub(crate) fn detect_rs_mode(cori: &[vr180_core::gyro::Quat]) -> RsMode {
 /// Path-based convenience for the batch-add path (no CORI parsed yet). Only
 /// GoPro `.360` (EAC) has the firmware-RS distinction; every other source
 /// keeps the firmware default.
+/// Per-clip readout time (ms) from the file's SROT — GoPro only; other
+/// sources keep the default (their readout comes from their own metadata).
+pub(crate) fn detect_rs_readout_ms_for_path(
+    path: &std::path::Path,
+    kind: vr180_pipeline::SourceKind,
+) -> f32 {
+    if kind != vr180_pipeline::SourceKind::GoProEac {
+        return default_rs_readout_ms();
+    }
+    vr180_pipeline::imu::gopro_readout_s(&first_chapter_of(path)) * 1000.0
+}
+
 pub(crate) fn detect_rs_mode_for_path(
     path: &std::path::Path,
     kind: vr180_pipeline::SourceKind,
@@ -5355,7 +5369,7 @@ fn gather_multi_angvel(
         toff += dur;
     }
     if times.len() < 2 { return None; }
-    Some(vr180_core::gyro::GyroAngvel { times, raw, smoothed })
+    Some(vr180_core::gyro::GyroAngvel::from_parts(times, raw, smoothed))
 }
 
 /// Single-segment entry — used everywhere a lone `.360` is processed.

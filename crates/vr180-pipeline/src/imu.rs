@@ -300,6 +300,23 @@ fn pick_acc_source(
 /// vibrating footage (motorcycle clips) at "the same settings".
 const VQF_RESAMPLE_WINDOW_S: f32 = 15.224 / 1000.0;
 
+/// The sensor readout time of a GoPro recording, in seconds: the file's
+/// `SROT` (a float-ms Global Setting in `moov/udta/GPMF`), falling back
+/// to the MAX constant [`SROT_S`] only when the file carries none. Every
+/// timing that depends on the readout — the mid-exposure pose instant
+/// and the per-row RS window — takes it from here, never from a setting.
+pub fn gopro_readout_s(path: &Path) -> f32 {
+    use vr180_core::gyro::resample::SROT_S;
+    match vr180_core::geoc::lookup_srot_s(path, None) {
+        Ok(Some(s)) if s > 0.0005 && s < 0.1 => s,
+        Ok(Some(s)) => {
+            tracing::warn!("GoPro SROT {:.3} ms implausible — using {:.3} ms", s * 1e3, SROT_S * 1e3);
+            SROT_S
+        }
+        _ => SROT_S,
+    }
+}
+
 pub fn vqf_cori_equivalent_stream(
     input: &Path,
     fps: f32,
@@ -307,8 +324,9 @@ pub fn vqf_cori_equivalent_stream(
 ) -> Result<Vec<Quat>> {
     use vr180_core::gyro::{
         vqf,
-        resample::{resample_quats_at_times, gopro_frame_sample_times, cori_swap_yz, SROT_S},
+        resample::{resample_quats_at_times, gopro_frame_sample_times, cori_swap_yz},
     };
+    let srot_s = gopro_readout_s(input);
 
     // 1. Prep the IMU arrays. `prepare_for_vqf` now returns the
     //    STMP-anchored gyro timeline and computes `gyr_ts` from it,
@@ -355,7 +373,7 @@ pub fn vqf_cori_equivalent_stream(
         // CORI stream.
         use vr180_core::gyro::resample::resample_quats_to_frames;
         return Ok(resample_quats_to_frames(
-            &cori_equiv, vqf_fps, fps, n_frames, SROT_S * 0.5, VQF_RESAMPLE_WINDOW_S,
+            &cori_equiv, vqf_fps, fps, n_frames, srot_s * 0.5, VQF_RESAMPLE_WINDOW_S,
         ));
     }
     tracing::info!(
@@ -369,7 +387,7 @@ pub fn vqf_cori_equivalent_stream(
     //    MID-EXPOSURE: `i/fps + SROT/2 − shutter_i/2` from the per-frame
     //    SHUT stream (the DJI/X6 rule), window-averaged over SROT. Without
     //    SHUT this is the readout midpoint, as before.
-    let mut times = gopro_frame_sample_times(fps, n_frames, &prep.shutter_s, SROT_S, skips_of(&prep.frame_skips));
+    let mut times = gopro_frame_sample_times(fps, n_frames, &prep.shutter_s, srot_s, skips_of(&prep.frame_skips));
     apply_diag_phase(&mut times);
     log_shutter(&prep.shutter_s, n_frames);
     Ok(resample_quats_at_times(&sample_times, &cori_equiv, &times, VQF_RESAMPLE_WINDOW_S))
@@ -434,13 +452,15 @@ pub fn vqf_cori_equivalent_stream_multi(
 ) -> Result<Vec<Quat>> {
     use vr180_core::gyro::{
         vqf,
-        resample::{resample_quats_at_times, gopro_frame_sample_times, cori_swap_yz, SROT_S},
+        resample::{resample_quats_at_times, gopro_frame_sample_times, cori_swap_yz},
     };
     use crate::decode::probe_video;
 
     if segments.len() == 1 {
         return vqf_cori_equivalent_stream(&segments[0], fps, n_frames);
     }
+    // One recording, one sensor: the readout comes from the first chapter.
+    let srot_s = gopro_readout_s(&segments[0]);
 
     let mut gyro_body: Vec<[f32; 3]> = Vec::new();
     let mut acc_body: Vec<[f32; 3]> = Vec::new();
@@ -504,9 +524,9 @@ pub fn vqf_cori_equivalent_stream_multi(
         use vr180_core::gyro::resample::resample_quats_to_frames;
         return Ok(resample_quats_to_frames(
             &cori_equiv, 1.0 / gyr_ts.max(1e-6), fps, n_frames,
-            SROT_S * 0.5, VQF_RESAMPLE_WINDOW_S));
+            srot_s * 0.5, VQF_RESAMPLE_WINDOW_S));
     }
-    let mut times = gopro_frame_sample_times(fps, n_frames, &shutter_all, SROT_S, skips_of(&skips_all));
+    let mut times = gopro_frame_sample_times(fps, n_frames, &shutter_all, srot_s, skips_of(&skips_all));
     apply_diag_phase(&mut times);
     log_shutter(&shutter_all, n_frames);
     Ok(resample_quats_at_times(&gyro_times, &cori_equiv, &times, VQF_RESAMPLE_WINDOW_S))
