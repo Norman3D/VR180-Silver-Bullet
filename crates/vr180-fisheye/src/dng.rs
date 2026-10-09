@@ -159,6 +159,12 @@ pub struct DngExif {
     /// `UserComment` text after its 8-byte character-code prefix (the X6
     /// writes `"INSTA360"` there, then the lens string).
     pub user_comment: Option<String>,
+    /// EXIF capture-condition flags carried through to the output as is.
+    pub exposure_program: Option<u16>,
+    pub metering_mode: Option<u16>,
+    pub white_balance: Option<u16>,
+    pub exposure_compensation: Option<f64>,
+    pub shutter_speed_value: Option<f64>,
 }
 
 /// A fully decoded Insta360 X6 DNG still.
@@ -512,6 +518,11 @@ const EXIF_ISO: u16 = 34855;
 const EXIF_DATETIME_ORIGINAL: u16 = 36867;
 const EXIF_FOCAL_LENGTH: u16 = 37386;
 const EXIF_USER_COMMENT: u16 = 37510;
+const EXIF_EXPOSURE_PROGRAM: u16 = 34850;
+const EXIF_SHUTTER_SPEED_VALUE: u16 = 37377;
+const EXIF_EXPOSURE_COMPENSATION: u16 = 37380;
+const EXIF_METERING_MODE: u16 = 37383;
+const EXIF_WHITE_BALANCE: u16 = 41987;
 const EXIF_FOCAL_35MM: u16 = 41989;
 
 const PHOTOMETRIC_CFA: u32 = 32803;
@@ -908,6 +919,11 @@ fn exif_tags(t: &mut TiffFile, exif: &Ifd, out: &mut DngExif) -> Result<()> {
     out.focal_mm = t.tag_f64(exif, EXIF_FOCAL_LENGTH)?;
     out.focal_35mm = t.tag_u32(exif, EXIF_FOCAL_35MM)?;
     out.datetime_original = t.tag_ascii(exif, EXIF_DATETIME_ORIGINAL)?;
+    out.exposure_program = t.tag_u32(exif, EXIF_EXPOSURE_PROGRAM)?.map(|v| v as u16);
+    out.metering_mode = t.tag_u32(exif, EXIF_METERING_MODE)?.map(|v| v as u16);
+    out.white_balance = t.tag_u32(exif, EXIF_WHITE_BALANCE)?.map(|v| v as u16);
+    out.exposure_compensation = t.tag_f64(exif, EXIF_EXPOSURE_COMPENSATION)?;
+    out.shutter_speed_value = t.tag_f64(exif, EXIF_SHUTTER_SPEED_VALUE)?;
     if let Some(b) = t.tag_bytes(exif, EXIF_USER_COMMENT)? {
         // 8-byte character-code prefix ("ASCII\0\0\0", "UNICODE\0", … — the
         // X6 writes "INSTA360"), then the text.

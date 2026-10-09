@@ -178,6 +178,12 @@ fn linear_dng_meta(still: &X6Still, l_max: f32) -> LinearDngMeta {
         focal_mm: e.focal_mm,
         focal_35mm: e.focal_35mm,
         datetime_original: e.datetime_original.clone(),
+        user_comment: e.user_comment.clone(),
+        exposure_program: e.exposure_program,
+        metering_mode: e.metering_mode,
+        white_balance: e.white_balance,
+        exposure_compensation: e.exposure_compensation,
+        shutter_speed_value: e.shutter_speed_value,
         image_description: Some("VR180 side-by-side (left | right), half-equirect per eye".into()),
     }
 }

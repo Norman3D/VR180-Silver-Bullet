@@ -76,6 +76,15 @@ pub struct LinearDngMeta {
     pub focal_35mm: Option<u32>,
     /// `"YYYY:MM:DD HH:MM:SS"`; also used for IFD0 `DateTime`.
     pub datetime_original: Option<String>,
+    /// `UserComment` text (written with the `ASCII\0\0\0` prefix). The X6
+    /// still's comment carries the factory lens strings — provenance of
+    /// the projection.
+    pub user_comment: Option<String>,
+    pub exposure_program: Option<u16>,
+    pub metering_mode: Option<u16>,
+    pub white_balance: Option<u16>,
+    pub exposure_compensation: Option<f64>,
+    pub shutter_speed_value: Option<f64>,
     pub image_description: Option<String>,
 }
 
@@ -159,6 +168,12 @@ mod tag {
     pub const DATE_TIME_DIGITIZED: u16 = 36868;
     pub const FOCAL_LENGTH: u16 = 37386;
     pub const FOCAL_LENGTH_35MM: u16 = 41989;
+    pub const EXPOSURE_PROGRAM: u16 = 34850;
+    pub const SHUTTER_SPEED_VALUE: u16 = 37377;
+    pub const EXPOSURE_COMPENSATION: u16 = 37380;
+    pub const METERING_MODE: u16 = 37383;
+    pub const USER_COMMENT: u16 = 37510;
+    pub const WHITE_BALANCE: u16 = 41987;
     pub const DNG_VERSION: u16 = 50706;
     pub const DNG_BACKWARD_VERSION: u16 = 50707;
     pub const UNIQUE_CAMERA_MODEL: u16 = 50708;
@@ -797,6 +812,16 @@ pub fn write_linear_dng_to<W: Write + Seek>(
     if let Some(f) = meta.focal_35mm {
         exif.set_short(tag::FOCAL_LENGTH_35MM, &[f.min(u16::MAX as u32) as u16]);
     }
+    if let Some(v) = meta.exposure_program { exif.set_short(tag::EXPOSURE_PROGRAM, &[v]); }
+    if let Some(v) = meta.metering_mode { exif.set_short(tag::METERING_MODE, &[v]); }
+    if let Some(v) = meta.white_balance { exif.set_short(tag::WHITE_BALANCE, &[v]); }
+    if let Some(v) = meta.exposure_compensation { exif.set_srational(tag::EXPOSURE_COMPENSATION, &[srat(v)]); }
+    if let Some(v) = meta.shutter_speed_value { exif.set_srational(tag::SHUTTER_SPEED_VALUE, &[srat(v)]); }
+    if let Some(c) = &meta.user_comment {
+        let mut v = b"ASCII\0\0\0".to_vec();
+        v.extend(c.bytes().map(|b| if b.is_ascii() && b != 0 { b } else { b'?' }));
+        exif.set_undefined(tag::USER_COMMENT, &v);
+    }
 
     // ---- IFD0: thumbnail + camera / colour tags ---------------------------
     let mut ifd0 = Ifd::default();
@@ -1027,6 +1052,9 @@ mod tests {
             focal_mm: Some(2.54),
             focal_35mm: Some(8),
             datetime_original: Some("2026:10:07 13:31:05".into()),
+            user_comment: Some("INSTA3602_2.455430_7214.730".into()),
+            exposure_program: Some(2), metering_mode: Some(5), white_balance: Some(0),
+            exposure_compensation: Some(0.0), shutter_speed_value: Some(12.31),
             image_description: Some("VR180 left eye".into()),
         }
     }
