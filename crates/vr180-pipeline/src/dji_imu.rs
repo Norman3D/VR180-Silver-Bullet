@@ -92,6 +92,27 @@ const AXIS_CORRECTION: [[f32; 3]; 3] = [
 /// Post-multiply a flat row-major 3×3 (`[9]`) by a structured 3×3.
 /// Returns flat 3×3. Useful for inserting fixed corrections into the
 /// per-frame rotation pipeline without re-shaping back and forth.
+/// DIAGNOSTIC: `VR180_LOCK_REF_FRAME=<k0>` re-anchors a camera-lock table to
+/// frame `k0` instead of frame 0, so a headless lock export of a window
+/// that starts mid-clip looks where the camera looked at the window start
+/// (`R'_i = R_i · R_k0ᵀ`: same world lock, re-expressed from frame k0's
+/// orientation). Only acts on lock tables (`smooth_ms == 0`); never set by
+/// the GUI.
+pub fn apply_lock_ref_diag(per_frame: &mut [EquirectRotation], smooth_ms: f32) {
+    if smooth_ms > 0.0 { return; }
+    let Some(k0) = std::env::var("VR180_LOCK_REF_FRAME").ok().and_then(|v| v.parse::<usize>().ok()) else { return; };
+    let Some(r0) = per_frame.get(k0).copied() else { return; };
+    let a = r0.0;
+    let at = [a[0], a[3], a[6], a[1], a[4], a[7], a[2], a[5], a[8]]; // transpose
+    for r in per_frame.iter_mut() {
+        let m = r.0;
+        let mut o = [0.0_f32; 9];
+        for i in 0..3 { for j in 0..3 { o[i * 3 + j] = m[i * 3] * at[j] + m[i * 3 + 1] * at[3 + j] + m[i * 3 + 2] * at[6 + j]; } }
+        r.0 = o;
+    }
+    tracing::info!("DIAGNOSTIC: camera lock re-anchored to frame {k0} (VR180_LOCK_REF_FRAME)");
+}
+
 fn mat3_mul_flat_postmul(a: &[f32; 9], b: &[[f32; 3]; 3]) -> [f32; 9] {
     let mut out = [0.0_f32; 9];
     for i in 0..3 {

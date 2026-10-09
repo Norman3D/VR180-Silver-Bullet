@@ -575,6 +575,45 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    second drop at 107.6 s is followed only by the unusable elevator
    segment, so it is unverified).
 
+17. **Osmo 360 "sometimes a roll residue, X6 almost perfect" (2026-10-09) —
+   investigation, diagnostic knob only, nothing user-visible changed.**
+   Same rig clips as item 16 (set 2: Osmo 0017 / X6 059 / GoPro 244; audio
+   offsets t_osmo = t_x6 + 3.332 = t_gopro + 1.016). MEASURED EQUAL between
+   Osmo and X6 — so ruled out: per-frame roll jitter of the real exports
+   (0.307 vs 0.304°/frame), the orientation inputs at the frame level
+   (0.03°/frame roll after sub-frame alignment), the shared smoother's
+   correction at identical settings (same to 0.1°), the table-predicted
+   output motion at identical settings (0.98–1.05× per band, corr ≥ 0.993),
+   inter-eye roll of the real exports (0.2–0.4° mean, all three cameras),
+   static horizon tilt. MEASURED DIFFERENT: registering the real soft-stab
+   exports to each other once per second (scratchpad `stab/cross_cam.py`,
+   far-field DIS→Kabsch) puts the Osmo horizon within ±0.3° of the GoPro's
+   except ONE Osmo-only transient at the first big turn (GoPro clock
+   29–32 s, correction yaw +27°): a rise over ~2 s to a +1.5° peak held
+   ~0.5 s, back to 0 (0.1 s zoom; the X6 stays <0.5° there; a second
+   candidate at 62 s is ≤0.45° = noise); the X6 wanders ±1° slowly against
+   both. Set 1 (0016/058/243): all three horizons agree to ±0.3° (roll std
+   0.12°, p95 0.23–0.28°) for the whole clip — no Osmo event at all. Hand-eye comparison of the lock tables
+   (data-audit agent): the Osmo's in-camera fused estimate shifts its tilt
+   by 1–4° at each ~90° heading turn and holds it between turns (frame-
+   invariant tilt-change magnitude up to 9° late in the clip); the X6's
+   gyro-only integration (100 s trim) does not. In soft-stab a slow
+   world-frame error cancels — actual and anchor carry it — leaving only the
+   smoother-lag transient of each step (≈1–1.5° for ~τ at each turn): that
+   is the roll residue. Not fixable from the file for the Osmo 360 I (no raw
+   gyro; `[2.10]` is a 30 Hz accelerometer, gait-aliased; the dead
+   `horizon_lock_quat`/`smooth_gravity_ema` would make it worse); the 360 II
+   writes `[3.3.5]` 1 kHz gyro+gravity, where the X6 treatment would apply.
+   Code: `dji_imu::apply_lock_ref_diag` + `VR180_LOCK_REF_FRAME=<k0>`
+   (fisheye_export, both arms) re-anchors a camera-lock export to frame k0 —
+   a lock anchored at frame 0 points wherever the camera pointed at record
+   start. MEASUREMENT TRAPS (see the memory note): `acos((trace−1)/2)` on
+   f32 tables floors steps <0.03° to exactly 0 (fake "frozen" output — use
+   the antisymmetric part); body-frame rotation-vector "disagreement"
+   between two cameras mixes heading disagreement into roll/pitch (fake
+   multi-degree roll — use image registration or frame-invariant
+   magnitudes); walking-scene lock residuals are parallax-dominated.
+
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
   Swift helper); GPU-resident zero-copy P010 for OSV **and** `.360`/EAC. The

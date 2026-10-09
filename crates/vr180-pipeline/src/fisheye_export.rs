@@ -1035,7 +1035,7 @@ fn export_fisheye_inner(
                     } else { f32::INFINITY };
                     crate::dji_imu::compute_dji_stabilization(
                         osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps, cfg.dji_responsiveness,
-                    ).ok().map(|s| s.per_frame)
+                    ).ok().map(|s| { let mut v = s.per_frame; crate::dji_imu::apply_lock_ref_diag(&mut v, cfg.dji_smooth_ms); v })
                 })
             }
             SourceKind::BlackmagicRaw => {
@@ -2605,7 +2605,7 @@ fn export_fisheye_osv_zerocopy_p010(
             } else { f32::INFINITY };
             crate::dji_imu::compute_dji_stabilization(
                 osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps, cfg.dji_responsiveness,
-            ).ok().map(|s| s.per_frame)
+            ).ok().map(|s| { let mut v = s.per_frame; crate::dji_imu::apply_lock_ref_diag(&mut v, cfg.dji_smooth_ms); v })
         })
     } else { None };
     tracing::info!(
