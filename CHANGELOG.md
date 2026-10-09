@@ -66,6 +66,32 @@ clip matches the Osmo and X6 second by second; the GoPro still looks
 worse than the 50 fps cameras simply because each 30 fps frame carries
 1.7× the motion.
 
+### Insta360 X6 stills: open a `.dng`, export a VR180 still — as PNG, JPEG or a linear DNG
+
+The X6 writes its photos as one 15520×7760 DNG with both fisheye circles
+side by side, 14-bit Bayer, the factory lens model in the EXIF and an
+Insta360 trailer. The app now opens them like any other source: the raw
+stage (the camera's per-channel gain maps, a 5×5 linear demosaic, black /
+white levels) runs on the CPU, each eye goes through the same exact
+UCM fisheye projection the X6 video path uses, and the result is one
+side-by-side half-equirect still — 8192×4096 or the full 15520×7760.
+
+Three containers in the export bar:
+
+- **PNG (16-bit)** and **JPEG** — developed: as-shot white balance, the
+  DNG colour matrix, the camera's baseline exposure, a filmic tone curve.
+- **DNG (linear raw)** — the camera-native linear data, demosaiced and
+  reprojected but not white-balanced or tone-mapped, with the source's
+  colour matrix, neutral, baseline exposure and EXIF carried over. Raw
+  developers (Lightroom / Camera Raw / Apple's) open it as the X6's own
+  raw and apply their profile, so the VR180 still can be graded with the
+  full raw latitude. Lossless-JPEG tiles (the layout Adobe's own
+  converter writes); validated with exiftool, macOS ImageIO and Adobe
+  DNG Converter.
+
+Stills have no timeline or stabilization; view adjust, stereo alignment,
+eye swap and the colour stack apply as for video.
+
 ### GoPro .360: rolling-shutter correction audited and tightened
 
 The GoPro rolling-shutter term was measured directly for the first time:

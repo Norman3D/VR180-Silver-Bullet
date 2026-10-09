@@ -12,6 +12,9 @@ pub mod audio;
 pub mod braw_imu;
 pub mod decode;
 pub mod dji_imu;
+pub mod raw_develop;
+pub mod ljpeg;
+pub mod dng_write;
 pub mod encode;
 pub mod fisheye_decode;
 pub mod fisheye_export;
@@ -24,6 +27,7 @@ pub mod panomap;
 pub mod render;
 pub mod source_kind;
 pub mod spherical_inject;
+pub mod still_export;
 
 pub use source_kind::SourceKind;
 

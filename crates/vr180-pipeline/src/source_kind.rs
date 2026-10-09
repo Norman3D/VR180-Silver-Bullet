@@ -37,6 +37,11 @@ pub enum SourceKind {
     /// Blackmagic RAW `.braw` (Pyxis 12K, URSA Cine Immersive, etc.).
     /// Multi-track stereo files auto-compose to SBS at the helper.
     BlackmagicRaw,
+    /// Insta360 X6 `.dng` STILL: one 15520×7760 Bayer frame holding both
+    /// fisheye circles side by side (left half = left eye post-mod), with
+    /// the factory lens strings in the EXIF and an Insta360 trailer.
+    /// Not a video: routes through `still_export` / the still preview.
+    Insta360Dng,
     /// Unrecognised — the GUI should surface an "unknown format"
     /// message and let the user pick a preset manually.
     Unknown,
@@ -82,11 +87,17 @@ impl SourceKind {
         matches!(self, Self::DjiOsv | Self::Insta360Insv)
     }
 
+    /// A single still photo (no timeline, no decoder, no stabilization):
+    /// the Insta360 X6 `.dng`.
+    pub fn is_still(self) -> bool {
+        matches!(self, Self::Insta360Dng)
+    }
+
     /// True if we can preview AND export this source to VR180 SBS —
-    /// every fisheye source plus GoPro EAC. Drives the export button,
-    /// the clip list, and batch eligibility.
+    /// every fisheye source plus GoPro EAC, and the X6 still. Drives the
+    /// export button, the clip list, and batch eligibility.
     pub fn is_exportable(self) -> bool {
-        self.is_fisheye() || self.is_eac()
+        self.is_fisheye() || self.is_eac() || self.is_still()
     }
 
     /// Human-readable name (e.g. for log messages / status bars).
@@ -97,6 +108,7 @@ impl SourceKind {
             Self::Insta360Insv  => "Insta360 INSV (dual-stream fisheye)",
             Self::SbsFisheye    => "Side-by-side fisheye",
             Self::BlackmagicRaw => "Blackmagic RAW",
+            Self::Insta360Dng   => "Insta360 X6 DNG still",
             Self::Unknown       => "Unknown",
         }
     }
@@ -119,6 +131,11 @@ pub fn detect(path: &Path) -> Result<SourceKind> {
         Some("osv")  => return Ok(SourceKind::DjiOsv),
         Some("insv") => return Ok(SourceKind::Insta360Insv),
         Some("braw") => return Ok(SourceKind::BlackmagicRaw),
+        Some("dng") => {
+            // Only the Insta360 X6 still (TIFF header + the Insta360
+            // footer magic) — any other DNG stays unsupported.
+            return Ok(if vr180_fisheye::dng::is_insta360_dng(path) { SourceKind::Insta360Dng } else { SourceKind::Unknown });
+        }
         Some("mp4") | Some("mov") | Some("m4v") | Some("mkv") => {
             // Ambiguous: could be GoPro `.mp4` (with `gpmd` stream), DJI
             // OSV-as-`.mp4` (two video streams), a renamed Insta360 `.insv`
@@ -202,6 +219,7 @@ mod tests {
             ("video.OSV", SourceKind::DjiOsv),
             ("VID_20260815_193658_00_030.insv", SourceKind::Insta360Insv),
             ("pyxis.BRAW", SourceKind::BlackmagicRaw),
+            ("IMG_20261007_133105_00_050.dng", SourceKind::Unknown), // no trailer on a bare path
             ("readme.txt", SourceKind::Unknown),
         ];
         for (name, expected) in cases {

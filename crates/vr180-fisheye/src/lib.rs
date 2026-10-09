@@ -37,6 +37,7 @@
 
 pub mod calib;
 pub mod dji_osv;
+pub mod dng;
 pub mod insta360;
 pub mod presets;
 pub mod projection;

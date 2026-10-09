@@ -632,6 +632,60 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    multi-degree roll — use image registration or frame-invariant
    magnitudes); walking-scene lock residuals are parallax-dominated.
 
+18. **Insta360 X6 DNG stills (2026-10-09) — new source kind + still export,
+   SHARED code, unreleased.** The X6 `.dng` = one 15520×7760 TIFF/DNG 1.3,
+   14-bit GBRG Bayer (WhiteLevel 16383, BlackLevel 0), Deflate strips,
+   both fisheye circles side by side (left half = calibration entry 1 =
+   LEFT eye post-mod, right half = entry 2 = RIGHT); ColorMatrix1 (D65),
+   AsShotNeutral, BaselineExposure ≈ 2.6–2.7 EV per shot, OpcodeList2 = 4
+   GainMap opcodes (one per CFA site, 13×34 grid over the whole frame, two
+   vignetting centres, gain 1.0 → 2.65 at the rims = the lens shading);
+   the factory lens strings (same 27-token format as `.insv`, 15488×7744
+   frame) in EXIF UserComment and in the trailer; the trailer is the
+   still-photo layout (the 1415 B before the 78 B footer ARE the
+   ExtraMetadata protobuf: field 19 dims, 25 rolling shutter 37.5 ms, 27
+   window_crop {src 7744² → dst 7760², offset 0}, 65 IMU ranges, 111/112
+   lens strings, 210 a 3×3 orientation at capture; before it a backward
+   chain `[data][u16 id swapped][u32 size]` with 0x0003 IMU (594 × 20 B,
+   0.6 s around capture), 0x0009 AE log, 0x001b, 0x001c). CODE:
+   `vr180_fisheye::dng` (reader: IFD walk, parallel inflate, tags, gain
+   maps, lens strings, still trailer; 9 tests + an ignored sample test;
+   decodes the 142 MB sample byte-identical to the Python reference in
+   ~50 ms warm), `vr180_pipeline::raw_develop` (CPU: gain map, Malvar-He-
+   Cutler demosaic, camera-linear RGBA64 scaled by `1/l_max` with the
+   clipped support flagged in alpha and filled neutral; `develop_display`
+   = WB → inv(ColorMatrix1) with Bradford to D65 → 2^(BaselineExposure+EV)
+   → ACES-fitted tone → sRGB; 11 tests), `vr180_pipeline::dng_write` +
+   `ljpeg` (linear DNG 1.4: IFD0 8-bit thumbnail + SubIFD LinearRaw
+   3×16-bit, 256² lossless-JPEG tiles byte-identical to Adobe DNG
+   Converter's own tiles, or uncompressed strips; the GainMap is baked in
+   and `BaselineExposure += log2(l_max)`; 14 tests + an ignored system
+   test: exiftool -validate OK, sips/ImageIO decodes, Adobe DNG Converter
+   17.3 accepts sample-identically; NOTE macOS ImageIO rejects Deflate and
+   multi-strip LJPEG, and any DNG < 100 KiB), `vr180_pipeline::still_export`
+   (`export_still`: per half develop → `project_fisheye_to_equirect_texture_16`
+   with `still_eye_calib` (= `stream_lens_calib(entry, crop, 7760, 7760)` →
+   `FisheyeCalib::new_omni`) → readback → CPU SBS compose → PNG16 / JPEG /
+   DNG; 0.6 s for 8192×4096 on the M5 Max), `SourceKind::Insta360Dng`
+   (`is_still()`, detect = ext + TIFF header + Insta360 footer),
+   GUI: still-aware load/batch-add (`dng::probe`, no video probe; fps 1,
+   1 frame), settings bucket "dng", preset "Insta360 X6", no LUT, stab
+   panel note, export bar "Still format" (PNG 16-bit / JPEG / DNG linear
+   raw) + Native = 15520×7760, output `<stem>_SBS.<png|jpg|dng>`, the
+   export worker branches on `is_still()`, command-line paths open at
+   startup (`pending_open`). The preview arm (`run_still`, decoder.rs) renders
+   the 2×2-binned develop through the texture-input projection and re-renders
+   on settings changes. MEASURED on the sample: eye order correct (near
+   objects −3° disparity, far −0.2°), far-field vertical offset +0.34° (the
+   rig's relative pitch, same as video — stereo adjust handles it), Apple's
+   raw pipeline renders the linear DNG with the same WB/exposure as our
+   developed PNG. OPEN: the 7744→7760 padding is assumed centred (+8 px,
+   the video rule; ≤0.44° common pan/tilt if wrong); gravity levelling from
+   the trailer IMU/field 210 not implemented (pitch sign unverified); raw
+   exposure/WB sliders not exposed (develop at 0 EV as-shot); `.insp` JPEG
+   not supported; Windows readers (WIC/Lightroom) untested; the headless
+   harness is `examples/dng_still_check.rs` (gitignored).
+
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
   Swift helper); GPU-resident zero-copy P010 for OSV **and** `.360`/EAC. The

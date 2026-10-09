@@ -1345,6 +1345,16 @@ pub fn start_decoder(
         .map_err(|e| { tracing::error!("decoder: source detect failed: {e}"); e })?;
     tracing::info!("decoder: source kind = {:?} ({})", kind, kind.display());
 
+    // Still photo (Insta360 X6 `.dng`): not a video — nothing to probe, no
+    // timeline. One developed + projected frame, re-rendered on every
+    // settings change. Routed before the video probe (which has no stream to
+    // find) and before the platform-specific video arms below.
+    if kind.is_still() {
+        tracing::info!("decoder: routing to still path");
+        let eye_w = cfg.eye_w.clamp(256, 2048);
+        return run_still(pipeline, &cfg, control, kind, eye_w, eye_w, frame_tx, cmd_rx);
+    }
+
     let probe = vr180_pipeline::decode::probe_video(&cfg.path)
         .map_err(|e| { tracing::error!("decoder: probe failed: {e}"); e })?;
     let fps = probe.fps.max(1e-3);
@@ -3502,6 +3512,268 @@ fn upload_rgba8_for_preview(
     Ok(tex)
 }
 
+/// Upload RGBA64 (four `u16` per pixel, row-major) into an `Rgba16Unorm`
+/// texture with TEXTURE_BINDING + COPY_DST — the input the
+/// `project_fisheye_rgba16_texture_*` projections sample.
+fn upload_rgba16_for_preview(
+    pipeline: &Device,
+    rgba64: &[u16],
+    w: u32, h: u32,
+    label: &str,
+) -> anyhow::Result<wgpu::Texture> {
+    anyhow::ensure!(
+        rgba64.len() >= (w as usize) * (h as usize) * 4,
+        "{label}: buffer too short ({} < {w}×{h}×4)", rgba64.len()
+    );
+    let tex = pipeline.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1, sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let bytes: &[u8] = bytemuck::cast_slice(&rgba64[..(w as usize) * (h as usize) * 4]);
+    pipeline.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex, mip_level: 0,
+            origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
+        },
+        bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * 8),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    Ok(tex)
+}
+
+/// The X6 still's two factory lens entries (`[0]` = left half, `[1]` = right
+/// half) in the PREVIEW frame's pixels (`stream_w × stream_h` per half).
+/// Same window rule as `still_export::still_eye_calib` — the 15488×7744
+/// calibration frame sits at offset 0 in each 7760² half (trailer field
+/// 27; the default below when the trailer omits it) — with
+/// `stream_lens_calib`'s stream scale taking it to the binned size, so the
+/// preview's geometry is the export's at ½ (fx/fy/cx/cy × 0.5).
+fn still_lens_calibs(
+    still: &vr180_fisheye::dng::X6Still,
+    stream_w: u32,
+    stream_h: u32,
+) -> (vr180_fisheye::DjiLensCalib, vr180_fisheye::DjiLensCalib) {
+    let half_w = still.width / 2;
+    let half_h = still.height;
+    let crop = still.crop.unwrap_or(vr180_fisheye::InsvWindowCrop {
+        src_w: still.calib_frame.1, src_h: still.calib_frame.1,
+        dst_w: half_w, dst_h: half_h, offset_x: 0, offset_y: 0,
+    });
+    let lens = |i: usize| vr180_pipeline::insv_imu::stream_lens_calib(
+        &still.lenses[i], Some(&crop), stream_w, stream_h);
+    (lens(0), lens(1))
+}
+
+/// Still-photo preview arm (`SourceKind::Insta360Dng`, the Insta360 X6 `.dng`).
+///
+/// No timeline, no video decoder, no IMU. The still is read once, each lens
+/// half is developed on the CPU to camera-linear RGBA64 at the 2×2-binned
+/// preview size (3880² for the X6, ~1–2 s) and those two `LinearEye`s are
+/// kept for the life of the thread. The loop then re-renders the same pair
+/// whenever `settings_generation` bumps — the video arms' pause-loop
+/// mechanics with nothing to pull — and parks in between. Per render:
+/// `develop_display` (only when the develop params moved; cached as the
+/// uploaded `Rgba16Unorm` pair otherwise) → the texture-input fisheye
+/// projection the zero-copy arm uses, with the per-eye UCM calib at the
+/// binned size, the view adjust, and the user swap exchanging the halves
+/// plainly (they are already in L|R order — NOT `dual_stream_iter_swap`) →
+/// `compose_with_color_and_mode`, so the colour stack and the preview modes
+/// apply as for video. Stabilization is meaningless for a still: identity
+/// rotations (`still_eye_rotations`), no RS rows, no automatic eye match.
+/// Geometry matches `still_export::export_still` at half resolution.
+fn run_still(
+    pipeline: Arc<Device>,
+    cfg: &DecoderConfig,
+    control: Arc<DecoderControl>,
+    kind: vr180_pipeline::SourceKind,
+    eye_w: u32,
+    eye_h: u32,
+    frame_tx: Sender<DecodedFrame>,
+    cmd_rx: Receiver<DecoderCommand>,
+) -> anyhow::Result<()> {
+    use vr180_fisheye::dng as x6dng;
+    use vr180_pipeline::raw_develop::{self, DevelopParams, DngColorLike, Half, LinearEye, RawParams};
+    use vr180_pipeline::still_export::still_eye_rotations;
+
+    // A still carries no motion data: nothing to load, nothing to wait for.
+    // Mark the IMU state "ready / none" up front so the sidebar neither
+    // greys out nor spins (the UI spawns the control with `imu_ready` false).
+    control.imu_ready.store(true, Ordering::SeqCst);
+    control.stab_loading.store(false, Ordering::SeqCst);
+    *control.eye_match_readout.lock() = None;
+
+    // ── Read + develop (once) ────────────────────────────────────────
+    let t_read = std::time::Instant::now();
+    let mut still = x6dng::read(&cfg.path)
+        .map_err(|e| anyhow::anyhow!("DNG read {}: {e}", cfg.path.display()))?;
+    if still.lenses.len() < 2 {
+        anyhow::bail!("DNG: no Insta360 lens calibration found in {}", cfg.path.display());
+    }
+    let params = RawParams::from(&still);
+    let gain_maps = raw_develop::gain_maps_from(&still.gain_maps);
+    let color_like = DngColorLike::from(&still.color);
+    let t_dev = std::time::Instant::now();
+    // 2×2-binned halves: ¼ the pixels of the full 7760² half, well inside
+    // wgpu's default 8192 texture limit, and cheap enough to re-develop live.
+    let linear: [LinearEye; 2] = [
+        raw_develop::develop_linear(&still.bayer, &params, &gain_maps, Half::Left, true),
+        raw_develop::develop_linear(&still.bayer, &params, &gain_maps, Half::Right, true),
+    ];
+    // The mosaic (240 MB for the X6) is not needed past this point; the
+    // lens entries / crop / colour tags stay.
+    drop(std::mem::take(&mut still.bayer));
+    let (src_w, src_h) = (linear[0].width, linear[0].height);
+    anyhow::ensure!(
+        linear[1].width == src_w && linear[1].height == src_h,
+        "DNG: lens halves differ in size ({}×{} vs {}×{})",
+        src_w, src_h, linear[1].width, linear[1].height
+    );
+    let max_dim = pipeline.device.limits().max_texture_dimension_2d;
+    anyhow::ensure!(
+        src_w <= max_dim && src_h <= max_dim,
+        "DNG: preview half {}×{} exceeds the device texture limit {}", src_w, src_h, max_dim
+    );
+    tracing::info!(
+        "decoder (still): {}×{} DNG read in {:.0} ms, both halves developed to {}×{} linear in {:.0} ms (l_max {:.2}/{:.2})",
+        still.width, still.height, t_dev.duration_since(t_read).as_secs_f64() * 1e3,
+        src_w, src_h, t_dev.elapsed().as_secs_f64() * 1e3, linear[0].l_max, linear[1].l_max
+    );
+
+    // ── Per-eye factory calibration at the preview size ──────────────
+    // The resolver's carrier is the video convention (lens_b = left eye,
+    // lens_a = right eye), so the un-swapped mapping lands the left half on
+    // the left eye and the user swap exchanges the halves — the same plain
+    // swap applied to the textures below. Calib-only: no quats, no gravity,
+    // so nothing downstream can mistake it for a stabilizable stream.
+    let (lens_left, lens_right) = still_lens_calibs(&still, src_w, src_h);
+    let calib_imu = vr180_fisheye::DjiOsvImu {
+        lens_a: lens_right, lens_b: lens_left, ..Default::default()
+    };
+    // Seeds the per-eye Override UI with the in-file values (as the video
+    // arms do), following the user swap.
+    seed_detected_calib(&control, &calib_imu, src_w, src_h);
+    drop(still);
+
+    // ── Render loop: once now, then on every settings bump ───────────
+    // `developed` caches the display-referred pair as uploaded textures,
+    // keyed on the develop params, so a view / colour / mode change only
+    // re-projects and re-composes (no CPU develop, no 120 MB upload).
+    let mut developed: Option<(u32, wgpu::Texture, wgpu::Texture)> = None;
+    let mut cached_gen = control.settings_generation.load(Ordering::SeqCst);
+    let mut force_render = true;
+    loop {
+        // Commands: Stop ends the thread; a Seek on a one-frame still is a
+        // no-op (the UI's scrub/play controls land here harmlessly).
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                DecoderCommand::Stop => return Ok(()),
+                DecoderCommand::Seek(_) => {}
+            }
+        }
+        let gen = control.settings_generation.load(Ordering::SeqCst);
+        if !force_render && gen == cached_gen {
+            // Parked: the pause-loop cadence of the video arms.
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            continue;
+        }
+        force_render = false;
+        cached_gen = gen;
+        let t_render = std::time::Instant::now();
+        let snap = control.settings.read().clone();
+
+        // 1. Develop to display (white balance, matrix, exposure, tone,
+        //    OETF) — only when the develop params changed.
+        // TODO(still): raw exposure slider — `Settings` has no raw-exposure
+        // field yet; the export's `DevelopParams` defaults are used as is.
+        let develop = DevelopParams { exposure_ev: 0.0, ..DevelopParams::default() };
+        let develop_key = develop.exposure_ev.to_bits();
+        if developed.as_ref().map(|d| d.0) != Some(develop_key) {
+            let t = std::time::Instant::now();
+            let l = raw_develop::develop_display(&linear[0], &color_like, &develop);
+            let tex_l = upload_rgba16_for_preview(&pipeline, &l, src_w, src_h, "still_left_rgba16")?;
+            drop(l);
+            let r = raw_develop::develop_display(&linear[1], &color_like, &develop);
+            let tex_r = upload_rgba16_for_preview(&pipeline, &r, src_w, src_h, "still_right_rgba16")?;
+            drop(r);
+            tracing::info!("decoder (still): developed + uploaded both eyes in {:.0} ms (ev {:+.2})",
+                t.elapsed().as_secs_f64() * 1e3, develop.exposure_ev);
+            developed = Some((develop_key, tex_l, tex_r));
+        }
+        let (_, tex_left_half, tex_right_half) = developed.as_ref().expect("developed above");
+
+        // 2. Eye order + calibration. The halves are already L|R, so the
+        //    user swap exchanges them plainly; the resolver follows the same
+        //    swap for the calib (lens_a ↔ left when swapped), and also
+        //    applies the Override fields and the output-mode shaping
+        //    (fisheye hfov / reframe) exactly as for the X6 video.
+        let swap = snap.effective_swap_eyes();
+        let (src_l, src_r) = if swap {
+            (tex_right_half, tex_left_half)
+        } else {
+            (tex_left_half, tex_right_half)
+        };
+        let (calib_l, calib_r) = resolve_fisheye_calib_pair(&snap, kind, src_w, src_h, Some(&calib_imu));
+        let (rot_l, rot_r) = still_eye_rotations(&snap.output_view_adjust());
+
+        // 3. Project each eye at the preview eye size (output mode's shape).
+        let (ow, oh) = preview_out_dims(snap.fisheye_output_mode, snap.reframe_aspect, eye_w, eye_h);
+        let (left_tex, right_tex) = match snap.fisheye_output_mode {
+            FisheyeOutputMode::Fisheye => (
+                pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                    src_l, src_w, src_h, ow, oh, rot_l, calib_l, 0)?,
+                pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                    src_r, src_w, src_h, ow, oh, rot_r, calib_r, 1)?,
+            ),
+            FisheyeOutputMode::HalfEquirect | FisheyeOutputMode::Reframe => (
+                pipeline.project_fisheye_rgba16_texture_to_equirect_16(
+                    src_l, src_w, src_h, ow, oh, rot_l, calib_l, 0)?,
+                pipeline.project_fisheye_rgba16_texture_to_equirect_16(
+                    src_r, src_w, src_h, ow, oh, rot_r, calib_r, 1)?,
+            ),
+        };
+        let (pe_w, pe_h) = (left_tex.width(), left_tex.height());
+
+        // 4. Colour stack + preview mode (SBS / anaglyph / overlay / single).
+        //    No automatic eye match: that is per-frame video-stream state.
+        let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
+            &pipeline, &snap, &left_tex, &right_tex, pe_w, pe_h, None,
+        )?;
+        tracing::debug!("decoder (still): rendered {}×{} in {:.1} ms (gen {})",
+            out_w, out_h, t_render.elapsed().as_secs_f64() * 1e3, gen);
+
+        // 5. Hand the single frame to the UI (frame 0 at t = 0). Unlike the
+        //    video arms, a render dropped on a full channel would leave the
+        //    stale image on screen, so wait for the UI to drain instead.
+        let mut pending = Some(DecodedFrame {
+            texture: Arc::new(sbs_tex),
+            width: out_w, height: out_h,
+            frame_idx: 0,
+            timestamp_s: 0.0,
+        });
+        while let Some(frame) = pending.take() {
+            match frame_tx.try_send(frame) {
+                Ok(()) => {}
+                Err(TrySendError::Full(frame)) => {
+                    if let Ok(DecoderCommand::Stop) = cmd_rx.try_recv() { return Ok(()); }
+                    std::thread::sleep(std::time::Duration::from_millis(4));
+                    pending = Some(frame);
+                }
+                Err(TrySendError::Disconnected(_)) => return Ok(()),
+            }
+        }
+    }
+}
+
 fn _check_pair_dims(
     pair: &vr180_pipeline::fisheye_decode::FisheyePair,
     src_w: u32,
@@ -3554,7 +3826,8 @@ pub(crate) fn resolve_fisheye_calib_pair(
     .unwrap_or_else(|| {
         let auto_name = match kind {
             vr180_pipeline::SourceKind::DjiOsv         => "DJI Osmo 360",
-            vr180_pipeline::SourceKind::Insta360Insv   => "Insta360 X6",
+            vr180_pipeline::SourceKind::Insta360Insv
+            | vr180_pipeline::SourceKind::Insta360Dng  => "Insta360 X6",
             vr180_pipeline::SourceKind::BlackmagicRaw  => "Blackmagic Pyxis 12K",
             _                                          => "Custom",
         };
@@ -3579,8 +3852,13 @@ pub(crate) fn resolve_fisheye_calib_pair(
 
     // For OSV: per-lens protobuf fx/fy/cx/cy + pure-KB projection. After
     // the DJI iter's default swap: left = Lens B, right = Lens A.
+    // The X6 STILL takes this arm too: `run_still` hands in a calib-only
+    // carrier (lens_b = left half, lens_a = right half) built from the
+    // DNG's factory lens strings at the preview size.
     let (calib_l, calib_r) = match (kind, osv) {
-        (vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv, Some(imu)) => {
+        (vr180_pipeline::SourceKind::DjiOsv
+         | vr180_pipeline::SourceKind::Insta360Insv
+         | vr180_pipeline::SourceKind::Insta360Dng, Some(imu)) => {
             let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
             let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
             let eye = |lens: &vr180_fisheye::DjiLensCalib,

@@ -4033,6 +4033,7 @@ name = "vr180-fisheye"
 version = "2.5.1"
 dependencies = [
  "anyhow",
+ "flate2",
  "nalgebra",
  "serde",
  "serde_json",

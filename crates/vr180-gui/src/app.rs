@@ -52,6 +52,10 @@ pub struct App {
 
     // ─── User-visible state ──────────────────────────────────────
     loaded_path: Option<PathBuf>,
+    /// Files named on the command line (`vr180-gui a.insv b.dng`, or macOS
+    /// `open App.app --args …`): opened on the first frame, once the
+    /// window exists.
+    pending_open: Vec<PathBuf>,
     /// Last (swap, upside_down) pair the decoder was opened with —
     /// a change triggers an automatic clip reload (the dual-stream
     /// iterators bind eye order at open).
@@ -313,6 +317,32 @@ pub struct App {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportCodec { H265, ProRes }
 
+/// Output container for a STILL source (Insta360 X6 `.dng`). Videos
+/// use `ExportCodec`; stills use this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StillFormatChoice { Png16, Jpeg, LinearDng }
+
+impl StillFormatChoice {
+    fn label(self) -> &'static str {
+        match self {
+            StillFormatChoice::Png16 => "PNG (16-bit)",
+            StillFormatChoice::Jpeg => "JPEG",
+            StillFormatChoice::LinearDng => "DNG (linear raw)",
+        }
+    }
+    fn extension(self) -> &'static str {
+        match self { Self::Png16 => "png", Self::Jpeg => "jpg", Self::LinearDng => "dng" }
+    }
+    fn to_pipeline(self) -> vr180_pipeline::still_export::StillFormat {
+        use vr180_pipeline::still_export::StillFormat as F;
+        match self {
+            Self::Png16 => F::Png16,
+            Self::Jpeg => F::Jpeg { quality: 92 },
+            Self::LinearDng => F::LinearDng { compression: vr180_pipeline::dng_write::DngCompression::LosslessJpegTiles },
+        }
+    }
+}
+
 /// Output resolution target for the export. `Native` renders at the
 /// source's per-eye dimensions — labeled by the OSV case (3840² per eye
 /// → 7680×3840 SBS); a `.360` source actually renders its cross-native
@@ -403,6 +433,8 @@ impl ProResProfile {
 #[derive(Debug, Clone, Copy)]
 struct ExportOptions {
     codec: ExportCodec,
+    /// Still-photo container (used only when the source is a still).
+    still_format: StillFormatChoice,
     /// Output resolution target (Native / 8192×4096).
     resolution: ExportResolution,
     /// H.265 average bitrate in Mbps for VR180 output. Range 20..=500.
@@ -491,6 +523,7 @@ impl Default for ExportOptions {
     fn default() -> Self {
         Self {
             codec: ExportCodec::H265,
+            still_format: StillFormatChoice::Png16,
             resolution: ExportResolution::R8k,
             h265_bitrate_mbps: 200,
             reframe_bitrate_mbps: 35,
@@ -669,6 +702,9 @@ fn tr(en: &'static str) -> &'static str {
         "Reset" => "重置",
         // Export format window (export_options_ui)
         "Resolution" => "分辨率",
+        "Still format" => "照片格式",
+        "DNG keeps the camera-native linear data with the raw colour tags — grade it in a raw developer." => "DNG 保留相机原生线性数据和 RAW 色彩标签——可在 RAW 软件里继续调色。",
+        "Still photo — no stabilization. Use the View adjust / stereo controls to level and align." => "静态照片——没有防抖。用视角调整 / 立体控制来调平和对齐。",
         "Codec" => "编码",
         "Bitrate (Mbps)" => "码率 (Mbps)",
         "Bit depth" => "位深",
@@ -1127,6 +1163,8 @@ impl App {
             egui_renderer: wgpu_state.renderer.clone(),
             preview_view_format,
             loaded_path: None,
+            pending_open: std::env::args_os().skip(1).map(PathBuf::from)
+                .filter(|p| p.is_file()).collect(),
             eye_orientation_applied: (defaults.fisheye_swap_eyes, defaults.camera_upside_down),
             clip: None,
             playing: false,
@@ -1399,6 +1437,15 @@ impl App {
             .join(format!("{stem}_SBS.{ext}"))
     }
 
+    /// `<source_stem>_SBS.<png|jpg|dng>` next to the source (stills).
+    fn default_still_output_for(source: &std::path::Path, format: StillFormatChoice) -> PathBuf {
+        let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+        source.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+            .join(format!("{stem}_SBS.{}", format.extension()))
+    }
+
     /// Build the full `FisheyeExportConfig` for one (source, output) pair
     /// from explicit clip facts + a Settings/ExportOptions pair. Pure —
     /// used by both the single export (current clip + live settings) and
@@ -1592,6 +1639,7 @@ impl App {
         eac_stab: Option<(crate::decoder::Settings, usize)>,
     ) {
         let output_path = cfg.output_path.clone();
+        let still_format = self.batch_opts.unwrap_or(self.export_opts).still_format;
 
         // Stop preview playback when it reads the SAME file as the export
         // (they'd race on the decoder / file). Previewing a DIFFERENT clip
@@ -1645,6 +1693,27 @@ impl App {
                     move |p| { let _ = progress_tx.try_send(p); },
                     cancel_for_thread,
                 )
+            } else if cfg.source_kind.is_still() {
+                // Still photo: one frame through the raw stage + projection,
+                // written as PNG / JPEG / linear DNG. Progress is reported as a
+                // 0..100 "frame" count so the export bar needs no special case.
+                let still_cfg = vr180_pipeline::still_export::StillExportConfig {
+                    source_path: cfg.source_path.clone(),
+                    output_path: cfg.output_path.clone(),
+                    format: still_format.to_pipeline(),
+                    eye_w: cfg.eye_w, eye_h: cfg.eye_h,
+                    view_adjust: cfg.view_adjust,
+                    swap_eyes: cfg.fisheye_swap_eyes,
+                    develop: vr180_pipeline::raw_develop::DevelopParams::default(),
+                };
+                let t0 = std::time::Instant::now();
+                vr180_pipeline::still_export::export_still(pipeline, &still_cfg, &|_stage, f| {
+                    let done = (f * 100.0).round() as u64;
+                    let _ = progress_tx2.try_send(vr180_pipeline::fisheye_export::ExportProgress {
+                        frame_idx: done.min(100), total_frames: 100,
+                        fps_avg: done as f32 / t0.elapsed().as_secs_f32().max(1e-3),
+                    });
+                })
             } else {
                 vr180_pipeline::fisheye_export::export_fisheye(
                     pipeline, cfg,
@@ -2004,6 +2073,7 @@ impl App {
             K::GoProEac       => "eac",
             K::SbsFisheye     => "sbs",
             K::BlackmagicRaw  => "braw",
+            K::Insta360Dng    => "dng",
             _                 => "other",
         }
     }
@@ -2075,15 +2145,22 @@ impl App {
                 tracing::warn!("batch: skipping non-exportable source {}", path.display());
                 continue;
             }
-            let probe = match vr180_pipeline::decode::probe_video(&path) {
+            let probe = if source_kind.is_still() {
+                // One Bayer frame, both eyes side by side: no video probe.
+                match vr180_fisheye::dng::probe(&path) {
+                    Ok((w, h)) => vr180_pipeline::decode::VideoProbe { width: w, height: h, fps: 1.0, duration_sec: 0.0 },
+                    Err(e) => { tracing::warn!("batch: DNG probe failed for {}: {e}", path.display()); continue; }
+                }
+            } else { match vr180_pipeline::decode::probe_video(&path) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("batch: probe failed for {}: {e}", path.display());
                     continue;
                 }
-            };
+            } };
             let (fisheye_eye_w, fisheye_eye_h) = match source_kind {
-                vr180_pipeline::SourceKind::SbsFisheye => (probe.width / 2, probe.height),
+                vr180_pipeline::SourceKind::SbsFisheye
+                | vr180_pipeline::SourceKind::Insta360Dng => (probe.width / 2, probe.height),
                 vr180_pipeline::SourceKind::DjiOsv
                 | vr180_pipeline::SourceKind::Insta360Insv => (probe.width, probe.height),
                 vr180_pipeline::SourceKind::BlackmagicRaw => {
@@ -2172,7 +2249,11 @@ impl App {
     /// folder (or next to the source), auto-renamed ` (2)`, ` (3)`… on
     /// collision rather than overwriting or silently skipping.
     fn batch_output_for(&self, item: &BatchItem, opts: &ExportOptions) -> PathBuf {
-        let mut out = Self::default_output_for(&item.path, opts.codec);
+        let mut out = if item.source_kind.is_still() {
+            Self::default_still_output_for(&item.path, opts.still_format)
+        } else {
+            Self::default_output_for(&item.path, opts.codec)
+        };
         if let Some(dir) = &self.batch_out_dir {
             if let Some(name) = out.file_name() {
                 out = dir.join(name);
@@ -2903,9 +2984,14 @@ impl App {
             .unwrap_or(vr180_pipeline::SourceKind::Unknown);
         tracing::info!("load_file: {} → kind={:?}", path.display(), source_kind);
 
-        let probe = vr180_pipeline::decode::probe_video(&path)
-            .map_err(|e| format!("probe failed: {e}"))?;
-        tracing::info!("load_timing: after probe_video @ {:?}", t_load.elapsed());
+        let probe = if source_kind.is_still() {
+            let (w, h) = vr180_fisheye::dng::probe(&path).map_err(|e| format!("DNG probe failed: {e}"))?;
+            vr180_pipeline::decode::VideoProbe { width: w, height: h, fps: 1.0, duration_sec: 0.0 }
+        } else {
+            vr180_pipeline::decode::probe_video(&path)
+                .map_err(|e| format!("probe failed: {e}"))?
+        };
+        tracing::info!("load_timing: after probe @ {:?}", t_load.elapsed());
 
         // GoPro family: parse GPMF + GEOC for metadata display + RS auto-detect.
         let (cori_count, grav_count, srot_ms, detected_rs_mode) =
@@ -2940,7 +3026,8 @@ impl App {
 
         // Fisheye family: compute one-eye dimensions for FOV slider hints.
         let (fisheye_eye_w, fisheye_eye_h) = match source_kind {
-            vr180_pipeline::SourceKind::SbsFisheye => (probe.width / 2, probe.height),
+            vr180_pipeline::SourceKind::SbsFisheye
+            | vr180_pipeline::SourceKind::Insta360Dng => (probe.width / 2, probe.height),
             vr180_pipeline::SourceKind::DjiOsv
             | vr180_pipeline::SourceKind::Insta360Insv => (probe.width, probe.height),
             vr180_pipeline::SourceKind::BlackmagicRaw => {
@@ -2958,8 +3045,9 @@ impl App {
             _ => (0, 0),
         };
 
-        let segments = merge_entry
-            .unwrap_or_else(|| vr180_core::segments::detect_segments(&path));
+        let segments = if source_kind.is_still() { vec![path.clone()] } else {
+            merge_entry.unwrap_or_else(|| vr180_core::segments::detect_segments(&path))
+        };
         tracing::info!("load_timing: after clip_segments ({} segs) @ {:?}",
             segments.len(), t_load.elapsed());
 
@@ -2989,6 +3077,8 @@ impl App {
                 "multi-segment: {} chapters → {:.1}s, {} frames total",
                 segments.len(), total_dur, total_frames);
             (total_dur, total_frames)
+        } else if source_kind.is_still() {
+            (0.0, 1)
         } else {
             (probe.duration_sec, (probe.duration_sec * probe.fps as f64).round() as u32)
         };
@@ -3048,7 +3138,8 @@ impl App {
         {
             let auto = match source_kind {
                 vr180_pipeline::SourceKind::DjiOsv        => "DJI Osmo 360",
-                vr180_pipeline::SourceKind::Insta360Insv  => "Insta360 X6",
+                vr180_pipeline::SourceKind::Insta360Insv
+                | vr180_pipeline::SourceKind::Insta360Dng => "Insta360 X6",
                 vr180_pipeline::SourceKind::BlackmagicRaw => "Blackmagic Pyxis 12K",
                 _                                         => "Custom",
             };
@@ -3725,6 +3816,7 @@ impl App {
         if self.show_export_settings {
             let mut open = true;
             let clip_fps = self.clip.as_ref().map(|c| c.fps).unwrap_or(30.0);
+            let is_still = self.clip.as_ref().map(|c| c.source_kind.is_still()).unwrap_or(false);
             egui::Window::new(tr("Export format"))
                 .collapsible(false)
                 .resizable(false)
@@ -3733,7 +3825,7 @@ impl App {
                 .show(ctx, |ui| {
                     ui.set_min_width(360.0);
                     Self::export_options_ui(ui, &mut self.export_opts, "export",
-                        self.settings.reframe_aspect_if_active(), clip_fps);
+                        self.settings.reframe_aspect_if_active(), clip_fps, is_still);
                 });
             self.show_export_settings = open;
         }
@@ -3746,6 +3838,7 @@ impl App {
         ui: &mut egui::Ui, opts: &mut ExportOptions, id_prefix: &str,
         reframe: Option<crate::decoder::ReframeAspect>,
         fps: f32,
+        is_still: bool,
     ) {
         if let Some(aspect) = reframe {
             // Reframed view: the exact viewport at a per-eye size.
@@ -3762,17 +3855,35 @@ impl App {
                 .small().color(Color32::GRAY));
         } else {
             ui.label(RichText::new(tr("Resolution")).strong());
+            let native_label = if is_still { "15520 × 7760 (full)" } else { ExportResolution::Native.label() };
+            let sel_label = if opts.resolution == ExportResolution::Native { native_label } else { ExportResolution::R8k.label() };
             egui::ComboBox::from_id_source(format!("{id_prefix}_resolution"))
-                .selected_text(opts.resolution.label())
+                .selected_text(sel_label)
                 .width(220.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut opts.resolution,
-                        ExportResolution::Native, ExportResolution::Native.label());
+                        ExportResolution::Native, native_label);
                     ui.selectable_value(&mut opts.resolution,
                         ExportResolution::R8k, ExportResolution::R8k.label());
                 });
         }
         ui.add_space(8.0);
+
+        if is_still {
+            ui.label(RichText::new(tr("Still format")).strong());
+            egui::ComboBox::from_id_source(format!("{id_prefix}_still_format"))
+                .selected_text(opts.still_format.label())
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for f in [StillFormatChoice::Png16, StillFormatChoice::Jpeg, StillFormatChoice::LinearDng] {
+                        ui.selectable_value(&mut opts.still_format, f, f.label());
+                    }
+                });
+            ui.label(RichText::new(tr("DNG keeps the camera-native linear data with the raw colour tags — grade it in a raw developer."))
+                .small().color(Color32::GRAY));
+            ui.add_space(8.0);
+            return;
+        }
 
         ui.label(RichText::new(tr("Codec")).strong());
         egui::ComboBox::from_id_source(format!("{id_prefix}_codec"))
@@ -3948,6 +4059,10 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Mirror the chosen language into the process global that `tr` reads.
         set_cur_lang(self.lang);
+        if !self.pending_open.is_empty() {
+            let paths = std::mem::take(&mut self.pending_open);
+            self.open_paths(paths);
+        }
         // Drain decoder frames first so the most recent texture is
         // ready by the time we render the central panel.
         self.drain_frames(ctx);
@@ -5143,8 +5258,9 @@ impl App {
             .add_filter(
                 "All supported video",
                 &["360", "osv", "OSV", "insv", "INSV", "braw", "BRAW",
-                  "mp4", "MP4", "mov", "MOV"],
+                  "mp4", "MP4", "mov", "MOV", "dng", "DNG"],
             )
+            .add_filter("Insta360 X6 still (.dng)", &["dng", "DNG"])
             .add_filter("DJI Osmo 360 (.osv)", &["osv", "OSV"])
             .add_filter("Insta360 (.insv)", &["insv", "INSV"])
             .add_filter("Blackmagic RAW (.braw)", &["braw", "BRAW"])
@@ -5702,6 +5818,11 @@ impl App {
     fn draw_fisheye_stab_panel(&mut self, ui: &mut egui::Ui) {
         use std::sync::atomic::Ordering;
         let kind = self.clip.as_ref().map(|c| c.source_kind);
+        if matches!(kind, Some(k) if k.is_still()) {
+            ui.label(RichText::new(tr("Still photo — no stabilization. Use the View adjust / stereo controls to level and align."))
+                .small().color(Color32::GRAY));
+            return;
+        }
         let is_braw = matches!(kind, Some(vr180_pipeline::SourceKind::BlackmagicRaw));
         let is_osv  = matches!(kind, Some(vr180_pipeline::SourceKind::DjiOsv));
         // Insta360: raw gyro fused at load (VQF) — same stab controls as OSV,

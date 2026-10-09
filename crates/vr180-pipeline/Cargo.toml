@@ -10,6 +10,8 @@ description = "I/O + GPU pipeline for VR180 Silver Bullet: ffmpeg-next decode/en
 path = "src/lib.rs"
 
 [dependencies]
+# PNG16 / JPEG still output (still_export) and the headless preview dumps.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 vr180-core = { workspace = true }
 vr180-fisheye = { workspace = true }
 vr180-braw = { workspace = true }
@@ -75,7 +77,6 @@ windows = { version = "0.62", features = [
 [dev-dependencies]
 # PNG dump for the headless preview-repro example (lets us eyeball the exact
 # zero-copy preview output without the GUI).
-image = { version = "0.25", default-features = false, features = ["png"] }
 # Surfaces the pipeline's `tracing` logs (perf timings, path-engaged lines) in
 # the headless examples — the lib emits via `tracing`, which needs a subscriber.
 tracing-subscriber = "0.3"
