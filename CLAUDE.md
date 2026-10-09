@@ -456,7 +456,16 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    walk stops at the first in-flight slot; the panel keys on `decoder_alive`
    (an exited worker used to leave "Measuring…"), and a frame the reduce
    cannot use (mostly sky / black) says so via `EyeMatchReadout::reason`.
-   Known/accepted: the Windows arms are unverified here; the export does
+   **Windows arms VERIFIED on the Windows box (2026-10-09):** real X6 clip
+   (026) through BOTH blind-edited export arms via `export_smoke` +
+   `VR180_EYE_MATCH=avg` — eyes sat 0.22 EV apart with matching off; with it
+   on, the zc readback arm closed the gap to 0.046 EV (79%) and the
+   GPU-resident NVENC arm to 0.048 EV (78%), both moving symmetrically
+   toward the middle as Average specifies, and the two arms agree to
+   0.1/255. No panics; OSV/SBS/.360 exports byte-identical with it off.
+   The PREVIEW arm (`run_fisheye_zerocopy` state creation) is launched
+   only — the app takes no file argument, so it was not driven headless.
+   Known/accepted: the export does
    not publish a readout; Play stays enabled during an export.
 
 16. **GoPro stabilization investigation + per-frame exposure timing
