@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::dng_write::{self, DngCompression, LinearDngImage, LinearDngMeta};
-use crate::gpu::{Device, EquirectRotation, FisheyeCalib};
+use crate::gpu::{ColorStackPlan, Device, EquirectRotation, FisheyeCalib};
 use crate::insv_imu;
 use crate::panomap::{mat3_mul_row_major, ViewAdjust};
 use crate::raw_develop::{self, DevelopParams, DngColorLike, GainMapLike, Half, LinearEye, RawParams};
@@ -70,6 +70,11 @@ pub struct StillExportConfig {
     pub swap_eyes: bool,
     /// Developed-output parameters (ignored for the linear DNG).
     pub develop: DevelopParams,
+    /// The app's colour stack (CDL / LUT / temperature-tint-saturation /
+    /// sharpen …). Baked into PNG / JPEG after projection, exactly as the
+    /// video export does; for the linear DNG it is NOT baked (see the
+    /// metadata path).
+    pub color_stack: ColorStackPlan,
 }
 
 /// Progress callback: `(stage, fraction 0..1)`.
@@ -117,7 +122,7 @@ pub fn still_eye_rotations(view_adjust: &ViewAdjust) -> (EquirectRotation, Equir
     )
 }
 
-/// One projected eye: RGBA64LE bytes, `eye_w × eye_h`.
+/// One projected eye as an `Rgba16Unorm` texture, `eye_w × eye_h`.
 fn project_eye(
     device: &Device,
     rgba64: &[u16],
@@ -125,11 +130,9 @@ fn project_eye(
     eye_w: u32, eye_h: u32,
     rot: EquirectRotation,
     calib: FisheyeCalib,
-) -> Result<Vec<u8>> {
+) -> Result<wgpu::Texture> {
     let bytes: &[u8] = bytemuck::cast_slice(rgba64);
-    let tex = device.project_fisheye_to_equirect_texture_16(bytes, src_w, src_h, eye_w, eye_h, rot, calib)?;
-    let out = device.read_texture_rgba64(&tex, eye_w, eye_h)?;
-    Ok(out)
+    device.project_fisheye_to_equirect_texture_16(bytes, src_w, src_h, eye_w, eye_h, rot, calib)
 }
 
 /// Compose two RGBA64LE eyes side by side into interleaved RGB16 (no alpha).
@@ -205,11 +208,11 @@ pub fn export_still(device: Arc<Device>, cfg: &StillExportConfig, progress: Stil
 
     // Eye order: left half → left eye unless swapped.
     let order = if cfg.swap_eyes { [Half::Right, Half::Left] } else { [Half::Left, Half::Right] };
-    let mut eyes: Vec<Vec<u8>> = Vec::with_capacity(2);
+    let mut eye_tex: Vec<wgpu::Texture> = Vec::with_capacity(2);
     let mut l_max = 1.0_f32;
     for (i, half) in order.iter().enumerate() {
         let label = if i == 0 { "left" } else { "right" };
-        progress(&format!("Developing {label} eye"), 0.1 + 0.35 * i as f32);
+        progress(&format!("Developing {label} eye"), 0.1 + 0.3 * i as f32);
         let eye: LinearEye = raw_develop::develop_linear(&still.bayer, &params, &gain_maps, *half, false);
         l_max = l_max.max(eye.l_max);
         let rgba: Vec<u16> = if linear {
@@ -218,15 +221,27 @@ pub fn export_still(device: Arc<Device>, cfg: &StillExportConfig, progress: Stil
             raw_develop::develop_display(&eye, &color_like, &cfg.develop)
         };
         drop(eye);
-        progress(&format!("Projecting {label} eye"), 0.25 + 0.35 * i as f32);
+        progress(&format!("Projecting {label} eye"), 0.25 + 0.3 * i as f32);
         let calib = still_eye_calib(&still, *half)?;
         let rot = if i == 0 { rot_l } else { rot_r };
-        let out = project_eye(&device, &rgba, half_w, half_h, cfg.eye_w, cfg.eye_h, rot, calib)?;
-        eyes.push(out);
+        eye_tex.push(project_eye(&device, &rgba, half_w, half_h, cfg.eye_w, cfg.eye_h, rot, calib)?);
     }
-    progress("Writing", 0.85);
-    let rgb16 = compose_rgb16(&eyes[0], &eyes[1], cfg.eye_w, cfg.eye_h);
-    drop(eyes);
+    // The colour stack: baked into the developed outputs (same 16-bit GPU
+    // stages as the video export, per eye, after projection). The linear
+    // DNG keeps camera-native data — its grade travels as metadata.
+    if !linear && cfg.color_stack.any_active() {
+        progress("Colour stack", 0.8);
+        let (l, r) = device.apply_color_stack_pair_16(&eye_tex[0], &eye_tex[1], cfg.eye_w, cfg.eye_h, &cfg.color_stack, None)?;
+        if let Some(t) = l { eye_tex[0] = t; }
+        if let Some(t) = r { eye_tex[1] = t; }
+    }
+    progress("Reading back", 0.85);
+    let left = device.read_texture_rgba64(&eye_tex[0], cfg.eye_w, cfg.eye_h)?;
+    let right = device.read_texture_rgba64(&eye_tex[1], cfg.eye_w, cfg.eye_h)?;
+    drop(eye_tex);
+    progress("Writing", 0.9);
+    let rgb16 = compose_rgb16(&left, &right, cfg.eye_w, cfg.eye_h);
+    drop(left); drop(right);
     let (w, h) = (cfg.eye_w * 2, cfg.eye_h);
     write_output(&cfg.output_path, cfg.format, w, h, &rgb16, &still, l_max)?;
     progress("Done", 1.0);

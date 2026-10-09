@@ -703,6 +703,8 @@ fn tr(en: &'static str) -> &'static str {
         // Export format window (export_options_ui)
         "Resolution" => "分辨率",
         "Still format" => "照片格式",
+        "Still" => "照片",
+        "single photo, 14-bit raw" => "单张照片，14 位 RAW",
         "DNG keeps the camera-native linear data with the raw colour tags — grade it in a raw developer." => "DNG 保留相机原生线性数据和 RAW 色彩标签——可在 RAW 软件里继续调色。",
         "Still photo — no stabilization. Use the View adjust / stereo controls to level and align." => "静态照片——没有防抖。用视角调整 / 立体控制来调平和对齐。",
         "Codec" => "编码",
@@ -1705,6 +1707,7 @@ impl App {
                     view_adjust: cfg.view_adjust,
                     swap_eyes: cfg.fisheye_swap_eyes,
                     develop: vr180_pipeline::raw_develop::DevelopParams::default(),
+                    color_stack: cfg.color_stack.clone(),
                 };
                 let t0 = std::time::Instant::now();
                 vr180_pipeline::still_export::export_still(pipeline, &still_cfg, &|_stage, f| {
@@ -4352,7 +4355,31 @@ impl eframe::App for App {
                 // Output are top-level sections; the camera-preset /
                 // per-eye FOV / center / KB panel is its own (collapsed)
                 // section. GoPro EAC keeps the existing stab + RS panels.
-                if matches!(kind, Some(k) if k.is_fisheye()) {
+                let is_still = matches!(kind, Some(k) if k.is_still());
+                if is_still {
+                    // Still photo: no timeline, no gyro, no rolling shutter,
+                    // no audio — only the geometry and colour sections apply.
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new(
+                        RichText::new(tr("View adjustment")).strong()
+                    )
+                    .default_open(true)
+                    .show(ui, |ui| { self.draw_view_adjust_panel(ui); });
+
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new(
+                        RichText::new(tr("Output")).strong()
+                    )
+                    .default_open(true)
+                    .show(ui, |ui| { self.draw_fisheye_output_panel(ui); });
+
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new(
+                        RichText::new(tr("Fisheye lens")).strong()
+                    )
+                    .default_open(false)
+                    .show(ui, |ui| { self.draw_fisheye_panel(ui); });
+                } else if matches!(kind, Some(k) if k.is_fisheye()) {
                     ui.add_space(4.0);
                     egui::CollapsingHeader::new(
                         RichText::new(tr("View adjustment")).strong()
@@ -4445,7 +4472,8 @@ impl eframe::App for App {
                 // exportable clip loaded; auto-hidden on Windows / older macOS
                 // / incapable hardware (see `denoise_supported`).
                 let nr_show = Self::denoise_supported()
-                    && self.clip.as_ref().map_or(false, |c| c.source_kind.is_exportable());
+                    && self.clip.as_ref().map_or(false, |c| c.source_kind.is_exportable())
+                    && !is_still; // temporal filter — meaningless for one frame
                 if nr_show {
                     ui.add_space(4.0);
                     egui::CollapsingHeader::new(
@@ -4547,9 +4575,13 @@ impl eframe::App for App {
         });
 
         // ─── Timeline scrubber ──────────────────────────────────
-        egui::TopBottomPanel::bottom("timeline").exact_height(34.0).show(ctx, |ui| {
-            self.draw_timeline(ui);
-        });
+        // A still has no timeline — skip the scrubber strip entirely.
+        let timeline_applies = !self.clip.as_ref().map_or(false, |c| c.source_kind.is_still());
+        if timeline_applies {
+            egui::TopBottomPanel::bottom("timeline").exact_height(34.0).show(ctx, |ui| {
+                self.draw_timeline(ui);
+            });
+        }
 
         // ─── Export bar (output settings + run the queue) ───────
         self.draw_export_bar(ctx);
@@ -5298,14 +5330,21 @@ impl App {
                     ui.label(RichText::new(tr("Stream")).color(Color32::GRAY).small());
                     ui.label(format!("{} × {}", c.width, c.height));
                 });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(tr("FPS")).color(Color32::GRAY).small());
-                    ui.label(format!("{:.3}", c.fps));
-                });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(tr("Duration")).color(Color32::GRAY).small());
-                    ui.label(format!("{:.2}s ({} frames)", c.duration_sec, c.frame_count));
-                });
+                if c.source_kind.is_still() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(tr("Still")).color(Color32::GRAY).small());
+                        ui.label(tr("single photo, 14-bit raw"));
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(tr("FPS")).color(Color32::GRAY).small());
+                        ui.label(format!("{:.3}", c.fps));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(tr("Duration")).color(Color32::GRAY).small());
+                        ui.label(format!("{:.2}s ({} frames)", c.duration_sec, c.frame_count));
+                    });
+                }
                 if c.source_kind.is_eac() {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(tr("EAC tile")).color(Color32::GRAY).small());
