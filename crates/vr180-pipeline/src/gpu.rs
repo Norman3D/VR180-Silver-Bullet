@@ -6983,65 +6983,96 @@ impl Device {
     /// bytes per pixel, little-endian, alpha channel dropped). The
     /// returned buffer is suitable for ffmpeg's RGB48LE pixel format
     /// → swscale → YUV420P10LE → Main10 encode.
+    /// Copy an `Rgba16Unorm` texture back to the CPU, 8 bytes/pixel, rows
+    /// tightly packed (`w*h*8` bytes). The copy runs in ROW BANDS through a
+    /// staging buffer of at most [`Self::READBACK_BAND_BYTES`]: wgpu's
+    /// default `max_buffer_size` is 256 MiB, and a full-resolution still eye
+    /// (7760² × 8 B = 482 MB) blew through it — the buffer came back invalid
+    /// and `map_async` failed. Bands also cap the transient memory.
+    fn read_texture_rgba64_bands(
+        &self,
+        tex: &wgpu::Texture,
+        w: u32,
+        h: u32,
+        label: &'static str,
+    ) -> Result<Vec<u8>> {
+        let bpp = 8u32;
+        let unpadded_row_bytes = w * bpp;
+        let padded_row_bytes = (unpadded_row_bytes + 255) & !255;
+        let rows_per_band = (Self::READBACK_BAND_BYTES / padded_row_bytes as u64).max(1) as u32;
+        let row_bytes = unpadded_row_bytes as usize;
+        let mut out = vec![0u8; row_bytes * h as usize];
+        let mut y0 = 0u32;
+        while y0 < h {
+            let rows = rows_per_band.min(h - y0);
+            let buf_size = (padded_row_bytes * rows) as u64;
+            let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: buf_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some(label),
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex, mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: y0, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &staging,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_row_bytes),
+                        rows_per_image: Some(rows),
+                    },
+                },
+                wgpu::Extent3d { width: w, height: rows, depth_or_array_layers: 1 },
+            );
+            self.queue.submit(Some(encoder.finish()));
+
+            let slice = staging.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            rx.recv()
+                .map_err(|_| Error::Wgpu("staging map send channel closed".into()))?
+                .map_err(|e| Error::Wgpu(format!("staging map ({w}×{h}, band {y0}+{rows}): {e}")))?;
+            let mapped = slice.get_mapped_range();
+            for r in 0..rows as usize {
+                let src = r * padded_row_bytes as usize;
+                let dst = (y0 as usize + r) * row_bytes;
+                out[dst..dst + row_bytes].copy_from_slice(&mapped[src..src + row_bytes]);
+            }
+            drop(mapped);
+            staging.unmap();
+            y0 += rows;
+        }
+        Ok(out)
+    }
+
+    /// Largest staging buffer a texture readback allocates (64 MiB): well
+    /// under wgpu's default 256 MiB `max_buffer_size`, ~8 rows of an 8K
+    /// SBS frame per band at most... i.e. one band for every video size the
+    /// app exports, several for a native still eye.
+    pub const READBACK_BAND_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// Read an `Rgba16Unorm` texture back as RGB48LE (6 bytes/pixel, alpha
+    /// dropped) for the encoder. Banded — see [`Self::read_texture_rgba64_bands`].
     pub fn read_texture_rgb48(
         &self,
         tex: &wgpu::Texture,
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        // Rgba16Unorm is 8 bytes/pixel on the GPU; we drop the 2 alpha
-        // bytes to emit RGB48LE (6 bytes/pixel) for the encoder.
-        let bpp = 8u32;
-        let unpadded_row_bytes = w * bpp;
-        let padded_row_bytes = (unpadded_row_bytes + 255) & !255;
-        let buf_size = (padded_row_bytes * h) as u64;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("read_texture_rgb48_staging"),
-            size: buf_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("read_texture_rgb48_enc"),
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: tex, mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &staging,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_row_bytes),
-                    rows_per_image: Some(h),
-                },
-            },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
-        self.queue.submit(Some(encoder.finish()));
-
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-        rx.recv()
-            .map_err(|_| Error::Wgpu("staging map send channel closed".into()))?
-            .map_err(|e| Error::Wgpu(format!("staging map: {e}")))?;
-        let mapped = slice.get_mapped_range();
-
+        let rgba = self.read_texture_rgba64_bands(tex, w, h, "read_texture_rgb48_staging")?;
         // Pack 8-byte RGBA64LE → 6-byte RGB48LE per pixel (strip alpha).
         let mut out = Vec::with_capacity((w * h * 6) as usize);
-        for y in 0..h {
-            let row_off = (y * padded_row_bytes) as usize;
-            for x in 0..w {
-                let px_off = row_off + (x * 8) as usize;
-                out.extend_from_slice(&mapped[px_off..px_off + 6]);
-            }
+        for px in rgba.chunks_exact(8) {
+            out.extend_from_slice(&px[..6]);
         }
-        drop(mapped);
-        staging.unmap();
         Ok(out)
     }
 
@@ -7050,66 +7081,14 @@ impl Device {
     /// encoder's swscale drops the alpha + converts to YUV in one SIMD
     /// pass; doing the alpha strip here meant a ~30M-iteration/frame loop
     /// on the export's main-thread critical path. Returns `w*h*8` bytes,
-    /// tightly packed.
+    /// tightly packed. Banded — see [`Self::read_texture_rgba64_bands`].
     pub fn read_texture_rgba64(
         &self,
         tex: &wgpu::Texture,
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let bpp = 8u32;
-        let unpadded_row_bytes = w * bpp;
-        let padded_row_bytes = (unpadded_row_bytes + 255) & !255;
-        let buf_size = (padded_row_bytes * h) as u64;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("read_texture_rgba64_staging"),
-            size: buf_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("read_texture_rgba64_enc"),
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: tex, mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &staging,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_row_bytes),
-                    rows_per_image: Some(h),
-                },
-            },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
-        self.queue.submit(Some(encoder.finish()));
-
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-        rx.recv()
-            .map_err(|_| Error::Wgpu("staging map send channel closed".into()))?
-            .map_err(|e| Error::Wgpu(format!("staging map: {e}")))?;
-        let mapped = slice.get_mapped_range();
-
-        // Bulk per-row copy — strips only the swscale row padding, keeps all
-        // 8 bytes/pixel. At 7680-wide the row is already 256-aligned, so this
-        // is effectively one contiguous memcpy.
-        let row_bytes = unpadded_row_bytes as usize;
-        let mut out = vec![0u8; row_bytes * h as usize];
-        for y in 0..h as usize {
-            let src = y * padded_row_bytes as usize;
-            out[y * row_bytes..y * row_bytes + row_bytes]
-                .copy_from_slice(&mapped[src..src + row_bytes]);
-        }
-        drop(mapped);
-        staging.unmap();
-        Ok(out)
+        self.read_texture_rgba64_bands(tex, w, h, "read_texture_rgba64_staging")
     }
 
     /// GPU SBS compose straight to **P010 planes in plain, readable
