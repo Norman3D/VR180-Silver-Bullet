@@ -234,10 +234,14 @@ impl GyroAngvel {
 
     /// Assemble from already-built streams (e.g. several chapters merged
     /// on one timeline); computes the running integral.
-    pub fn from_parts(times: Vec<f32>, raw: Vec<[f32; 3]>, smoothed: Vec<[f32; 3]>) -> Self {
+    pub fn from_parts(mut times: Vec<f32>, mut raw: Vec<[f32; 3]>, mut smoothed: Vec<[f32; 3]>) -> Self {
+        // One consistent length for every accessor (merged chapters can
+        // only disagree by a bug, but index out of bounds is the wrong
+        // failure mode for a diagnostic stream).
+        let n = raw.len().min(times.len()).min(smoothed.len());
+        times.truncate(n); raw.truncate(n); smoothed.truncate(n);
         // Trapezoid running integral of the raw rate (rad), for the
         // mean-rate row groups.
-        let n = raw.len().min(times.len());
         let mut cum = vec![[0.0_f64; 3]; n];
         for i in 1..n {
             let dt = (times[i] - times[i - 1]).max(0.0) as f64;
@@ -253,7 +257,9 @@ impl GyroAngvel {
     /// stream; clamped to the stream's span.
     fn integral_at(&self, t: f32) -> [f64; 3] {
         let times = &self.times;
-        let n = times.len();
+        let n = times.len().min(self.raw.len()).min(self.cum.len());
+        if n == 0 { return [0.0; 3]; }
+        if n == 1 { return self.cum[0]; }
         let t = t.clamp(times[0], times[n - 1]);
         let mut idx = match times.binary_search_by(|x| x.partial_cmp(&t)
             .unwrap_or(std::cmp::Ordering::Equal)) {
@@ -276,7 +282,9 @@ impl GyroAngvel {
     }
 
     fn lerp_at(stream: &[[f32; 3]], times: &[f32], t: f32) -> [f32; 3] {
-        let n = stream.len();
+        let n = stream.len().min(times.len());
+        if n == 0 { return [0.0; 3]; }
+        if n == 1 { return stream[0]; }
         let t = t.clamp(times[0], times[n - 1]);
         // bisect_right(times, t) - 1, clamped to [0, n-2]
         let mut idx = match times.binary_search_by(|x| x.partial_cmp(&t)
@@ -314,11 +322,21 @@ impl GyroAngvel {
     /// Groups within a microsecond of `t` degrade to the instantaneous rate.
     pub fn groups_at(&self, t: f32, srot_s: f32, n_groups: usize) -> Vec<[f32; 3]> {
         let n_groups = n_groups.max(2);
-        let base = self.integral_at(t);
+        if self.times.len() < 2 || self.raw.len() < 2 {
+            return (0..n_groups).map(|_| Self::lerp_at(&self.raw, &self.times, t)).collect();
+        }
+        // Both endpoints live on the stream's span: a window that pokes
+        // past either end (frame 0 at a long shutter, the last frame)
+        // is averaged over the part inside the stream, and a window
+        // entirely outside degrades to the nearest sample, as the
+        // point-sampled groups did.
+        let (lo, hi) = (self.times[0], self.times[self.times.len() - 1]);
+        let tc = t.clamp(lo, hi);
+        let base = self.integral_at(tc);
         (0..n_groups).map(|g| {
             let frac = g as f32 / (n_groups - 1) as f32; // 0..=1
-            let gt = t + (frac - 0.5) * srot_s;
-            let span = (gt - t) as f64;
+            let gt = (t + (frac - 0.5) * srot_s).clamp(lo, hi);
+            let span = (gt - tc) as f64;
             if span.abs() < 1e-6 {
                 return Self::lerp_at(&self.raw, &self.times, gt);
             }
@@ -434,6 +452,23 @@ mod tests {
         let got = groups[0][0] * dt;
         let want = alpha * ((t + dt).powi(2) - t.powi(2)) / 2.0;
         assert!((got - want).abs() < 2e-6, "{got} vs {want}");
+    }
+
+    #[test]
+    fn row_groups_outside_the_stream_use_the_nearest_sample() {
+        use super::super::cori_iori::CoriBlockStmp;
+        let mut blocks = Vec::new();
+        for b in 0..2u64 {
+            let samples: Vec<[f32; 3]> = (0..800).map(|_| [0.0, 0.5, 0.0]).collect(); // shader X = 0.5 rad/s
+            blocks.push(ImuBlock { samples, scal: 1.0, stmp_us: Some(b * 1_000_000) });
+        }
+        let cori = vec![CoriBlockStmp { stmp_us: 0, n_samples: 30 }, CoriBlockStmp { stmp_us: 1_000_000, n_samples: 30 }];
+        let av = GyroAngvel::build(&blocks, &cori, 30.0, 2.0).expect("angvel");
+        // Frame 0 at a 1/30 s shutter: the reference instant and the whole
+        // window sit before the first gyro sample.
+        for w in av.groups_at(-0.009, 0.015, 32) { assert!((w[0] - 0.5).abs() < 1e-5, "{}", w[0]); }
+        // Window straddling the start: still the constant rate.
+        for w in av.groups_at(0.004, 0.015, 32) { assert!((w[0] - 0.5).abs() < 1e-5, "{}", w[0]); }
     }
 
     #[test]

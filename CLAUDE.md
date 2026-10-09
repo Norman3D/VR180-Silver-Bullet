@@ -530,6 +530,15 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    ×5 both nudge the burst the right way), left untuned by rule.
    `VR180_GOPRO_PHASE_MS` remains as the GoPro twin of the DJI diagnostic
    knob (default 0).
+   OPEN after the 2026-10-09 pre-push review: (a) a dropped frame that is the
+   FIRST frame of a telemetry block charges the shortened span to the
+   previous block (`real = n + skip(f1) − skip(f0)`); which block the
+   firmware stamps short is unverified — needs a clip with a boundary drop;
+   (b) `gopro_shutter_per_frame`/`gopro_skips_per_frame` re-extract each
+   chapter's GPMF uncached on every multi-chapter stab rebuild in the GUI
+   (slow on SMB) — should take the cached blobs; (c) the headless
+   `vr180-render` CLI still centres its RS window on frame start with no
+   MSKP/SHUT (it has pre-existing compile errors from wgpu drift anyway).
    THIRD PASS (2026-10-08, "the mount is fine — look carefully at RS"):
    the RS term was MEASURED for the first time (scratchpad `stab/rs_probe*.py`:
    GOPRO_NO_STAB exports with RS off / on / ×2 / −1, DIS flow → Kabsch →

@@ -249,9 +249,7 @@ pub fn build_imu_sample_times_with_skips(
     let cori_start_us = cori_stmps[0].stmp_us;
     // Usable skip table: cumulative, non-positive, non-increasing. Anything
     // else is ignored (plain block anchors).
-    let skips: Option<&[i32]> = frame_skips.filter(|sk| {
-        !sk.is_empty() && sk[0] <= 0 && sk.windows(2).all(|w| w[1] <= w[0])
-    });
+    let skips: Option<&[i32]> = frame_skips.filter(|sk| usable_skip_table(sk));
     let skip_at = |i: u32| -> i64 {
         match skips {
             Some(sk) => sk.get(i as usize).or(sk.last()).copied().unwrap_or(0) as i64,
@@ -421,8 +419,16 @@ fn resample_at_times_aligned(aligned: &[Quat], src_times: &[f32], times: &[f32],
 /// `frame_skips` (MSKP, see [`build_imu_sample_times_with_skips`]): a video
 /// frame that repeats the previous image gets the previous frame's instant,
 /// so it receives the same pose and RS correction as the image it copies.
+/// A usable MSKP table: cumulative, non-positive, non-increasing. Both
+/// consumers (the gyro timeline and the frame sample times) apply this
+/// same test so a malformed table is ignored by both, never by one.
+pub fn usable_skip_table(sk: &[i32]) -> bool {
+    !sk.is_empty() && sk[0] <= 0 && sk.windows(2).all(|w| w[1] <= w[0])
+}
+
 pub fn gopro_frame_sample_times(fps: f32, n_frames: usize, shutter_s: &[f32], readout_s: f32, frame_skips: Option<&[i32]>) -> Vec<f32> {
     let dt = 1.0 / fps.max(1e-6);
+    let frame_skips = frame_skips.filter(|sk| usable_skip_table(sk));
     let mut out: Vec<f32> = Vec::with_capacity(n_frames);
     for i in 0..n_frames {
         let repeat = i > 0 && frame_skips.map_or(false, |sk| {

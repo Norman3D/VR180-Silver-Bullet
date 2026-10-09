@@ -106,9 +106,6 @@ pub(crate) fn detect_rs_mode(cori: &[vr180_core::gyro::Quat]) -> RsMode {
     mode
 }
 
-/// Path-based convenience for the batch-add path (no CORI parsed yet). Only
-/// GoPro `.360` (EAC) has the firmware-RS distinction; every other source
-/// keeps the firmware default.
 /// Per-clip readout time (ms) from the file's SROT — GoPro only; other
 /// sources keep the default (their readout comes from their own metadata).
 pub(crate) fn detect_rs_readout_ms_for_path(
@@ -121,6 +118,9 @@ pub(crate) fn detect_rs_readout_ms_for_path(
     vr180_pipeline::imu::gopro_readout_s(&first_chapter_of(path)) * 1000.0
 }
 
+/// Path-based convenience for the batch-add path (no CORI parsed yet). Only
+/// GoPro `.360` (EAC) has the firmware-RS distinction; every other source
+/// keeps the firmware default.
 pub(crate) fn detect_rs_mode_for_path(
     path: &std::path::Path,
     kind: vr180_pipeline::SourceKind,
