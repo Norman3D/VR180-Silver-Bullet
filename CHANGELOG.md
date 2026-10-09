@@ -89,8 +89,16 @@ Three containers in the export bar:
   converter writes); validated with exiftool, macOS ImageIO and Adobe
   DNG Converter.
 
-Stills have no timeline or stabilization; view adjust, stereo alignment,
-eye swap and the colour stack apply as for video.
+Stills have no timeline or stabilization (those sections are hidden);
+view adjust, stereo alignment, eye swap and the colour stack apply as for
+video. The grade bakes into PNG / JPEG; the **linear DNG carries it as
+metadata** instead: white balance → `AsShotNeutral`, the lift / gamma /
+gain / shadow / highlight tone → `ProfileToneCurve` (the app's tone curve
+composed with the CDL, honoured by Adobe and Apple), saturation →
+`ProfileLookTable` (Adobe), the raw exposure offset → `BaselineExposure`;
+the per-eye "Matching Eyes" trims are baked exactly in camera-linear
+space (one DNG has one profile). A 3D LUT and sharpening cannot travel as
+DNG metadata and are left out of the DNG (the export panel says so).
 
 ### GoPro .360: rolling-shutter correction audited and tightened
 

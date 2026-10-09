@@ -704,6 +704,7 @@ fn tr(en: &'static str) -> &'static str {
         "Resolution" => "分辨率",
         "Still format" => "照片格式",
         "Still" => "照片",
+        "Your grade travels as metadata: white balance → AsShotNeutral, tone (lift/gamma/gain/shadow/highlight) → profile tone curve, saturation → profile look table (Adobe); per-eye trims are baked. Not carried: 3D LUT, sharpen." => "调色以元数据形式写入：白平衡 → AsShotNeutral，影调（提升/伽马/增益/阴影/高光）→ 配置文件色调曲线，饱和度 → 配置文件 Look 表（Adobe）；双眼微调会烘入像素。不带入：3D LUT、锐化。",
         "single photo, 14-bit raw" => "单张照片，14 位 RAW",
         "DNG keeps the camera-native linear data with the raw colour tags — grade it in a raw developer." => "DNG 保留相机原生线性数据和 RAW 色彩标签——可在 RAW 软件里继续调色。",
         "Still photo — no stabilization. Use the View adjust / stereo controls to level and align." => "静态照片——没有防抖。用视角调整 / 立体控制来调平和对齐。",
@@ -3892,6 +3893,10 @@ impl App {
                 });
             ui.label(RichText::new(tr("DNG keeps the camera-native linear data with the raw colour tags — grade it in a raw developer."))
                 .small().color(Color32::GRAY));
+            if opts.still_format == StillFormatChoice::LinearDng {
+                ui.label(RichText::new(tr("Your grade travels as metadata: white balance → AsShotNeutral, tone (lift/gamma/gain/shadow/highlight) → profile tone curve, saturation → profile look table (Adobe); per-eye trims are baked. Not carried: 3D LUT, sharpen."))
+                    .small().color(Color32::GRAY));
+            }
             ui.add_space(8.0);
             return;
         }

@@ -685,6 +685,29 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    exposure/WB sliders not exposed (develop at 0 EV as-shot); `.insp` JPEG
    not supported; Windows readers (WIC/Lightroom) untested; the headless
    harness is `examples/dng_still_check.rs` (gitignored).
+   GRADE (2026-10-09, same day): PNG/JPEG bake the 16-bit colour stack
+   (`apply_color_stack_pair_16` on the two eye textures, as video). The
+   linear DNG carries the grade as METADATA (`still_export::grade_metadata`,
+   validated with exiftool / sips / Adobe DNG Converter): temperature/tint
+   → `AsShotNeutral` via n' = n ⊘ ((M⁻¹·m) ⊘ n) with m = the stack's
+   encoded gains ^2.2 and M = `camera_to_srgb_matrix` (universal); CDL →
+   `ProfileToneCurve` = srgb_eotf(CDL(srgb_oetf(ACES(x)))) sampled at 129
+   points, pinned (0,0)/(1,1), only when the CDL is not identity (the tag
+   REPLACES the developer's default curve: Adobe + Apple honour it);
+   saturation → `ProfileLookTable` dims 1×2×1 (Adobe/DNG-SDK only, Apple
+   ignores); exposure_ev → `BaselineExposure`; per-eye trims baked as
+   M⁻¹·diag(m)·M in camera space. Not carried: 3D LUT, sharpen, mid-
+   detail, eye scale, auto eye match (logged + UI note). `ProfileName`
+   "VR180 Silver Bullet - graded|linear", `ProfileEmbedPolicy` 0. Tag ids:
+   ProfileLookTableEncoding is 51108 (0xC7A4), NOT 50983. Brightness
+   ladder at the left-lens centre of 050 (sRGB 8-bit mean): camera .insp
+   JPEG 50 | Apple render of our DNG 41 | our developed PNG/JPEG 69 |
+   Adobe ACR preview of our DNG 84 — our ACES develop sits between the two
+   developers' defaults. FIXED the same day: PNG16 output was byte-swapped
+   (the image crate takes native-endian 16-bit samples), and the full-size
+   export failed on a 482 MB readback buffer (now banded, see gpu.rs). The
+   harness env SAT/TEMP/TINT/LIFT/GAMMA/GAIN/SHADOW/HIGHLIGHT exercises the
+   colour stack on stills.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

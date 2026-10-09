@@ -69,6 +69,20 @@ pub struct LinearDngMeta {
     /// `dims[0] * dims[1] * dims[2] * 3` floats (hue shift, sat scale, val scale).
     pub profile_hue_sat_map_data1: Option<Vec<f32>>,
     pub profile_hue_sat_map_encoding: Option<u32>,
+    /// Camera-profile name shown by raw developers (ACR: the "Embedded"
+    /// profile entry). Written when `Some`.
+    pub profile_name: Option<String>,
+    /// `ProfileEmbedPolicy` (0 = allow copying). Written when `Some`.
+    pub profile_embed_policy: Option<u32>,
+    /// `ProfileToneCurve`: linear-in → linear-out `(x, y)` pairs, first
+    /// `(0,0)`, last `(1,1)`, monotone. REPLACES the developer's default tone
+    /// curve (ACR and Apple both honour it) — write it only when a specific
+    /// tone is intended.
+    pub profile_tone_curve: Option<Vec<[f32; 2]>>,
+    /// `ProfileLookTable` (dims hue×sat×val, data (hueShift°, satScale,
+    /// valScale) per node in val/hue/sat nesting, encoding 0 = linear).
+    /// Applied by DNG-SDK developers after exposure, before the tone curve.
+    pub profile_look_table: Option<LookTable>,
     pub exposure_s: Option<f64>,
     pub f_number: Option<f64>,
     pub iso: Option<u32>,
@@ -86,6 +100,14 @@ pub struct LinearDngMeta {
     pub exposure_compensation: Option<f64>,
     pub shutter_speed_value: Option<f64>,
     pub image_description: Option<String>,
+}
+
+/// `ProfileLookTable` payload — see [`LinearDngMeta::profile_look_table`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct LookTable {
+    pub dims: [u32; 3],
+    pub data: Vec<f32>,
+    pub encoding: u32,
 }
 
 /// Main-image encoding.
@@ -192,6 +214,12 @@ mod tag {
     pub const PROFILE_HUE_SAT_MAP_DIMS: u16 = 50937;
     pub const PROFILE_HUE_SAT_MAP_DATA1: u16 = 50938;
     pub const PROFILE_HUE_SAT_MAP_ENCODING: u16 = 51107;
+    pub const PROFILE_NAME: u16 = 50936;
+    pub const PROFILE_TONE_CURVE: u16 = 50940;
+    pub const PROFILE_EMBED_POLICY: u16 = 50941;
+    pub const PROFILE_LOOK_TABLE_DIMS: u16 = 50981;
+    pub const PROFILE_LOOK_TABLE_DATA: u16 = 50982;
+    pub const PROFILE_LOOK_TABLE_ENCODING: u16 = 51108; // 0xC7A4 (DNG 1.4)
 }
 
 /// PhotometricInterpretation = LinearRaw.
@@ -729,6 +757,19 @@ pub fn write_linear_dng_to<W: Write + Seek>(
             return Err(invalid("thumbnail byte length must be width*height*3"));
         }
     }
+    if let Some(lt) = &meta.profile_look_table {
+        let n = lt.dims.iter().map(|&d| d as u64).product::<u64>() * 3;
+        if lt.data.len() as u64 != n || lt.dims[0] < 1 || lt.dims[1] < 2 || lt.dims[2] < 1 {
+            return Err(invalid(&format!("ProfileLookTable has {} floats, dims {:?} need {} (hue≥1, sat≥2, val≥1)", lt.data.len(), lt.dims, n)));
+        }
+    }
+    if let Some(tc) = &meta.profile_tone_curve {
+        let ok = tc.len() >= 2 && tc[0] == [0.0, 0.0] && *tc.last().unwrap() == [1.0, 1.0]
+            && tc.windows(2).all(|w| w[1][0] > w[0][0] && w[1][1] >= w[0][1]);
+        if !ok {
+            return Err(invalid("ProfileToneCurve must run (0,0) → (1,1) with increasing x and non-decreasing y"));
+        }
+    }
     if let (Some(dims), Some(data)) = (&meta.profile_hue_sat_map_dims, &meta.profile_hue_sat_map_data1) {
         let n = dims.iter().map(|&d| d as u64).product::<u64>() * 3;
         if data.len() as u64 != n {
@@ -872,6 +913,17 @@ pub fn write_linear_dng_to<W: Write + Seek>(
         if let Some(enc) = meta.profile_hue_sat_map_encoding {
             ifd0.set_long(tag::PROFILE_HUE_SAT_MAP_ENCODING, &[enc]);
         }
+    }
+    if let Some(n) = &meta.profile_name { ifd0.set_ascii(tag::PROFILE_NAME, n); }
+    if let Some(p) = meta.profile_embed_policy { ifd0.set_long(tag::PROFILE_EMBED_POLICY, &[p]); }
+    if let Some(tc) = &meta.profile_tone_curve {
+        let flat: Vec<f32> = tc.iter().flat_map(|p| [p[0], p[1]]).collect();
+        ifd0.set_float(tag::PROFILE_TONE_CURVE, &flat);
+    }
+    if let Some(lt) = &meta.profile_look_table {
+        ifd0.set_long(tag::PROFILE_LOOK_TABLE_DIMS, &lt.dims);
+        ifd0.set_float(tag::PROFILE_LOOK_TABLE_DATA, &lt.data);
+        ifd0.set_long(tag::PROFILE_LOOK_TABLE_ENCODING, &[lt.encoding]);
     }
 
     // ---- pass 1: layout (lengths do not depend on pointer values) ---------
@@ -1046,6 +1098,10 @@ mod tests {
             profile_hue_sat_map_dims: Some([1, 2, 1]),
             profile_hue_sat_map_data1: Some(vec![1.0, 0.93, 1.0, 1.0, 0.93, 1.0]),
             profile_hue_sat_map_encoding: Some(1),
+            profile_name: Some("VR180 Silver Bullet grade".into()),
+            profile_embed_policy: Some(0),
+            profile_tone_curve: Some(vec![[0.0, 0.0], [0.25, 0.18], [0.5, 0.45], [0.75, 0.74], [1.0, 1.0]]),
+            profile_look_table: Some(LookTable { dims: [1, 2, 1], data: vec![0.0, 1.3, 1.0, 0.0, 1.3, 1.0], encoding: 0 }),
             exposure_s: Some(1.0 / 5072.0),
             f_number: Some(2.0),
             iso: Some(120),
@@ -1153,6 +1209,18 @@ mod tests {
         match meta.baseline_sharpness {
             Some(v) => assert_eq!(ifd0.rationals(tag::BASELINE_SHARPNESS), [urat(v as f64)]),
             None => assert!(!ifd0.entries.contains_key(&tag::BASELINE_SHARPNESS)),
+        }
+        match &meta.profile_tone_curve {
+            Some(tc) => assert_eq!(ifd0.floats(tag::PROFILE_TONE_CURVE), tc.iter().flat_map(|p| [p[0], p[1]]).collect::<Vec<f32>>()),
+            None => assert!(!ifd0.entries.contains_key(&tag::PROFILE_TONE_CURVE)),
+        }
+        match &meta.profile_look_table {
+            Some(lt) => {
+                assert_eq!(ifd0.longs(tag::PROFILE_LOOK_TABLE_DIMS), lt.dims);
+                assert_eq!(ifd0.floats(tag::PROFILE_LOOK_TABLE_DATA), lt.data);
+                assert_eq!(ifd0.longs(tag::PROFILE_LOOK_TABLE_ENCODING), [lt.encoding]);
+            }
+            None => assert!(!ifd0.entries.contains_key(&tag::PROFILE_LOOK_TABLE_DIMS)),
         }
         match (&meta.profile_hue_sat_map_dims, &meta.profile_hue_sat_map_data1) {
             (Some(d), Some(data)) => {

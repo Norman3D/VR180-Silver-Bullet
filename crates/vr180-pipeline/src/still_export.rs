@@ -22,11 +22,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::dng_write::{self, DngCompression, LinearDngImage, LinearDngMeta};
+use crate::dng_write::{self, DngCompression, LinearDngImage, LinearDngMeta, LookTable};
 use crate::gpu::{ColorStackPlan, Device, EquirectRotation, FisheyeCalib};
 use crate::insv_imu;
 use crate::panomap::{mat3_mul_row_major, ViewAdjust};
-use crate::raw_develop::{self, DevelopParams, DngColorLike, GainMapLike, Half, LinearEye, RawParams};
+use crate::raw_develop::{self, DevelopParams, DngColorLike, GainMapLike, Half, LinearEye, RawParams, WhiteBalance};
 use crate::{Error, Result};
 use vr180_fisheye::dng::{self as x6dng, X6Still};
 use vr180_fisheye::insta360::InsvWindowCrop;
@@ -156,7 +156,172 @@ fn compose_rgb16(left: &[u8], right: &[u8], eye_w: u32, eye_h: u32) -> Vec<u16> 
     out
 }
 
-fn linear_dng_meta(still: &X6Still, l_max: f32) -> LinearDngMeta {
+// ── The grade as DNG metadata ─────────────────────────────────────────────
+//
+// The app's colour stack acts on display-encoded (sRGB OETF, ACES-tone-
+// mapped) values. A linear DNG cannot carry those stages as pixels without
+// baking, but three of them map onto profile metadata that raw developers
+// honour (Adobe Camera Raw / Lightroom, Apple ImageIO; validated 2026-10-09
+// with exiftool, sips and Adobe DNG Converter):
+//
+// - white balance (temperature / tint)  → `AsShotNeutral` (universal)
+// - the CDL tone (lift / gamma / gain / shadow / highlight) → `ProfileToneCurve`
+//   = the app's ACES tone composed with the CDL, as a linear→linear curve
+//   (Adobe + Apple; it REPLACES the developer's default curve, so it is
+//   written only when the CDL is not identity)
+// - saturation → `ProfileLookTable` (Adobe / DNG-SDK developers; Apple ignores)
+// - the raw exposure offset → `BaselineExposure`
+//
+// Per-eye "Matching Eyes" trims cannot be metadata in one DNG (one profile
+// for both eyes), so they are baked into the camera-linear data as exact
+// per-channel gains. Not carried: the 3D LUT, sharpen, mid-detail, eye
+// scale, automatic eye matching (reported in the log).
+
+/// The app's grade translated for the linear DNG.
+#[derive(Debug, Clone)]
+pub struct GradeMeta {
+    pub as_shot_neutral: [f32; 3],
+    pub exposure_delta_ev: f32,
+    pub tone_curve: Option<Vec<[f32; 2]>>,
+    pub look_table: Option<LookTable>,
+    /// Anything that changed vs the camera's own profile.
+    pub graded: bool,
+    /// Stages that cannot travel as metadata (and were not applied).
+    pub dropped: Vec<&'static str>,
+}
+
+/// CPU twin of `cdl_16.wgsl` (one channel; the stack applies it per
+/// channel with scalar knobs).
+pub fn cdl_apply(x: f32, cdl: &crate::gpu::CdlParams) -> f32 {
+    let hermite = |t: f32| { let t = t.clamp(0.0, 1.0); t * t * (3.0 - 2.0 * t) };
+    let mut x = x + cdl.lift * (1.0 - x);
+    x *= cdl.gain;
+    x += cdl.shadow * hermite(1.0 - 2.0 * x) * 0.6;
+    x += cdl.highlight * hermite(2.0 * x - 1.0) * 0.6;
+    x = x.clamp(0.0, 1.0);
+    x.powf(1.0 / cdl.gamma.max(1e-4))
+}
+
+fn srgb_eotf(v: f32) -> f32 {
+    let v = v.clamp(0.0, 1.0);
+    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+}
+
+fn inv3(m: &[[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
+    let a = m;
+    let det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+        - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+        + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    if det.abs() < 1e-12 { return None; }
+    let d = 1.0 / det;
+    Some([
+        [(a[1][1] * a[2][2] - a[1][2] * a[2][1]) * d, (a[0][2] * a[2][1] - a[0][1] * a[2][2]) * d, (a[0][1] * a[1][2] - a[0][2] * a[1][1]) * d],
+        [(a[1][2] * a[2][0] - a[1][0] * a[2][2]) * d, (a[0][0] * a[2][2] - a[0][2] * a[2][0]) * d, (a[0][2] * a[1][0] - a[0][0] * a[1][2]) * d],
+        [(a[1][0] * a[2][1] - a[1][1] * a[2][0]) * d, (a[0][1] * a[2][0] - a[0][0] * a[2][1]) * d, (a[0][0] * a[1][1] - a[0][1] * a[1][0]) * d],
+    ])
+}
+
+fn mul3v(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+    [m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+     m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+     m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2]]
+}
+
+/// The stack's white-balance stage as linear-sRGB white multipliers: the
+/// shader scales the ENCODED channels by `k = (1+0.3T, 1−0.3t, 1−0.3T)`,
+/// which is `k^2.2` on linear values to first order.
+fn wb_linear_gains(temperature: f32, tint: f32) -> [f32; 3] {
+    let k = [1.0 + 0.30 * temperature, 1.0 - 0.30 * tint, 1.0 - 0.30 * temperature];
+    [k[0].max(1e-3).powf(2.2), k[1].max(1e-3).powf(2.2), k[2].max(1e-3).powf(2.2)]
+}
+
+/// Translate the app's grade into DNG metadata (see the module notes above).
+pub fn grade_metadata(plan: &ColorStackPlan, develop: &DevelopParams, color: &DngColorLike) -> GradeMeta {
+    let n = color.as_shot_neutral;
+    let mut out = GradeMeta {
+        as_shot_neutral: n, exposure_delta_ev: develop.exposure_ev, tone_curve: None, look_table: None,
+        graded: develop.exposure_ev != 0.0, dropped: Vec::new(),
+    };
+    // White balance → AsShotNeutral. `M` = camera_to_srgb_matrix maps the
+    // UNBALANCED as-shot neutral n to white (M·n = 1). A developer renders a
+    // camera pixel p as B·(p ⊘ n') with B = M·diag(n) (B·1 = 1). For the
+    // scene neutral p = n to come out as the stack's white `m`:
+    // n ⊘ n' = B⁻¹·m = (M⁻¹·m) ⊘ n  ⇒  n' = n ⊘ ((M⁻¹·m) ⊘ n).
+    let (t, ti) = (plan.color_grade.temperature, plan.color_grade.tint);
+    if t != 0.0 || ti != 0.0 {
+        let m = wb_linear_gains(t, ti);
+        let cam_to_srgb = raw_develop::camera_to_srgb_matrix(color, WhiteBalance::AsShot);
+        if let Some(inv) = inv3(&cam_to_srgb) {
+            let u = mul3v(&inv, m);
+            let v = [u[0] / n[0].max(1e-6), u[1] / n[1].max(1e-6), u[2] / n[2].max(1e-6)];
+            let mut np = [n[0] / v[0].max(1e-6), n[1] / v[1].max(1e-6), n[2] / v[2].max(1e-6)];
+            let g = np[1].max(1e-6);
+            np = [np[0] / g, 1.0, np[2] / g];
+            out.as_shot_neutral = np;
+            out.graded = true;
+        }
+    }
+    // Tone → ProfileToneCurve: the app's ACES tone composed with the CDL,
+    // sampled as linear→linear. Only when the CDL is not identity, so an
+    // ungraded DNG keeps the developer's own default tone.
+    if !plan.cdl.is_identity() {
+        const N: usize = 129;
+        let mut pts: Vec<[f32; 2]> = (0..N).map(|i| {
+            let x = i as f32 / (N - 1) as f32;
+            let y = srgb_eotf(cdl_apply(raw_develop::srgb_oetf(raw_develop::tone_aces(x)), &plan.cdl));
+            [x, y]
+        }).collect();
+        // Spec pins: first (0,0), last (1,1); keep it monotone.
+        pts[0] = [0.0, 0.0];
+        pts[N - 1] = [1.0, 1.0];
+        for i in 1..N { if pts[i][1] < pts[i - 1][1] { pts[i][1] = pts[i - 1][1]; } }
+        out.tone_curve = Some(pts);
+        out.graded = true;
+    }
+    // Saturation → ProfileLookTable (sat scale, hue 0, val 1).
+    let sat = plan.color_grade.saturation * develop.saturation;
+    if (sat - 1.0).abs() > 1e-4 {
+        let s = sat.max(0.0);
+        out.look_table = Some(LookTable { dims: [1, 2, 1], data: vec![0.0, s, 1.0, 0.0, s, 1.0], encoding: 0 });
+        out.graded = true;
+    }
+    if plan.lut.is_some() { out.dropped.push("3D LUT"); }
+    if !plan.sharpen.is_identity() { out.dropped.push("sharpen"); }
+    if !plan.mid_detail.is_identity() { out.dropped.push("mid-detail"); }
+    if (plan.eye_scale - 1.0).abs() > 1e-6 { out.dropped.push("eye scale"); }
+    if plan.auto_eye_match.is_some() { out.dropped.push("automatic eye matching"); }
+    out
+}
+
+/// Bake the per-eye "Matching Eyes" trims (CT / tint / exposure, applied
+/// `+` to the left eye and `−` to the right) into camera-linear RGBA64, as
+/// the camera-space matrix `M⁻¹·diag(m)·M` of the stack's linear gains.
+pub fn bake_eye_trims(rgba: &mut [u16], plan: &ColorStackPlan, color: &DngColorLike, is_left: bool) -> bool {
+    if plan.eye_match_ct == 0.0 && plan.eye_match_tint == 0.0 && plan.eye_match_exposure == 0.0 {
+        return false;
+    }
+    let sgn = if is_left { 1.0 } else { -1.0 };
+    let mut m = wb_linear_gains(sgn * plan.eye_match_ct, sgn * plan.eye_match_tint);
+    let e = 2.0_f32.powf(sgn * plan.eye_match_exposure).powf(2.2);
+    for c in m.iter_mut() { *c *= e; }
+    let cam_to_srgb = raw_develop::camera_to_srgb_matrix(color, WhiteBalance::AsShot);
+    let Some(inv) = inv3(&cam_to_srgb) else { return false; };
+    // A = inv · diag(m) · M
+    let mut a = [[0.0_f32; 3]; 3];
+    for i in 0..3 { for j in 0..3 {
+        a[i][j] = (0..3).map(|k| inv[i][k] * m[k] * cam_to_srgb[k][j]).sum();
+    } }
+    for px in rgba.chunks_exact_mut(4) {
+        let v = [px[0] as f32, px[1] as f32, px[2] as f32];
+        let o = mul3v(&a, v);
+        px[0] = o[0].round().clamp(0.0, 65535.0) as u16;
+        px[1] = o[1].round().clamp(0.0, 65535.0) as u16;
+        px[2] = o[2].round().clamp(0.0, 65535.0) as u16;
+    }
+    true
+}
+
+fn linear_dng_meta(still: &X6Still, l_max: f32, grade: Option<&GradeMeta>) -> LinearDngMeta {
     let c = &still.color;
     let e = &still.exif;
     LinearDngMeta {
@@ -166,15 +331,20 @@ fn linear_dng_meta(still: &X6Still, l_max: f32) -> LinearDngMeta {
         software: format!("VR180 Silver Bullet {}", env!("CARGO_PKG_VERSION")),
         color_matrix1: c.color_matrix1,
         calibration_illuminant1: c.calibration_illuminant1,
-        as_shot_neutral: c.as_shot_neutral,
+        as_shot_neutral: grade.map(|g| g.as_shot_neutral).unwrap_or(c.as_shot_neutral),
         // The gain map is baked into the data at 1/l_max scale: tell the
-        // developer the scene is l_max brighter than the codes say.
-        baseline_exposure: c.baseline_exposure + l_max.max(1.0).log2(),
+        // developer the scene is l_max brighter than the codes say — plus
+        // the app's raw exposure offset, as metadata.
+        baseline_exposure: c.baseline_exposure + l_max.max(1.0).log2() + grade.map(|g| g.exposure_delta_ev).unwrap_or(0.0),
         baseline_noise: c.baseline_noise,
         baseline_sharpness: c.baseline_sharpness,
         profile_hue_sat_map_dims: c.profile_hue_sat_map_dims,
         profile_hue_sat_map_data1: c.profile_hue_sat_map_data1.clone(),
         profile_hue_sat_map_encoding: c.profile_hue_sat_map_encoding,
+        profile_name: Some(if grade.map_or(false, |g| g.graded) { "VR180 Silver Bullet - graded".into() } else { "VR180 Silver Bullet linear".into() }),
+        profile_embed_policy: Some(0),
+        profile_tone_curve: grade.and_then(|g| g.tone_curve.clone()),
+        profile_look_table: grade.and_then(|g| g.look_table.clone()),
         exposure_s: e.exposure_s,
         f_number: e.f_number,
         iso: e.iso,
@@ -205,6 +375,17 @@ pub fn export_still(device: Arc<Device>, cfg: &StillExportConfig, progress: Stil
     let color_like = DngColorLike::from(&still.color);
     let (rot_l, rot_r) = still_eye_rotations(&cfg.view_adjust);
     let linear = cfg.format.is_linear_dng();
+    let grade = if linear {
+        let g = grade_metadata(&cfg.color_stack, &cfg.develop, &color_like);
+        if g.graded || !g.dropped.is_empty() {
+            tracing::info!(
+                "still export (DNG): grade as metadata — neutral {:?}, exposure {:+.2} EV, tone curve {}, saturation table {}; not carried: {}",
+                g.as_shot_neutral, g.exposure_delta_ev, g.tone_curve.is_some(), g.look_table.is_some(),
+                if g.dropped.is_empty() { "nothing".to_string() } else { g.dropped.join(", ") },
+            );
+        }
+        Some(g)
+    } else { None };
 
     // Eye order: left half → left eye unless swapped.
     let order = if cfg.swap_eyes { [Half::Right, Half::Left] } else { [Half::Left, Half::Right] };
@@ -216,7 +397,12 @@ pub fn export_still(device: Arc<Device>, cfg: &StillExportConfig, progress: Stil
         let eye: LinearEye = raw_develop::develop_linear(&still.bayer, &params, &gain_maps, *half, false);
         l_max = l_max.max(eye.l_max);
         let rgba: Vec<u16> = if linear {
-            eye.rgba.clone()
+            let mut v = eye.rgba.clone();
+            // Per-eye trims cannot be metadata in one DNG: bake them exactly.
+            if bake_eye_trims(&mut v, &cfg.color_stack, &color_like, i == 0) {
+                tracing::info!("still export (DNG): per-eye trims baked into the {label} eye");
+            }
+            v
         } else {
             raw_develop::develop_display(&eye, &color_like, &cfg.develop)
         };
@@ -243,16 +429,20 @@ pub fn export_still(device: Arc<Device>, cfg: &StillExportConfig, progress: Stil
     let rgb16 = compose_rgb16(&left, &right, cfg.eye_w, cfg.eye_h);
     drop(left); drop(right);
     let (w, h) = (cfg.eye_w * 2, cfg.eye_h);
-    write_output(&cfg.output_path, cfg.format, w, h, &rgb16, &still, l_max)?;
+    write_output(&cfg.output_path, cfg.format, w, h, &rgb16, &still, l_max, grade.as_ref())?;
     progress("Done", 1.0);
     Ok(())
 }
 
-fn write_output(path: &Path, format: StillFormat, w: u32, h: u32, rgb16: &[u16], still: &X6Still, l_max: f32) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn write_output(path: &Path, format: StillFormat, w: u32, h: u32, rgb16: &[u16], still: &X6Still, l_max: f32, grade: Option<&GradeMeta>) -> Result<()> {
     match format {
         StillFormat::Png16 => {
-            let bytes: Vec<u8> = rgb16.iter().flat_map(|v| v.to_be_bytes()).collect();
-            image::save_buffer(path, &bytes, w, h, image::ExtendedColorType::Rgb16)
+            // The image crate takes 16-bit samples in NATIVE byte order (it
+            // swaps for the PNG stream itself); big-endian bytes here came out
+            // byte-swapped on little-endian machines.
+            let bytes: &[u8] = bytemuck::cast_slice(rgb16);
+            image::save_buffer(path, bytes, w, h, image::ExtendedColorType::Rgb16)
                 .map_err(|e| Error::Ffmpeg(format!("PNG write: {e}")))?;
         }
         StillFormat::Jpeg { quality } => {
@@ -264,10 +454,91 @@ fn write_output(path: &Path, format: StillFormat, w: u32, h: u32, rgb16: &[u16],
                 .map_err(|e| Error::Ffmpeg(format!("JPEG write: {e}")))?;
         }
         StillFormat::LinearDng { compression } => {
-            let meta = linear_dng_meta(still, l_max);
+            let meta = linear_dng_meta(still, l_max, grade);
             let img = LinearDngImage { width: w, height: h, rgb16, white_level: 65535 };
             dng_write::write_linear_dng(path, &img, &meta, compression, None)?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::{CdlParams, ColorGradeParams};
+
+    fn x6_color() -> DngColorLike {
+        DngColorLike {
+            color_matrix1: [0.71875, -0.1484375, -0.09375, -0.609375, 1.453125, 0.109375, -0.15625, 0.296875, 0.4765625],
+            as_shot_neutral: [0.4599609375, 1.0, 0.537109375],
+            baseline_exposure: 2.6,
+        }
+    }
+
+    #[test]
+    fn ungraded_stack_leaves_the_camera_profile_alone() {
+        let g = grade_metadata(&ColorStackPlan::default(), &DevelopParams::default(), &x6_color());
+        assert!(!g.graded);
+        assert_eq!(g.as_shot_neutral, x6_color().as_shot_neutral);
+        assert!(g.tone_curve.is_none() && g.look_table.is_none() && g.dropped.is_empty());
+    }
+
+    #[test]
+    fn warmer_temperature_lowers_the_red_neutral() {
+        // +temperature = warmer render: the developer divides by the neutral,
+        // so the red neutral must drop relative to green (and blue rise).
+        let mut plan = ColorStackPlan::default();
+        plan.color_grade = ColorGradeParams { temperature: 0.5, tint: 0.0, saturation: 1.0 };
+        let g = grade_metadata(&plan, &DevelopParams::default(), &x6_color());
+        let n = x6_color().as_shot_neutral;
+        assert!(g.graded);
+        assert_eq!(g.as_shot_neutral[1], 1.0);
+        assert!(g.as_shot_neutral[0] / g.as_shot_neutral[1] < n[0] / n[1], "{:?}", g.as_shot_neutral);
+        assert!(g.as_shot_neutral[2] / g.as_shot_neutral[1] > n[2] / n[1], "{:?}", g.as_shot_neutral);
+    }
+
+    #[test]
+    fn cdl_becomes_a_pinned_monotone_tone_curve() {
+        let mut plan = ColorStackPlan::default();
+        plan.cdl = CdlParams { lift: 0.05, gamma: 1.2, gain: 1.1, shadow: 0.1, highlight: -0.1 };
+        let g = grade_metadata(&plan, &DevelopParams::default(), &x6_color());
+        let tc = g.tone_curve.expect("tone curve");
+        assert_eq!(tc[0], [0.0, 0.0]);
+        assert_eq!(*tc.last().unwrap(), [1.0, 1.0]);
+        assert!(tc.windows(2).all(|w| w[1][0] > w[0][0] && w[1][1] >= w[0][1]));
+        // Mid-grey: brighter than linear (ACES + gain + gamma 1.2 lift it).
+        let mid = tc[64];
+        assert!((mid[0] - 0.5).abs() < 1e-6 && mid[1] > 0.5, "{mid:?}");
+    }
+
+    #[test]
+    fn saturation_becomes_a_look_table_and_lut_is_reported_dropped() {
+        let mut plan = ColorStackPlan::default();
+        plan.color_grade = ColorGradeParams { temperature: 0.0, tint: 0.0, saturation: 1.4 };
+        plan.lut = Some((vr180_core::color::Cube3DLut {
+            size: 2, data: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            title: None, domain_min: [0.0; 3], domain_max: [1.0; 3],
+        }, 1.0));
+        let g = grade_metadata(&plan, &DevelopParams::default(), &x6_color());
+        let lt = g.look_table.expect("look table");
+        assert_eq!(lt.dims, [1, 2, 1]);
+        assert_eq!(lt.data, vec![0.0, 1.4, 1.0, 0.0, 1.4, 1.0]);
+        assert!(g.dropped.contains(&"3D LUT"));
+    }
+
+    #[test]
+    fn eye_trims_bake_oppositely_and_zero_is_a_no_op() {
+        let color = x6_color();
+        let mut plan = ColorStackPlan::default();
+        let px: Vec<u16> = vec![20000, 30000, 25000, 0, 1000, 2000, 1500, 65535];
+        let mut a = px.clone();
+        assert!(!bake_eye_trims(&mut a, &plan, &color, true));
+        assert_eq!(a, px);
+        plan.eye_match_exposure = 0.2;
+        let mut l = px.clone(); let mut r = px.clone();
+        assert!(bake_eye_trims(&mut l, &plan, &color, true));
+        assert!(bake_eye_trims(&mut r, &plan, &color, false));
+        assert!(l[1] > px[1] && r[1] < px[1], "left {} right {} src {}", l[1], r[1], px[1]);
+        assert_eq!(l[3], 0); assert_eq!(l[7], 65535); // alpha untouched
+    }
 }
