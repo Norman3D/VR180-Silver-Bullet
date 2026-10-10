@@ -109,6 +109,19 @@ what the DNG will carry. The Output section's Fisheye and Reframed modes
 and the eye swap / upside-down toggles now work for stills, and the lens
 Override is honoured by the still export as it already was by the preview.
 
+Fixed: exporting the loaded still left the photo frozen — the export
+stopped the preview thread (as it does for a video that shares the file)
+and a still has no Play button to start it again, so the sidebar and the
+pan drag no longer did anything until the clip was reloaded. The still's
+preview now stays live through its own export (it holds only textures;
+the export re-reads the file), and a still whose preview did stop gets a
+"Restart preview" button. Found alongside: Stop before the first frame
+left Play dead until a reload; the snapshot key on a still waited out a
+15 s timeout and saved the working-res preview (it now points at Export);
+Space on a still spun the playback repaint cadence; a restart of the same
+clip re-seeded hand-tuned lens Override values from the file; and the
+audio probe opened the whole DNG on the UI thread.
+
 ### GoPro .360: rolling-shutter correction audited and tightened
 
 The GoPro rolling-shutter term was measured directly for the first time:

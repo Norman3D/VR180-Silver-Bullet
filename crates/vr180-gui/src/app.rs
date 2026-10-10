@@ -68,6 +68,9 @@ pub struct App {
     /// True while a decoder thread is alive (started but not Stopped).
     /// Lets Pause toggle the `paused` flag instead of killing the worker.
     decoder_alive: bool,
+    /// One-shot (reset by `spawn_decoder`): the "settings changed with no
+    /// decoder alive" warning has been logged for the current stop.
+    no_decoder_warned: bool,
     /// True from `spawn_decoder` until the decoder delivers its FIRST frame.
     /// While set, play/seek respawns are ignored — clicking Play repeatedly
     /// during a slow load would otherwise pile up detached decoder threads
@@ -704,6 +707,8 @@ fn tr(en: &'static str) -> &'static str {
         "Resolution" => "分辨率",
         "Still format" => "照片格式",
         "Still photo — no timeline" => "静态照片——没有时间线",
+        "Restart preview" => "重启预览",
+        "Still photo — use Export for the full-size file" => "静态照片——请用导出获得全尺寸文件",
         "DNG output: the 3D LUT, sharpening and automatic eye matching cannot travel as DNG metadata — hidden, and not applied to the preview." => "DNG 输出：3D LUT、锐化和自动眼间匹配无法作为 DNG 元数据保存——已隐藏，预览中也不应用。",
         "Still" => "照片",
         "Your grade travels as metadata: white balance → AsShotNeutral, tone (lift/gamma/gain/shadow/highlight) → profile tone curve, saturation → profile look table (Adobe); per-eye trims are baked. Not carried: 3D LUT, sharpen." => "调色以元数据形式写入：白平衡 → AsShotNeutral，影调（提升/伽马/增益/阴影/高光）→ 配置文件色调曲线，饱和度 → 配置文件 Look 表（Adobe）；双眼微调会烘入像素。不带入：3D LUT、锐化。",
@@ -1174,6 +1179,7 @@ impl App {
             clip: None,
             playing: false,
             decoder_alive: false,
+            no_decoder_warned: false,
             decoder_starting: false,
             current_display: None,
             frame_rx: None,
@@ -1655,7 +1661,13 @@ impl App {
         // Stop preview playback when it reads the SAME file as the export
         // (they'd race on the decoder / file). Previewing a DIFFERENT clip
         // is fine — that's what lets you keep tuning clips mid-batch.
-        if self.loaded_path.as_ref() == Some(&cfg.source_path) {
+        // A STILL is the exception: its preview thread read the DNG once
+        // and now holds only textures, and the export re-reads the file
+        // itself, so there is nothing to race on. Stopping it left the
+        // photo frozen on the last render with no transport to restart it
+        // (the still has no Play button) — the "UI stopped responding
+        // after exporting" report.
+        if self.loaded_path.as_ref() == Some(&cfg.source_path) && !cfg.source_kind.is_still() {
             self.stop_playback();
         }
 
@@ -2932,6 +2944,8 @@ impl App {
         //    "Loading…" once a new load is queued behind this).
         self.clip = None;
         self.loaded_path = None;
+        // The next clip's in-file calibration must reseed the Override fields.
+        self.fisheye_last_seeded = None;
         // Drop any stale "play when ready" intent from a prior load.
         self.play_when_ready = false;
         // 6. Cancel a load still in flight: bump the token so a late worker
@@ -3300,6 +3314,10 @@ impl App {
             return;
         }
         self.stop_playback();
+        let is_still = self.clip.as_ref().map_or(false, |c| c.source_kind.is_still());
+        // A still only ever starts paused (its loop ignores the flag; a
+        // "playing" photo would spin the 8 ms repaint cadence).
+        let start_paused = start_paused || is_still;
         tracing::info!(
             "spawn_decoder: starting decoder for {} (paused={})",
             path.display(), start_paused
@@ -3370,6 +3388,7 @@ impl App {
         self.playing = !start_paused;
         self.decoder_alive = true;
         self.decoder_starting = true;
+        self.no_decoder_warned = false;
         self.last_pushed_settings = self.settings.clone();
         self.fps_stats = FpsStats::default();
 
@@ -3378,7 +3397,10 @@ impl App {
         // for the lifetime of the playback session. Multi-segment: feed
         // it an ffconcat playlist so the chain's audio plays + seeks as
         // one continuous timeline (matches the video chaining).
-        if let Some(audio_path) = self.loaded_path.clone() {
+        // Not for a still: a DNG carries no audio, and the probe is an
+        // ffmpeg open of the whole file on the UI thread (a stall on a
+        // cold network share).
+        if let Some(audio_path) = self.loaded_path.clone().filter(|_| !is_still) {
             let audio_path = self.clip.as_ref()
                 .filter(|c| c.segments.len() > 1)
                 .and_then(|c| vr180_pipeline::audio::build_segment_playlist(&c.segments, "preview"))
@@ -3410,6 +3432,12 @@ impl App {
         // is reached via the Space shortcut.)
         if self.load_pending.is_some() {
             self.play_when_ready = !self.play_when_ready;
+            return;
+        }
+        // A photo has no playback: Space only revives a dead render thread,
+        // paused (a "playing" still would spin the 8 ms repaint cadence).
+        if self.clip.as_ref().map_or(false, |c| c.source_kind.is_still()) {
+            if !self.decoder_alive { self.spawn_decoder(true); }
             return;
         }
         if !self.decoder_alive {
@@ -3555,6 +3583,10 @@ impl App {
         self.control = None;
         self.playing = false;
         self.decoder_alive = false;
+        // No live decoder → nothing is "starting". Left set, a Stop (or an
+        // export of the loaded clip) before the first frame arrived kept
+        // every later Play / Space / seek respawn gated off until a reload.
+        self.decoder_starting = false;
         // Drop the audio player: cpal stream stops, worker thread
         // shuts down (Stop command).
         self.audio_player = None;
@@ -3568,11 +3600,16 @@ impl App {
     /// handled separately in `draw_eye_lens`.
     fn maybe_reseed_fisheye_override(&mut self) {
         let detected = self.control.as_ref().and_then(|c| *c.detected_calib.lock());
-        if detected == self.fisheye_last_seeded {
-            return; // unchanged (same clip, or both absent) — nothing to do
+        // No control (stopped) or not seeded yet: KEEP the last seed. A
+        // same-clip respawn (Restart preview, Play after Stop) passes through
+        // `None` for ~100 ms and must not read as a new clip — that
+        // overwrote hand-tuned Override values with the factory ones. A new
+        // clip resets `fisheye_last_seeded` in `unload_clip`.
+        let Some(d) = detected else { return; };
+        if Some(d) == self.fisheye_last_seeded {
+            return; // same clip's calibration — nothing to do
         }
-        self.fisheye_last_seeded = detected;
-        let Some(d) = detected else { return; }; // cleared mid-load → wait for next
+        self.fisheye_last_seeded = Some(d);
         tracing::info!("RESEED-DBG: detected changed; suppress={} ov_l={} cx_l {:.4}->{:.4} fov_l {:.2}->{:.2}",
             self.suppress_reseed_once, self.settings.fisheye_override_left,
             self.settings.fisheye_cx_norm_left, d.left.cx_norm,
@@ -3622,6 +3659,11 @@ impl App {
             *ctl.settings.write() = self.settings.clone();
             ctl.settings_generation.fetch_add(1, Ordering::SeqCst);
             tracing::debug!("settings changed → generation bumped");
+        } else if !self.no_decoder_warned {
+            // Once per stop: makes a "preview stopped following the sliders"
+            // report diagnosable from the log.
+            self.no_decoder_warned = true;
+            tracing::warn!("settings changed with no decoder alive — the preview will not follow until it is restarted");
         }
         self.last_pushed_settings = self.settings.clone();
     }
@@ -4539,6 +4581,16 @@ impl eframe::App for App {
                 if self.clip.as_ref().map_or(false, |c| c.source_kind.is_still()) {
                     // A still has no transport, trim or playhead.
                     ui.label(RichText::new(tr("Still photo — no timeline")).small().color(Color32::GRAY));
+                    // The still's render thread normally lives as long as the
+                    // clip; if it is gone (a decode error, a stop from another
+                    // path) the photo would sit frozen — offer the restart the
+                    // hidden Play button used to provide.
+                    if !self.decoder_alive && self.load_pending.is_none() {
+                        ui.separator();
+                        if ui.small_button(tr("Restart preview")).clicked() {
+                            self.spawn_decoder(true);
+                        }
+                    }
                     return;
                 }
                 let can_play = self.loaded_path.is_some();
@@ -5059,6 +5111,14 @@ impl App {
     fn request_snapshot(&mut self) {
         if self.current_display.is_none() || self.loaded_path.is_none() {
             self.snapshot_status = Some((tr("Nothing to snapshot yet").to_string(), std::time::Instant::now()));
+            return;
+        }
+        // A still's full-size render IS the export; the zoom-still path that
+        // serves snapshots is video-only (no DetailCache for a photo), so a
+        // request here would wait out the 15 s timeout and save the
+        // working-res preview.
+        if self.clip.as_ref().map_or(false, |c| c.source_kind.is_still()) {
+            self.snapshot_status = Some((tr("Still photo — use Export for the full-size file").to_string(), std::time::Instant::now()));
             return;
         }
         if self.playing { self.toggle_play_pause(); }

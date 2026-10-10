@@ -719,6 +719,22 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    did for the preview) and the per-eye lens Override via
    `StillLensOverride::from_export_cfg` (same formulas as the video
    resolvers; preset k fallback = explicit preset else "Insta360 X6").
+   FREEZE (2026-10-09, evening): "UI stopped responding after exporting
+   flat" = the export of the LOADED still called `stop_playback()` (log:
+   "decoder thread exited cleanly" 11 ms after "export: spawned worker"),
+   and nothing restarts a still's thread (no Play button; sliders bump a
+   generation on `control = None`, which is not even logged). Not a
+   main-thread block (sample: idle in `-[NSApplication run]`; reviewed by
+   three independent agents). Fix: `spawn_export_job` keeps a still's
+   preview alive (it holds only textures), "Restart preview" button in the
+   still transport row, `stop_playback` clears `decoder_starting`,
+   `maybe_reseed_fisheye_override` keeps the last seed across a same-clip
+   respawn (reset in `unload_clip`), stills never "play" (Space revives
+   paused), no `AudioPlayer::open` on a still, one-shot WARN when settings
+   change with no decoder. Known, accepted: during a still export the
+   worker's `poll(wait)` holds wgpu's fence read guard per 64 MiB band, so
+   a slider drag hitches for ms — same as previewing another clip during
+   a video export.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
