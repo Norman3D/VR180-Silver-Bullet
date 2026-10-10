@@ -914,7 +914,20 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    dropped from the first kept packet's pts, the tail runs 0.1 s past the
    window. Verified: X6 export audio starts at exactly t_in (lag 0 vs the
    source, corr 0.999; before: the first packet after t_in, +10.7 ms), a 6 s
-   window renders in 68 ms; GoPro passthrough unchanged (offset = t_in). **WINDOWS ARMS VERIFIED (2026-10-10, Windows box):** my explicit-muxer
+   window renders in 68 ms; GoPro passthrough unchanged (offset = t_in).
+
+21. **2.5.2 release (2026-10-10, in progress).** macOS side cut with
+   `scripts/release_mac.sh` at `8dfa2d8`: bundle 2.5.2, helpers hash-current,
+   app + DMG notarized (Accepted) and stapled, `spctl` "Notarized Developer
+   ID"; update zip + `.minisig` + darwin-only `latest.json`
+   (`make-latest-json.mjs`); **GitHub release v2.5.2 created as a DRAFT**
+   with those four assets (tag is created on publish). Apple's first
+   `notarytool` call failed 403 until the Account Holder accepted the updated
+   Program License Agreement; propagation was uneven for ~10 min (a 403 can
+   land mid-`--wait` while the submission is already Accepted — `notarytool
+   history`/`info` + `stapler staple`). Pending: publish decision (mac-only
+   manifest first, as 2.5.1, or wait for Windows), Windows setup.exe + merged
+   `latest.json` via `--clobber`, memory recipe updated. **WINDOWS ARMS VERIFIED (2026-10-10, Windows box):** my explicit-muxer
    open survived the edit; clip 059 through BOTH blind-edited arms (zc
    readback = Libx265, GPU-resident = NVENC), trimmed at t_in = 5 s: the
    audio starts at **+0 ms** (10 ms RMS-envelope cross-correlation vs the
