@@ -332,19 +332,26 @@ fn transcode_audio_window(
         Sample::F32(Type::Packed), src_layout, rate,
     ).map_err(|e| Error::Ffmpeg(format!("resampler: {e}")))?;
 
-    let (codec_id, enc_fmt, enc_layout, out_ch, bit_rate) = match out {
+    // The muxer is named EXPLICITLY rather than guessed from the extension:
+    // `.m4a` resolves to the `ipod` muxer, which the FFmpeg build bundled
+    // with the Windows app (the gpl-lite dist) does not include, so the
+    // extension-guessed open failed there with "Unable to choose an output
+    // format" and every X6 360°-Audio export fell back to muxing the raw
+    // 4-channel track. `mp4` carries an AAC-only stream fine and is present
+    // in every build that can write our video; `wav` likewise.
+    let (codec_id, enc_fmt, enc_layout, out_ch, bit_rate, muxer) = match out {
         AudioOut::AacStereo { bit_rate } =>
-            (ffmpeg::codec::Id::AAC, Sample::F32(Type::Planar), ChannelLayout::STEREO, 2usize, bit_rate),
+            (ffmpeg::codec::Id::AAC, Sample::F32(Type::Planar), ChannelLayout::STEREO, 2usize, bit_rate, "mp4"),
         AudioOut::Pcm24 { channels } =>
-            (ffmpeg::codec::Id::PCM_S24LE, Sample::I32(Type::Packed), ambisonic_layout(channels), channels as usize, 0),
+            (ffmpeg::codec::Id::PCM_S24LE, Sample::I32(Type::Packed), ambisonic_layout(channels), channels as usize, 0, "wav"),
     };
     if mix.is_none() && out_ch != in_ch {
         return Err(Error::Ffmpeg(format!("channel count {in_ch} → {out_ch} without a mix")));
     }
     let codec = ffmpeg::encoder::find(codec_id)
         .ok_or_else(|| Error::Ffmpeg(format!("no encoder for {codec_id:?}")))?;
-    let mut octx = ffmpeg::format::output(&out_path)
-        .map_err(|e| Error::Ffmpeg(format!("open output {out_path:?}: {e}")))?;
+    let mut octx = ffmpeg::format::output_as(&out_path, muxer)
+        .map_err(|e| Error::Ffmpeg(format!("open output {out_path:?} as {muxer}: {e}")))?;
     let global_header = octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER);
     let (ost_idx, mut encoder) = {
         let mut ost = octx.add_stream(codec)
