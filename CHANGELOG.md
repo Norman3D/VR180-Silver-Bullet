@@ -100,6 +100,15 @@ the per-eye "Matching Eyes" trims are baked exactly in camera-linear
 space (one DNG has one profile). A 3D LUT and sharpening cannot travel as
 DNG metadata and are left out of the DNG (the export panel says so).
 
+With a still loaded, everything that cannot act on one photo is hidden
+rather than greyed: the transport row (play / stop / snapshot / trim),
+the timeline, stabilization, rolling shutter, noise reduction, Auto align
+and the built-in log LUT buttons. With DNG output selected, the 3D LUT and
+Detail sections go too, and the preview drops them so it shows exactly
+what the DNG will carry. The Output section's Fisheye and Reframed modes
+and the eye swap / upside-down toggles now work for stills, and the lens
+Override is honoured by the still export as it already was by the preview.
+
 ### GoPro .360: rolling-shutter correction audited and tightened
 
 The GoPro rolling-shutter term was measured directly for the first time:

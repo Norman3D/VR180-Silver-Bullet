@@ -703,6 +703,8 @@ fn tr(en: &'static str) -> &'static str {
         // Export format window (export_options_ui)
         "Resolution" => "分辨率",
         "Still format" => "照片格式",
+        "Still photo — no timeline" => "静态照片——没有时间线",
+        "DNG output: the 3D LUT, sharpening and automatic eye matching cannot travel as DNG metadata — hidden, and not applied to the preview." => "DNG 输出：3D LUT、锐化和自动眼间匹配无法作为 DNG 元数据保存——已隐藏，预览中也不应用。",
         "Still" => "照片",
         "Your grade travels as metadata: white balance → AsShotNeutral, tone (lift/gamma/gain/shadow/highlight) → profile tone curve, saturation → profile look table (Adobe); per-eye trims are baked. Not carried: 3D LUT, sharpen." => "调色以元数据形式写入：白平衡 → AsShotNeutral，影调（提升/伽马/增益/阴影/高光）→ 配置文件色调曲线，饱和度 → 配置文件 Look 表（Adobe）；双眼微调会烘入像素。不带入：3D LUT、锐化。",
         "single photo, 14-bit raw" => "单张照片，14 位 RAW",
@@ -1541,6 +1543,12 @@ impl App {
         if !matches!(source_kind, vr180_pipeline::SourceKind::Insta360Insv) {
             color_stack.auto_eye_match = None;
         }
+        // A still bound for a linear DNG: only what the DNG carries as
+        // metadata. Decided from THIS export's options (a batch may use a
+        // different still format than the live preview flag reflects).
+        if source_kind.is_still() && opts.still_format == StillFormatChoice::LinearDng {
+            crate::decoder::restrict_to_dng_metadata(&mut color_stack);
+        }
         // "BeyondVR Hack" — final-stage per-eye scale. Half-equirect SBS
         // output only; the preview plan (built separately) never sets it.
         if opts.beyondvr_hack
@@ -1709,6 +1717,8 @@ impl App {
                     swap_eyes: cfg.fisheye_swap_eyes,
                     develop: vr180_pipeline::raw_develop::DevelopParams::default(),
                     color_stack: cfg.color_stack.clone(),
+                    projection: cfg.projection,
+                    lens_override: vr180_pipeline::still_export::StillLensOverride::from_export_cfg(&cfg),
                 };
                 let t0 = std::time::Instant::now();
                 vr180_pipeline::still_export::export_still(pipeline, &still_cfg, &|_stage, f| {
@@ -4079,6 +4089,13 @@ impl eframe::App for App {
             let paths = std::mem::take(&mut self.pending_open);
             self.open_paths(paths);
         }
+        // Still + DNG output: the preview and the sidebar follow what the
+        // DNG can carry (the flag rides on Settings so the decoder sees it).
+        let still_dng = self.clip.as_ref().map_or(false, |c| c.source_kind.is_still())
+            && self.export_opts.still_format == StillFormatChoice::LinearDng;
+        if self.settings.still_dng_mode != still_dng {
+            self.settings.still_dng_mode = still_dng;
+        }
         // Drain decoder frames first so the most recent texture is
         // ready by the time we render the central panel.
         self.drain_frames(ctx);
@@ -4519,6 +4536,11 @@ impl eframe::App for App {
         // ─── Transport — buttons + trim controls ────────────────
         egui::TopBottomPanel::bottom("transport").exact_height(36.0).show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
+                if self.clip.as_ref().map_or(false, |c| c.source_kind.is_still()) {
+                    // A still has no transport, trim or playhead.
+                    ui.label(RichText::new(tr("Still photo — no timeline")).small().color(Color32::GRAY));
+                    return;
+                }
                 let can_play = self.loaded_path.is_some();
                 ui.add_enabled_ui(can_play, |ui| {
                     let label = tr(if self.playing { "Pause" } else { "▶ Play" });
@@ -5512,6 +5534,9 @@ impl App {
         let eye_match_readout = if self.decoder_alive {
             self.control.as_ref().and_then(|c| *c.eye_match_readout.lock())
         } else { None };
+        let is_still = matches!(kind, Some(k) if k.is_still());
+        // Still + DNG: only what the DNG carries as metadata is offered.
+        let dng_mode = is_still && self.export_opts.still_format == StillFormatChoice::LinearDng;
         let s = &mut self.settings;
 
         // CDL: lift / gamma / gain / shadow / highlight.
@@ -5614,84 +5639,94 @@ impl App {
 
         ui.separator();
 
-        // 3D LUT.
-        ui.label(RichText::new(tr("3D LUT (.cube)")).strong());
-        ui.horizontal(|ui| {
-            let mut label = if s.lut_path.is_empty() {
-                "(none)".to_string()
-            } else if s.lut_path == crate::decoder::BUILTIN_OSMO_LUT_PATH {
-                crate::decoder::BUILTIN_OSMO_LUT_NAME.to_string()
-            } else if s.lut_path == crate::decoder::BUILTIN_GPLOG_LUT_PATH {
-                crate::decoder::BUILTIN_GPLOG_LUT_NAME.to_string()
-            } else if s.lut_path == crate::decoder::BUILTIN_X6_LUT_PATH {
-                crate::decoder::BUILTIN_X6_LUT_NAME.to_string()
-            } else {
-                std::path::Path::new(&s.lut_path)
-                    .file_name().and_then(|f| f.to_str()).unwrap_or("(invalid)")
-                    .to_string()
-            };
-            ui.add(egui::TextEdit::singleline(&mut label).interactive(false).desired_width(160.0));
-            if ui.button(tr("Browse…")).clicked() {
-                browse_lut = true;
-            }
-            if ui.button(tr("Clear")).clicked() {
-                s.lut_path.clear();
-            }
-        });
-        // Quick re-apply of the embedded log→709 LUT for THIS source
-        // (autoloaded on open; offered here in case it was cleared). Only
-        // the source-matching builtin is shown — no DJI LUT on a `.360`,
-        // no GoPro LUT on an `.osv`.
-        match kind {
-            Some(vr180_pipeline::SourceKind::DjiOsv)
-                if s.lut_path != crate::decoder::BUILTIN_OSMO_LUT_PATH =>
-            {
-                if ui.button(tr("Use built-in Osmo 360 D-LogM→709")).clicked() {
-                    s.lut_path = crate::decoder::BUILTIN_OSMO_LUT_PATH.to_string();
-                    s.lut_intensity = 1.0;
+        if dng_mode {
+            // Linear DNG output carries the grade as metadata; a 3D LUT,
+            // sharpening and automatic eye matching have no DNG equivalent
+            // (`still_export::grade_metadata`), and the preview plan drops
+            // them too (`Settings::still_dng_mode`) — so they are not offered.
+            ui.label(RichText::new(tr(
+                "DNG output: the 3D LUT, sharpening and automatic eye matching cannot travel as DNG metadata — hidden, and not applied to the preview."
+            )).small().color(Color32::GRAY));
+        } else {
+            // 3D LUT.
+            ui.label(RichText::new(tr("3D LUT (.cube)")).strong());
+            ui.horizontal(|ui| {
+                let mut label = if s.lut_path.is_empty() {
+                    "(none)".to_string()
+                } else if s.lut_path == crate::decoder::BUILTIN_OSMO_LUT_PATH {
+                    crate::decoder::BUILTIN_OSMO_LUT_NAME.to_string()
+                } else if s.lut_path == crate::decoder::BUILTIN_GPLOG_LUT_PATH {
+                    crate::decoder::BUILTIN_GPLOG_LUT_NAME.to_string()
+                } else if s.lut_path == crate::decoder::BUILTIN_X6_LUT_PATH {
+                    crate::decoder::BUILTIN_X6_LUT_NAME.to_string()
+                } else {
+                    std::path::Path::new(&s.lut_path)
+                        .file_name().and_then(|f| f.to_str()).unwrap_or("(invalid)")
+                        .to_string()
+                };
+                ui.add(egui::TextEdit::singleline(&mut label).interactive(false).desired_width(160.0));
+                if ui.button(tr("Browse…")).clicked() {
+                    browse_lut = true;
                 }
-            }
-            Some(vr180_pipeline::SourceKind::GoProEac)
-                if s.lut_path != crate::decoder::BUILTIN_GPLOG_LUT_PATH =>
-            {
-                if ui.button(tr("Use built-in GoPro GP-Log→709")).clicked() {
-                    s.lut_path = crate::decoder::BUILTIN_GPLOG_LUT_PATH.to_string();
-                    s.lut_intensity = 1.0;
+                if ui.button(tr("Clear")).clicked() {
+                    s.lut_path.clear();
                 }
-            }
-            Some(vr180_pipeline::SourceKind::Insta360Insv)
-                if s.lut_path != crate::decoder::BUILTIN_X6_LUT_PATH =>
-            {
-                if ui.button(tr("Use built-in Insta360 X6 I-Log→709")).clicked() {
-                    s.lut_path = crate::decoder::BUILTIN_X6_LUT_PATH.to_string();
-                    s.lut_intensity = 1.0;
+            });
+            // Quick re-apply of the embedded log→709 LUT for THIS source
+            // (autoloaded on open; offered here in case it was cleared). Only
+            // the source-matching builtin is shown — no DJI LUT on a `.360`,
+            // no GoPro LUT on an `.osv`.
+            match kind {
+                Some(vr180_pipeline::SourceKind::DjiOsv)
+                    if s.lut_path != crate::decoder::BUILTIN_OSMO_LUT_PATH =>
+                {
+                    if ui.button(tr("Use built-in Osmo 360 D-LogM→709")).clicked() {
+                        s.lut_path = crate::decoder::BUILTIN_OSMO_LUT_PATH.to_string();
+                        s.lut_intensity = 1.0;
+                    }
                 }
+                Some(vr180_pipeline::SourceKind::GoProEac)
+                    if s.lut_path != crate::decoder::BUILTIN_GPLOG_LUT_PATH =>
+                {
+                    if ui.button(tr("Use built-in GoPro GP-Log→709")).clicked() {
+                        s.lut_path = crate::decoder::BUILTIN_GPLOG_LUT_PATH.to_string();
+                        s.lut_intensity = 1.0;
+                    }
+                }
+                Some(vr180_pipeline::SourceKind::Insta360Insv)
+                    if s.lut_path != crate::decoder::BUILTIN_X6_LUT_PATH =>
+                {
+                    if ui.button(tr("Use built-in Insta360 X6 I-Log→709")).clicked() {
+                        s.lut_path = crate::decoder::BUILTIN_X6_LUT_PATH.to_string();
+                        s.lut_intensity = 1.0;
+                    }
+                }
+                _ => {}
             }
-            _ => {}
-        }
-        ui.add_enabled_ui(!s.lut_path.is_empty(), |ui| {
-            ui.add(egui::Slider::new(&mut s.lut_intensity, 0.0..=1.0)
-                .text(tr("Intensity")).fixed_decimals(2));
-        });
+            ui.add_enabled_ui(!s.lut_path.is_empty(), |ui| {
+                ui.add(egui::Slider::new(&mut s.lut_intensity, 0.0..=1.0)
+                    .text(tr("Intensity")).fixed_decimals(2));
+            });
 
-        ui.separator();
+            ui.separator();
 
-        // Detail: equirect-aware sharpening (ported from the Python app;
-        // runs on every exportable source). Noise reduction has its own
-        // section.
-        ui.label(RichText::new(tr("Detail")).strong());
-        ui.add(egui::Slider::new(&mut s.sharpen_amount, 0.0..=2.0)
-            .text(tr("Sharpen")).fixed_decimals(2))
-            .on_hover_text(tr("Equirect-aware unsharp mask (cos-latitude weighted). \
-                0.5 subtle, 1.0 moderate, 2.0 strong."));
-        ui.add_enabled_ui(s.sharpen_amount > 0.0, |ui| {
-            ui.add(egui::Slider::new(&mut s.sharpen_radius, 0.5..=3.0)
-                .text(tr("Radius")).fixed_decimals(2));
-        });
-        if ui.button(tr("Reset detail")).clicked() {
-            s.sharpen_amount = 0.0; s.sharpen_radius = 1.5;
+            // Detail: equirect-aware sharpening (ported from the Python app;
+            // runs on every exportable source). Noise reduction has its own
+            // section.
+            ui.label(RichText::new(tr("Detail")).strong());
+            ui.add(egui::Slider::new(&mut s.sharpen_amount, 0.0..=2.0)
+                .text(tr("Sharpen")).fixed_decimals(2))
+                .on_hover_text(tr("Equirect-aware unsharp mask (cos-latitude weighted). \
+                    0.5 subtle, 1.0 moderate, 2.0 strong."));
+            ui.add_enabled_ui(s.sharpen_amount > 0.0, |ui| {
+                ui.add(egui::Slider::new(&mut s.sharpen_radius, 0.5..=3.0)
+                    .text(tr("Radius")).fixed_decimals(2));
+            });
+            if ui.button(tr("Reset detail")).clicked() {
+                s.sharpen_amount = 0.0; s.sharpen_radius = 1.5;
+            }
+            // (Noise reduction has moved to its own "Noise Reduction" section.)
         }
-        // (Noise reduction has moved to its own "Noise Reduction" section.)
 
         if browse_lut {
             let ctx = ui.ctx().clone();
@@ -5742,6 +5777,7 @@ impl App {
         );
         let align_running = self.align_rx.is_some();
         let align_status = self.align_status.clone();
+        let is_still = self.clip.as_ref().map_or(false, |c| c.source_kind.is_still());
         let s = &mut self.settings;
         ui.label(RichText::new(tr("Global (both eyes)")).small().color(Color32::GRAY));
         if matches!(s.fisheye_output_mode, crate::decoder::FisheyeOutputMode::Reframe) {
@@ -5781,7 +5817,9 @@ impl App {
             // Auto align: measure the inter-eye disparity field on a few
             // frames and ADD the fitted pitch/roll (and gated yaw)
             // correction to the stereo sliders. Fisheye-family sources.
-            if align_running {
+            if is_still {
+                // Auto align measures disparity over several frames — not for a still.
+            } else if align_running {
                 ui.spinner();
                 ui.label(RichText::new(tr("Aligning…")).small());
             } else if ui.add_enabled(align_ok, egui::Button::new(tr("Auto align")))
@@ -5974,9 +6012,13 @@ impl App {
 
     /// Output panel for fisheye sources — projection target + L↔R swap.
     fn draw_fisheye_output_panel(&mut self, ui: &mut egui::Ui) {
+        // Dual-fisheye sources (and the X6 still): 195° lens, eye swap +
+        // upside-down mount apply (the still honours both too).
         let is_osv = matches!(
             self.clip.as_ref().map(|c| c.source_kind),
-            Some(vr180_pipeline::SourceKind::DjiOsv) | Some(vr180_pipeline::SourceKind::Insta360Insv)
+            Some(vr180_pipeline::SourceKind::DjiOsv)
+                | Some(vr180_pipeline::SourceKind::Insta360Insv)
+                | Some(vr180_pipeline::SourceKind::Insta360Dng)
         );
         let s = &mut self.settings;
 

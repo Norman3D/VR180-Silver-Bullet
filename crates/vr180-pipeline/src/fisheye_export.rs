@@ -3786,7 +3786,8 @@ pub(crate) fn resolve_calib_pair(
     }.unwrap_or_else(|| {
         let auto_name = match cfg.source_kind {
             SourceKind::DjiOsv        => "DJI Osmo 360",
-            SourceKind::Insta360Insv  => "Insta360 X6",
+            SourceKind::Insta360Insv
+            | SourceKind::Insta360Dng => "Insta360 X6",
             SourceKind::BlackmagicRaw => "Blackmagic Pyxis 12K",
             _                         => "Custom",
         };

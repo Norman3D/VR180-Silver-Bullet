@@ -215,6 +215,12 @@ pub struct Settings {
     pub rs_mode: RsMode,
     #[serde(skip, default = "default_rs_readout_ms")]
     pub rs_readout_ms: f32,
+    /// Still photo + linear-DNG output selected: the colour stack is
+    /// limited to what the DNG can carry as metadata (white balance, CDL
+    /// tone, saturation, per-eye trims) so the preview shows exactly what
+    /// the DNG will. Set by the GUI every frame; never persisted.
+    #[serde(skip)]
+    pub still_dng_mode: bool,
     pub preview_eye_w: u32,
     /// Trim-in time in seconds. `None` = play from clip start.
     /// Honored by the decoder loop: when playback hits `trim_out_s`,
@@ -432,6 +438,7 @@ impl Default for Settings {
             rs_correct: true,
             rs_mode: default_rs_mode(),
             rs_readout_ms: default_rs_readout_ms(),
+            still_dng_mode: false,
             preview_eye_w: 768,
             trim_in_s: None,
             trim_out_s: None,
@@ -565,6 +572,17 @@ pub(crate) fn load_lut_cached(lut_path: &str) -> Option<vr180_core::Cube3DLut> {
     })
 }
 
+/// Limit a colour-stack plan to what a linear DNG carries as metadata
+/// (`still_export::grade_metadata`: white balance, CDL tone, saturation,
+/// per-eye trims): no 3D LUT, no sharpening, no automatic eye matching.
+/// The still preview and the still-DNG export both go through this so the
+/// preview shows exactly what the DNG will.
+pub fn restrict_to_dng_metadata(plan: &mut vr180_pipeline::gpu::ColorStackPlan) {
+    plan.lut = None;
+    plan.sharpen = Default::default();
+    plan.auto_eye_match = None;
+}
+
 impl Settings {
     /// The L↔R eye swap that should actually be applied: the manual
     /// "Swap L↔R" toggle XOR the upside-down mount (flipping the rig
@@ -640,6 +658,9 @@ impl Settings {
             sigma: self.sharpen_radius.max(0.1),
             apply_lat_weight: true, // equirect output (both EAC + OSV)
         };
+        if self.still_dng_mode {
+            restrict_to_dng_metadata(&mut plan);
+        }
         plan
     }
 

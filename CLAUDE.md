@@ -708,6 +708,17 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    export failed on a 482 MB readback buffer (now banded, see gpu.rs). The
    harness env SAT/TEMP/TINT/LIFT/GAMMA/GAIN/SHADOW/HIGHLIGHT exercises the
    colour stack on stills.
+   HIDE (2026-10-09, same day): for a still the GUI hides (not greys) every
+   control that cannot act on one photo — transport row, timeline, stab,
+   RS, NR, Auto align, built-in log LUT buttons; with DNG output selected
+   also the 3D LUT + Detail sections, and `Settings::still_dng_mode`
+   (serde-skipped, set by the GUI each frame) makes `build_color_stack`
+   drop LUT / sharpen / auto eye match so preview == DNG. Stills now take
+   `FisheyeExportProjection` (Fisheye → `project_fisheye_to_fisheye_texture_16`,
+   Reframe → `with_reframe` on the equirect kernel, as `run_still` already
+   did for the preview) and the per-eye lens Override via
+   `StillLensOverride::from_export_cfg` (same formulas as the video
+   resolvers; preset k fallback = explicit preset else "Insta360 X6").
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

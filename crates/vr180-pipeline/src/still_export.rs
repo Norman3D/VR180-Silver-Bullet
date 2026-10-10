@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::dng_write::{self, DngCompression, LinearDngImage, LinearDngMeta, LookTable};
+use crate::fisheye_export::{FisheyeExportProjection, FISHEYE_OUT_FULL_FOV_DEG};
 use crate::gpu::{ColorStackPlan, Device, EquirectRotation, FisheyeCalib};
 use crate::insv_imu;
 use crate::panomap::{mat3_mul_row_major, ViewAdjust};
@@ -75,6 +76,68 @@ pub struct StillExportConfig {
     /// video export does; for the linear DNG it is NOT baked (see the
     /// metadata path).
     pub color_stack: ColorStackPlan,
+    /// Output projection — half-equirect VR180, the normalized
+    /// `FISHEYE_OUT_FULL_FOV_DEG` fisheye, or a reframed viewport — with
+    /// the per-eye calibration shaped exactly as the video export shapes it.
+    /// `eye_w × eye_h` is the per-eye frame of that projection (square for
+    /// the fisheye, the viewport for a reframe).
+    pub projection: FisheyeExportProjection,
+    /// Per-OUTPUT-eye manual lens Override (`[left, right]`; `None` = the
+    /// DNG's factory model). Mirrors the preview's resolver so export ==
+    /// preview when the user has edited an eye's FOV / centre / distortion.
+    pub lens_override: [Option<StillLensOverride>; 2],
+}
+
+/// One eye's manual lens Override for a still: a Kannala-Brandt lens
+/// described by the sidebar's fields, in place of the DNG's factory UCM
+/// model (the same substitution the video preview / export make).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StillLensOverride {
+    /// Per-eye field of view (degrees) → `fx = w / fov`.
+    pub fov_deg: f32,
+    /// Principal point as a fraction of the eye frame.
+    pub cx_norm: f32,
+    pub cy_norm: f32,
+    /// KB k1–k4 (the caller substitutes the camera preset's when the
+    /// manual ones are all zero, as the preview resolver does).
+    pub k: [f32; 4],
+    pub k5: f32,
+    /// Brown-Conrady tangential `[p1, p2]`.
+    pub p: [f32; 2],
+}
+
+impl StillLensOverride {
+    /// The `[left, right]` output-eye Overrides from a video-style export
+    /// config (the GUI fills the same per-eye fields for every source kind).
+    /// Manual k1–k4 that are all zero take the camera preset's — the explicit
+    /// preset name wins, else the X6 preset — exactly as the video resolvers.
+    pub fn from_export_cfg(cfg: &crate::fisheye_export::FisheyeExportConfig) -> [Option<Self>; 2] {
+        use vr180_fisheye::presets;
+        let preset = if !cfg.fisheye_preset.is_empty() && cfg.fisheye_preset != "Auto" {
+            presets::find(&cfg.fisheye_preset)
+        } else {
+            None
+        }
+        .or_else(|| presets::find("Insta360 X6"))
+        .unwrap_or(&presets::presets()[7]);
+        let preset_k = [preset.calib.k[0] as f32, preset.calib.k[1] as f32,
+                        preset.calib.k[2] as f32, preset.calib.k[3] as f32];
+        let mk = |on: bool, fov: f32, cxn: f32, cyn: f32, k: [f32; 4], k5: f32, p: [f32; 2]| {
+            on.then(|| Self {
+                fov_deg: fov, cx_norm: cxn, cy_norm: cyn,
+                k: if k.iter().any(|c| c.abs() > 1e-9) { k } else { preset_k },
+                k5, p,
+            })
+        };
+        [
+            mk(cfg.fisheye_override_left, cfg.fisheye_fov_deg_left,
+               cfg.fisheye_cx_norm_left, cfg.fisheye_cy_norm_left,
+               cfg.fisheye_k_left, cfg.fisheye_k5_left, cfg.fisheye_p_left),
+            mk(cfg.fisheye_override_right, cfg.fisheye_fov_deg_right,
+               cfg.fisheye_cx_norm_right, cfg.fisheye_cy_norm_right,
+               cfg.fisheye_k_right, cfg.fisheye_k5_right, cfg.fisheye_p_right),
+        ]
+    }
 }
 
 /// Progress callback: `(stage, fraction 0..1)`.
@@ -108,6 +171,42 @@ pub fn still_eye_calib(still: &X6Still, half: Half) -> Result<FisheyeCalib> {
     ))
 }
 
+/// The calibration the projection kernels get for one OUTPUT eye: the
+/// factory model (or the user's Override), then shaped for the output
+/// projection exactly as `fisheye_export::resolve_fisheye_calib` shapes it
+/// for video — the fisheye target's output half-FOV, the reframed
+/// viewport's ray generator. `eye_w × eye_h` is the output eye frame.
+pub fn still_output_calib(
+    still: &X6Still,
+    half: Half,
+    ov: Option<&StillLensOverride>,
+    projection: FisheyeExportProjection,
+    eye_w: u32,
+    eye_h: u32,
+) -> Result<FisheyeCalib> {
+    let calib = match ov {
+        None => still_eye_calib(still, half)?,
+        Some(o) => {
+            let (w, h) = ((still.width / 2) as f32, still.height as f32);
+            // Same formulas as the video resolvers' Override branch.
+            let half_fov = o.fov_deg.max(1.0).to_radians() * 0.5;
+            let fx = w / (2.0 * half_fov);
+            let mut c = FisheyeCalib::new_pure_kb(fx, fx, o.cx_norm * w, o.cy_norm * h, o.k, w, h);
+            c.k5 = o.k5;
+            c.p1 = o.p[0];
+            c.p2 = o.p[1];
+            c
+        }
+    };
+    Ok(match projection {
+        FisheyeExportProjection::HalfEquirect => calib,
+        FisheyeExportProjection::Fisheye =>
+            calib.with_output_hfov((FISHEYE_OUT_FULL_FOV_DEG * 0.5).to_radians()),
+        FisheyeExportProjection::Reframe { hfov_deg, defish } =>
+            calib.with_reframe(hfov_deg, defish, eye_w as f32 / eye_h.max(1) as f32),
+    })
+}
+
 /// Per-eye output rotations for a still: no stabilization (identity),
 /// only the pano / stereo view adjust, exactly as the preview's
 /// `render_still_from_pair` composes them.
@@ -122,7 +221,10 @@ pub fn still_eye_rotations(view_adjust: &ViewAdjust) -> (EquirectRotation, Equir
     )
 }
 
-/// One projected eye as an `Rgba16Unorm` texture, `eye_w × eye_h`.
+/// One projected eye as an `Rgba16Unorm` texture, `eye_w × eye_h`: the
+/// equirect kernel for VR180 and the reframed viewport (the calib carries
+/// the viewport), the fisheye kernel for the normalized fisheye output.
+#[allow(clippy::too_many_arguments)]
 fn project_eye(
     device: &Device,
     rgba64: &[u16],
@@ -130,9 +232,14 @@ fn project_eye(
     eye_w: u32, eye_h: u32,
     rot: EquirectRotation,
     calib: FisheyeCalib,
+    projection: FisheyeExportProjection,
 ) -> Result<wgpu::Texture> {
     let bytes: &[u8] = bytemuck::cast_slice(rgba64);
-    device.project_fisheye_to_equirect_texture_16(bytes, src_w, src_h, eye_w, eye_h, rot, calib)
+    if projection == FisheyeExportProjection::Fisheye {
+        device.project_fisheye_to_fisheye_texture_16(bytes, 16, src_w, src_h, eye_w, eye_h, rot, calib)
+    } else {
+        device.project_fisheye_to_equirect_texture_16(bytes, src_w, src_h, eye_w, eye_h, rot, calib)
+    }
 }
 
 /// Compose two RGBA64LE eyes side by side into interleaved RGB16 (no alpha).
@@ -408,9 +515,9 @@ pub fn export_still(device: Arc<Device>, cfg: &StillExportConfig, progress: Stil
         };
         drop(eye);
         progress(&format!("Projecting {label} eye"), 0.25 + 0.3 * i as f32);
-        let calib = still_eye_calib(&still, *half)?;
+        let calib = still_output_calib(&still, *half, cfg.lens_override[i].as_ref(), cfg.projection, cfg.eye_w, cfg.eye_h)?;
         let rot = if i == 0 { rot_l } else { rot_r };
-        eye_tex.push(project_eye(&device, &rgba, half_w, half_h, cfg.eye_w, cfg.eye_h, rot, calib)?);
+        eye_tex.push(project_eye(&device, &rgba, half_w, half_h, cfg.eye_w, cfg.eye_h, rot, calib, cfg.projection)?);
     }
     // The colour stack: baked into the developed outputs (same 16-bit GPU
     // stages as the video export, per eye, after projection). The linear
