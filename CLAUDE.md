@@ -704,8 +704,10 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    4096×2048 LinearRaw 16-bit, DNG 1.4 / back 1.1, LJPEG 256² tiles, Black 0
    / White 65535). Practical consequence: Explorer and Photos show a soft
    256-px preview of our DNG; a larger embedded preview (Adobe writes ~1024
-   wide) would fix that cosmetically — writer's call. Lightroom is not
-   installed on the Windows box: still untested there.
+   wide) would fix that cosmetically — writer's call. Lightroom CC IS
+   installed on the Windows box but is GUI-only (no CLI), so it was not
+   driven; the exported DNGs sit in the session scratchpad `stills/` for a
+   by-hand open.
    GRADE (2026-10-09, same day): PNG/JPEG bake the 16-bit colour stack
    (`apply_color_stack_pair_16` on the two eye textures, as video). The
    linear DNG carries the grade as METADATA (`still_export::grade_metadata`,
