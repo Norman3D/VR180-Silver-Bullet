@@ -17,6 +17,10 @@
   what a `.m4a` name resolves to; the audio writer now names its container
   explicitly instead of guessing from the extension. Windows exports of such
   clips now get a real stereo track, at the source's level.
+- The stereo decode of an X6 360° Audio clip now renders only the export
+  window instead of the whole clip (a 127 s clip cost ~7 s up front even for
+  a 6 s export), and it starts sample-accurately at the trim point rather
+  than at the next audio packet.
 
 ### Insta360 X6: automatic per-frame eye-exposure matching
 

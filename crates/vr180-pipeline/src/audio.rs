@@ -289,9 +289,12 @@ enum AudioOut {
 }
 
 /// Decode the `[offset_s, offset_s + dur_s)` window of audio stream
-/// `stream_index` (packet granularity at the edges, like the passthrough
-/// mux), optionally mix it 4→2 through `mix` (rows = output channels), and
-/// encode it to `out_path`. Returns the number of samples written.
+/// `stream_index`, optionally mix it 4→2 through `mix` (rows = output
+/// channels), and encode it to `out_path`. The output starts EXACTLY at
+/// `offset_s` (sample-accurate: decoding begins a few packets earlier so
+/// the codec's overlap has settled, then the head is dropped) and runs a
+/// little past `offset_s + dur_s` (packet granularity) so a mux can cut at
+/// `dur_s`. Returns the number of samples written.
 fn transcode_audio_window(
     input: &Path,
     stream_index: usize,
@@ -434,16 +437,27 @@ fn transcode_audio_window(
     };
 
     let tb_s = src_tb.numerator() as f64 / src_tb.denominator().max(1) as f64;
-    let win_end = dur_s.map(|d| offset_s + d);
+    // Warm-up / tail margins in source seconds: a few packets before the
+    // window (the AAC frame after a mid-stream start lacks its overlap; it
+    // falls inside the dropped head) and a few after it.
+    const EDGE_S: f64 = 0.1;
+    let win_end = dur_s.map(|d| offset_s + d + EDGE_S);
     let mut decoded = ffmpeg::frame::Audio::empty();
     let mut f32_frame = ffmpeg::frame::Audio::empty();
-    let mut push = |f: &ffmpeg::frame::Audio, pending: &mut Vec<f32>| {
+    // Samples still to drop so the output starts exactly at `offset_s`
+    // (set from the first kept packet's timestamp).
+    let mut drop_left: Option<usize> = None;
+    let push = |f: &ffmpeg::frame::Audio, pending: &mut Vec<f32>, drop_left: &mut Option<usize>| {
         let n = f.samples();
         let bytes = &f.data(0)[..n * in_ch * 4];
-        let src: &[f32] = bytemuck::cast_slice(bytes);
+        let mut src: &[f32] = bytemuck::cast_slice(bytes);
+        if let Some(d) = drop_left {
+            let take = (*d).min(n);
+            src = &src[take * in_ch..];
+            *d -= take;
+        }
         match mix {
-            Some(m) => for i in 0..n {
-                let s = &src[i * 4..i * 4 + 4];
+            Some(m) => for s in src.chunks_exact(4) {
                 for row in m.iter() {
                     pending.push(row[0] * s[0] + row[1] * s[1] + row[2] * s[2] + row[3] * s[3]);
                 }
@@ -454,12 +468,15 @@ fn transcode_audio_window(
     for (stream, pkt) in ictx.packets() {
         if stream.index() != stream_index { continue; }
         let t = pkt.pts().or(pkt.dts()).unwrap_or(0) as f64 * tb_s;
-        if t < offset_s - 0.05 { continue; }
+        if t < offset_s - EDGE_S { continue; }
         if let Some(end) = win_end { if t >= end { break; } }
+        if drop_left.is_none() {
+            drop_left = Some(((offset_s - t) * rate as f64).round().max(0.0) as usize);
+        }
         if decoder.send_packet(&pkt).is_err() { continue; }
         while decoder.receive_frame(&mut decoded).is_ok() {
             if to_f32.run(&decoded, &mut f32_frame).is_ok() && f32_frame.samples() > 0 {
-                push(&f32_frame, &mut pending);
+                push(&f32_frame, &mut pending, &mut drop_left);
             }
         }
         emit(&mut pending, false, &mut encoder, &mut octx, &mut written)?;
@@ -467,11 +484,11 @@ fn transcode_audio_window(
     let _ = decoder.send_eof();
     while decoder.receive_frame(&mut decoded).is_ok() {
         if to_f32.run(&decoded, &mut f32_frame).is_ok() && f32_frame.samples() > 0 {
-            push(&f32_frame, &mut pending);
+            push(&f32_frame, &mut pending, &mut drop_left);
         }
     }
     if to_f32.flush(&mut f32_frame).is_ok() && f32_frame.samples() > 0 {
-        push(&f32_frame, &mut pending);
+        push(&f32_frame, &mut pending, &mut drop_left);
     }
     emit(&mut pending, true, &mut encoder, &mut octx, &mut written)?;
     encoder.send_eof().map_err(|e| Error::Ffmpeg(format!("send_eof: {e}")))?;
@@ -481,17 +498,20 @@ fn transcode_audio_window(
 }
 
 /// Decode the X6's 4-channel 360° Audio (first-order AmbiX) to a
-/// front-facing stereo AAC `.m4a` — see [`FOA_STEREO_MATRIX`]. The whole
-/// track when `dur_s` is `None`, so the caller can keep muxing with the
-/// source's trim offsets. Returns the number of samples written.
+/// front-facing stereo AAC `.m4a` — see [`FOA_STEREO_MATRIX`]. Only the
+/// `[offset_s, offset_s + dur_s)` window (the whole track when `dur_s` is
+/// `None`); the file starts exactly at `offset_s`, so a mux plays it from
+/// its own 0. Returns the number of samples written.
 pub fn foa_to_stereo_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Option<f64>, bit_rate: usize) -> Result<u64> {
     let info = probe_foa_aac(input)?
         .ok_or_else(|| Error::Ffmpeg(format!("no 4-channel AAC (360° Audio) track in {input:?}")))?;
+    let t0 = std::time::Instant::now();
     let n = transcode_audio_window(
         input, info.stream_index, output_m4a, offset_s, dur_s,
         Some(&FOA_STEREO_MATRIX), AudioOut::AacStereo { bit_rate },
     )?;
     tracing::info!(m4a = %output_m4a.display(), samples = n, sample_rate = info.sample_rate,
+        window_start_s = offset_s, window_s = dur_s.unwrap_or(f64::NAN), took_ms = t0.elapsed().as_millis() as u64,
         "X6 360° Audio: decoded first-order AmbiX to a front-facing stereo AAC");
     Ok(n)
 }

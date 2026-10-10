@@ -426,8 +426,8 @@ fn finalize_eac_audio(
 
     let stereo = |audio_tmp: &Option<PathBuf>| -> Result<()> {
         // (The X6's 360° Audio is decoded to a stereo temp here.)
-        let (s_src, s_tmp) = stereo_audio_source(cfg);
-        let r = finalize_with_audio(&s_src, video_tmp, out, offset_s, dur_s);
+        let (s_src, s_tmp, s_off) = stereo_audio_source(cfg, offset_s, dur_s);
+        let r = finalize_with_audio(&s_src, video_tmp, out, s_off, dur_s);
         if let Some(t) = s_tmp { std::fs::remove_file(t).ok(); }
         r?;
         drop_tmp(audio_tmp);
@@ -565,29 +565,32 @@ fn one_pass_audio_eligible(cfg: &FisheyeExportConfig) -> bool {
     }
 }
 
-/// The audio source for a STEREO export: the source file (or the chain
-/// playlist) — except an Insta360 X6 clip recorded in "360° Audio" mode,
-/// whose 4-channel AmbiX track is first decoded to a front-facing stereo
-/// AAC temp (`audio::foa_to_stereo_aac`): copied as is, a layout downmix of
-/// that track cancels two anti-phase channels and lands ~9 dB left-heavy.
-/// The whole track is rendered so the caller's trim offsets still apply.
-/// Second element = a temp to delete when done (the playlist or the m4a).
-fn stereo_audio_source(cfg: &FisheyeExportConfig) -> (PathBuf, Option<PathBuf>) {
+/// The audio source for a STEREO export of the window `[t_in, t_in + dur_s)`:
+/// the source file (or the chain playlist) — except an Insta360 X6 clip
+/// recorded in "360° Audio" mode, whose 4-channel AmbiX track is first
+/// decoded to a front-facing stereo AAC temp (`audio::foa_to_stereo_aac`):
+/// copied as is, a layout downmix of that track cancels two anti-phase
+/// channels and lands ~9 dB left-heavy. Only the export window is rendered,
+/// starting exactly at `t_in` (sample-accurate).
+/// Returns `(source, temp to delete when done, offset)` — the offset the mux
+/// must apply to THAT source: `t_in` for a source file / playlist, `0` for
+/// the rendered temp.
+fn stereo_audio_source(cfg: &FisheyeExportConfig, t_in: f64, dur_s: f64) -> (PathBuf, Option<PathBuf>, f64) {
     let (src, tmp) = eac_audio_source(cfg);
     if cfg.source_kind == SourceKind::Insta360Insv {
         if let Ok(Some(_)) = crate::audio::probe_foa_aac(&src) {
             let out = video_only_temp_path(&cfg.output_path).with_extension("foa_stereo.m4a");
-            match crate::audio::foa_to_stereo_aac(&src, &out, 0.0, None, 192_000) {
+            match crate::audio::foa_to_stereo_aac(&src, &out, t_in, Some(dur_s), 192_000) {
                 Ok(_) => {
                     if let Some(t) = tmp { std::fs::remove_file(t).ok(); }
-                    return (out.clone(), Some(out));
+                    return (out.clone(), Some(out), 0.0);
                 }
                 Err(e) => tracing::warn!(
                     "X6 360° Audio → stereo decode failed ({e}); muxing the 4-channel track as is"),
             }
         }
     }
-    (src, tmp)
+    (src, tmp, t_in)
 }
 
 /// Two-pass audio finalize for the fisheye (non-EAC) exports: the X6 takes
@@ -1211,9 +1214,9 @@ fn export_fisheye_inner(
 
     // Inline audio passthrough — must attach before the first frame.
     let one_pass_audio_tmp = if one_pass {
-        let (asrc, atmp) = stereo_audio_source(&cfg);
         let dur = total_frames_to_write as f64 / cfg.fps as f64;
-        if let Err(e) = encoder.attach_audio_passthrough(&asrc, t_in, dur) {
+        let (asrc, atmp, aoff) = stereo_audio_source(&cfg, t_in, dur);
+        if let Err(e) = encoder.attach_audio_passthrough(&asrc, aoff, dur) {
             tracing::warn!("one-pass audio attach failed: {e} — video-only output");
         }
         atmp
@@ -1774,7 +1777,6 @@ fn export_eac_inner(
     // covers the whole chain when stabilizing; otherwise (empty per_eye)
     // probe the chain — per_eye.len() would clip the audio to nothing.
     let one_pass_audio_tmp = if one_pass {
-        let (asrc, atmp) = stereo_audio_source(&cfg);
         let total_video_frames = if per_eye.is_empty() {
             if cfg.segments.len() > 1 {
                 cfg.segments.iter().map(|s| chain_segment_frames(s, cfg.fps)).sum::<usize>()
@@ -1787,8 +1789,9 @@ fn export_eac_inner(
         let dur = trim_out_frame
             .map(|o| (o.saturating_sub(trim_in_frame)) as f64 * dt)
             .unwrap_or((total_video_frames.saturating_sub(trim_in_frame as usize)) as f64 * dt);
+        let (asrc, atmp, aoff) = stereo_audio_source(&cfg, trim_in_frame as f64 * dt, dur);
         if let Err(e) = encoder.attach_audio_passthrough(
-            &asrc, trim_in_frame as f64 * dt, dur,
+            &asrc, aoff, dur,
         ) {
             tracing::warn!("one-pass audio attach failed: {e} — video-only output");
         }
@@ -1979,7 +1982,6 @@ fn export_eac_zerocopy_vt(
     // covers the whole chain when stabilizing; otherwise (empty per_eye)
     // probe the chain — per_eye.len() would clip the audio to nothing.
     let one_pass_audio_tmp = if one_pass {
-        let (asrc, atmp) = stereo_audio_source(&cfg);
         let total_video_frames = if per_eye.is_empty() {
             if cfg.segments.len() > 1 {
                 cfg.segments.iter().map(|s| chain_segment_frames(s, cfg.fps)).sum::<usize>()
@@ -1992,8 +1994,9 @@ fn export_eac_zerocopy_vt(
         let dur = trim_out_frame
             .map(|o| (o.saturating_sub(trim_in_frame)) as f64 * dt)
             .unwrap_or((total_video_frames.saturating_sub(trim_in_frame as usize)) as f64 * dt);
+        let (asrc, atmp, aoff) = stereo_audio_source(&cfg, trim_in_frame as f64 * dt, dur);
         if let Err(e) = encoder.attach_audio_passthrough(
-            &asrc, trim_in_frame as f64 * dt, dur,
+            &asrc, aoff, dur,
         ) {
             tracing::warn!("one-pass audio attach failed: {e} — video-only output");
         }
@@ -2226,12 +2229,14 @@ fn export_eac_gpu_resident(
     let one_pass = one_pass_audio_eligible(&cfg);
     let video_tmp = if one_pass { cfg.output_path.clone() }
                     else { video_only_temp_path(&cfg.output_path) };
-    let one_pass_audio = if one_pass { Some(stereo_audio_source(&cfg)) } else { None };
+    let one_pass_audio = if one_pass {
+        Some(stereo_audio_source(&cfg, t_in, total_frames_to_write as f64 / cfg.fps as f64))
+    } else { None };
     // (source, offset, clip) for whichever encode thread engages — the
     // source is the ffconcat chain playlist for a merged recording, so
     // multi-segment audio is one continuous timeline the window cuts from.
-    let enc_audio = one_pass_audio.as_ref().map(|(asrc, _)| {
-        (asrc.clone(), t_in, total_frames_to_write as f64 / cfg.fps as f64)
+    let enc_audio = one_pass_audio.as_ref().map(|(asrc, _, aoff)| {
+        (asrc.clone(), *aoff, total_frames_to_write as f64 / cfg.fps as f64)
     });
 
     // ── Encode tail, by backend (mirrors the OSV arms) ────────────────
@@ -2545,7 +2550,7 @@ fn export_eac_gpu_resident(
     // Otherwise (NVENC tail, ambisonic/APAC): same finalize as the portable
     // EAC path (handles the GoPro ambisonic / APAC tracks + ffconcat).
     if one_pass {
-        if let Some((_, atmp)) = one_pass_audio {
+        if let Some((_, atmp, _)) = one_pass_audio {
             if let Some(t) = atmp { std::fs::remove_file(t).ok(); }
         }
     } else {
@@ -2714,9 +2719,9 @@ fn export_fisheye_osv_zerocopy_p010(
     };
     // Inline audio passthrough (must be attached before the first frame).
     let one_pass_audio_tmp = if one_pass {
-        let (asrc, atmp) = stereo_audio_source(&cfg);
         let dur = total_frames_to_write as f64 / cfg.fps as f64;
-        if let Err(e) = encoder.attach_audio_passthrough(&asrc, t_in, dur) {
+        let (asrc, atmp, aoff) = stereo_audio_source(&cfg, t_in, dur);
+        if let Err(e) = encoder.attach_audio_passthrough(&asrc, aoff, dur) {
             tracing::warn!("one-pass audio attach failed: {e} — video-only output");
         }
         atmp
@@ -3076,7 +3081,9 @@ fn export_fisheye_osv_zerocopy_d3d11(
     let one_pass = one_pass_audio_eligible(&cfg);
     let video_tmp = if one_pass { cfg.output_path.clone() }
                     else { video_only_temp_path(&cfg.output_path) };
-    let one_pass_audio = if one_pass { Some(stereo_audio_source(&cfg)) } else { None };
+    let one_pass_audio = if one_pass {
+        Some(stereo_audio_source(&cfg, t_in, total_frames_to_write as f64 / cfg.fps as f64))
+    } else { None };
 
     let dt = 1.0 / cfg.fps as f64;
     let color_plan = cfg.color_stack.clone();
@@ -3160,8 +3167,8 @@ fn export_fisheye_osv_zerocopy_d3d11(
         (cfg.encoder, cfg.fps, cfg.bitrate_kbps, cfg.bit_depth, cfg.prores_profile);
     // Inline audio: (source, offset, clip) — attached before the first
     // frame on the encode thread (see one_pass above).
-    let enc_audio = one_pass_audio.as_ref().map(|(asrc, _)| {
-        (asrc.clone(), t_in, total_frames_to_write as f64 / cfg.fps as f64)
+    let enc_audio = one_pass_audio.as_ref().map(|(asrc, _, aoff)| {
+        (asrc.clone(), *aoff, total_frames_to_write as f64 / cfg.fps as f64)
     });
     let encode_handle = std::thread::spawn(move || -> Result<u64> {
         let mut encoder = open_h265_encoder(
@@ -3451,7 +3458,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
 
     if one_pass {
         // Audio already muxed inline — drop the playlist temp, if any.
-        if let Some((_, atmp)) = one_pass_audio {
+        if let Some((_, atmp, _)) = one_pass_audio {
             if let Some(t) = atmp { std::fs::remove_file(t).ok(); }
         }
     } else {
@@ -3553,7 +3560,9 @@ fn export_fisheye_osv_gpu_resident(
     let one_pass = one_pass_audio_eligible(&cfg);
     let video_tmp = if one_pass { cfg.output_path.clone() }
                     else { video_only_temp_path(&cfg.output_path) };
-    let one_pass_audio = if one_pass { Some(stereo_audio_source(&cfg)) } else { None };
+    let one_pass_audio = if one_pass {
+        Some(stereo_audio_source(&cfg, t_in, total_frames_to_write as f64 / cfg.fps as f64))
+    } else { None };
     // Ring of shared P010 frames: the main thread composes frame N+k while the
     // encode thread is still feeding NVENC frame N. RING slots + a bounded
     // channel of depth RING-2 keep main from overwriting an in-flight slot.
@@ -3571,8 +3580,8 @@ fn export_fisheye_osv_gpu_resident(
     struct EncMsg { y_ptr: u64, y_pitch: usize, uv_ptr: u64, uv_pitch: usize }
     let (enc_tx, enc_rx) = std::sync::mpsc::sync_channel::<EncMsg>(RING - 2);
     let (efps, ebr, etmp) = (cfg.fps, cfg.bitrate_kbps, video_tmp.clone());
-    let nv_audio = one_pass_audio.as_ref().map(|(asrc, _)| {
-        (asrc.clone(), t_in, total_frames_to_write as f64 / cfg.fps as f64)
+    let nv_audio = one_pass_audio.as_ref().map(|(asrc, _, aoff)| {
+        (asrc.clone(), *aoff, total_frames_to_write as f64 / cfg.fps as f64)
     });
     let encode_handle = std::thread::spawn(move || -> Result<u64> {
         let _cuda = cudarc::driver::CudaDevice::new(0)
@@ -3794,7 +3803,7 @@ fn export_fisheye_osv_gpu_resident(
     }
     if one_pass {
         // Audio already muxed inline — drop the playlist temp, if any.
-        if let Some((_, atmp)) = one_pass_audio {
+        if let Some((_, atmp, _)) = one_pass_audio {
             if let Some(t) = atmp { std::fs::remove_file(t).ok(); }
         }
     } else {
