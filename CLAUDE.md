@@ -929,6 +929,11 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
 
 21. **2.5.2 release (2026-10-10) — macOS PUBLISHED (tag `v2.5.2` @ `fe41028`,
    marked Latest; live `releases/latest/download/latest.json` serves 2.5.2
+   — NOTE: the standalone `.minisig` files uploaded to v2.5.2 (mac first,
+   Windows mirrored it) are REDUNDANT: the updater verifies the artifact
+   against the base64 `signature` field inside `latest.json`, which IS the
+   `.minisig` content; 2.5.0/2.5.1 never shipped the file. Release assets =
+   DMG + app zip + setup.exe + portable zip + latest.json, nothing else
    darwin-aarch64); **Windows RELEASED 2026-10-10** (Windows box).** macOS side cut with
    `scripts/release_mac.sh` at `8dfa2d8`: bundle 2.5.2, helpers hash-current,
    app + DMG notarized (Accepted) and stapled, `spctl` "Notarized Developer

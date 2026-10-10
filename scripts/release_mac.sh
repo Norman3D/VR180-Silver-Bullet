@@ -120,5 +120,6 @@ rm -rf "$STAGE"
 say "done. Remaining manual steps"
 cat <<EOM
   node scripts/make-latest-json.mjs --version $VER --notes-file <release-notes.md>
-  gh release create v$VER (or upload --clobber): "$UPDATE_ZIP", its .minisig, latest.json, "$DMG"
+  gh release create v$VER (or upload --clobber): "$UPDATE_ZIP", latest.json, "$DMG"
+  (NOT the .minisig: its contents are already embedded in latest.json's "signature" field, which is what the updater verifies)
 EOM
