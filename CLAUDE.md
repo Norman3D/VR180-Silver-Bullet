@@ -745,6 +745,20 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    "Preview size" menu is hidden for stills. The zoom magnifier on a still
    samples `current_display` (no DetailCache for stills), so it is sharp
    now without a separate full-res path.
+   NATIVE tier (same evening): `run_still` keeps the mosaic (`bayer`) and
+   lazily develops the unbinned 7760² pair (`native`, slots 22/23, one
+   failed attempt → binned fallback, logged). Native SOURCE for every
+   resting Reframe render (output stays 3880 wide; the viewport samples a
+   small lens region so source res is what shows) and native source +
+   native OUTPUT (15520×7760 SBS) when `Settings::still_native_zoom` is
+   set — the central panel computes `still_native_wanted` =
+   zoom × on-screen eye px (physical) > binned eye px × 0.95. Needs the
+   16384 texture limit: all three device descriptors (eframe's in main.rs,
+   `Device::new`, the Windows dedicated export device) now request
+   `adapter.limits().max_texture_dimension_2d.clamp(8192, 16384)`; the
+   scratch example `tex_limit_check` confirmed 16384 + a 15520×7760
+   compose on the M5 Max. Log line: "(native|full|quick, native|binned
+   source)".
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

@@ -595,7 +595,10 @@ impl Device {
                 &wgpu::DeviceDescriptor {
                     label: Some("vr180-render"),
                     required_features,
-                    required_limits: wgpu::Limits::default(),
+                    required_limits: wgpu::Limits {
+                        max_texture_dimension_2d: adapter.limits().max_texture_dimension_2d.clamp(8192, 16384),
+                        ..wgpu::Limits::default()
+                    },
                     memory_hints: wgpu::MemoryHints::default(),
                     trace: wgpu::Trace::Off,
                     experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -635,7 +638,10 @@ impl Device {
             &wgpu::DeviceDescriptor {
                 label: Some("vr180 export (dedicated)"),
                 required_features: have,
-                required_limits: wgpu::Limits::default(),
+                required_limits: wgpu::Limits {
+                    max_texture_dimension_2d: adapter.limits().max_texture_dimension_2d.clamp(8192, 16384),
+                    ..wgpu::Limits::default()
+                },
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::Off,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),

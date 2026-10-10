@@ -130,6 +130,15 @@ a slider or the pan is moving, quick renders at the preview size keep it
 fluid; the full one follows ~120 ms after the last change. The "Preview
 size" menu is not offered for photos.
 
+Beyond that, the unbinned 7760² halves are used where they can be seen:
+the reframed view always samples them (a narrow viewport shows a small
+part of the lens, so the source's resolution is what it shows), and when
+the magnifier is zoomed past what the binned size can feed, the photo is
+rendered at its native size (15520×7760 side by side). The native pair is
+developed on first need (~1 GB of GPU textures, kept while the photo is
+open). The GPU device now asks for the adapter's own texture-size limit
+(16384 on every desktop GPU) instead of the 8192 default.
+
 ### GoPro .360: rolling-shutter correction audited and tightened
 
 The GoPro rolling-shutter term was measured directly for the first time:

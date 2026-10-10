@@ -146,7 +146,13 @@ fn main() -> anyhow::Result<()> {
                     wgpu::DeviceDescriptor {
                         label: Some("vr180-gui device"),
                         required_features: have,
-                        required_limits: wgpu::Limits::default(),
+                        // The adapter's 2D texture limit (16384 on every desktop
+                        // GPU; the 8192 default would cap a 15520-wide still at
+                        // half its resolution). Never above what it reports.
+                        required_limits: wgpu::Limits {
+                            max_texture_dimension_2d: adapter.limits().max_texture_dimension_2d.clamp(8192, 16384),
+                            ..wgpu::Limits::default()
+                        },
                         memory_hints: wgpu::MemoryHints::default(),
                         trace: wgpu::Trace::Off,
                         experimental_features: wgpu::ExperimentalFeatures::disabled(),

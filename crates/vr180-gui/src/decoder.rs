@@ -221,6 +221,12 @@ pub struct Settings {
     /// the DNG will. Set by the GUI every frame; never persisted.
     #[serde(skip)]
     pub still_dng_mode: bool,
+    /// Still photo: the magnifier is zoomed far enough that the resting
+    /// render needs more than the binned working size per eye — render the
+    /// native (unbinned) source at its own size. Set by the GUI each frame
+    /// from the zoom and the on-screen eye size; never persisted.
+    #[serde(skip)]
+    pub still_native_zoom: bool,
     pub preview_eye_w: u32,
     /// Trim-in time in seconds. `None` = play from clip start.
     /// Honored by the decoder loop: when playback hits `trim_out_s`,
@@ -439,6 +445,7 @@ impl Default for Settings {
             rs_mode: default_rs_mode(),
             rs_readout_ms: default_rs_readout_ms(),
             still_dng_mode: false,
+            still_native_zoom: false,
             preview_eye_w: 768,
             trim_in_s: None,
             trim_out_s: None,
@@ -3607,7 +3614,13 @@ fn still_lens_calibs(
 /// resolution (the binned half: 3880² per eye on the X6 → 7760×3880 SBS);
 /// the preview-size setting only sizes the quick renders that keep a
 /// slider drag fluid, and once the settings rest for `STILL_SETTLE` the
-/// full-size render replaces the quick one. Per render:
+/// full-size render replaces the quick one. A third, NATIVE tier uses the
+/// unbinned 7760² halves (developed lazily on first need, ~1 GB of GPU
+/// textures): as the SOURCE for every resting reframed render (a narrow
+/// viewport samples a small part of the lens, so source resolution is
+/// what it shows) and as source AND output size when the magnifier is
+/// zoomed past what the binned size can feed (`Settings::still_native_zoom`,
+/// a 15520×7760 SBS — hence the adapter-level texture limit). Per render:
 /// `develop_display` (only when the develop params moved; cached as the
 /// uploaded `Rgba16Unorm` pair otherwise) → the texture-input fisheye
 /// projection the zero-copy arm uses, with the per-eye UCM calib at the
@@ -3655,9 +3668,11 @@ fn run_still(
         raw_develop::develop_linear(&still.bayer, &params, &gain_maps, Half::Left, true),
         raw_develop::develop_linear(&still.bayer, &params, &gain_maps, Half::Right, true),
     ];
-    // The mosaic (240 MB for the X6) is not needed past this point; the
-    // lens entries / crop / colour tags stay.
-    drop(std::mem::take(&mut still.bayer));
+    // The mosaic (240 MB for the X6) stays for the lazy NATIVE develop
+    // (re-reading the file would hit a network share again); the lens
+    // entries / crop / colour tags stay with `still` until the calib is built.
+    let bayer: Vec<u16> = std::mem::take(&mut still.bayer);
+    let (nat_w, nat_h) = (still.width / 2, still.height);
     let (src_w, src_h) = (linear[0].width, linear[0].height);
     anyhow::ensure!(
         linear[1].width == src_w && linear[1].height == src_h,
@@ -3685,10 +3700,21 @@ fn run_still(
     let calib_imu = vr180_fisheye::DjiOsvImu {
         lens_a: lens_right, lens_b: lens_left, ..Default::default()
     };
+    // The same carrier at the native half size, for the native tier.
+    let (nlens_left, nlens_right) = still_lens_calibs(&still, nat_w, nat_h);
+    let calib_imu_native = vr180_fisheye::DjiOsvImu {
+        lens_a: nlens_right, lens_b: nlens_left, ..Default::default()
+    };
     // Seeds the per-eye Override UI with the in-file values (as the video
     // arms do), following the user swap.
     seed_detected_calib(&control, &calib_imu, src_w, src_h);
     drop(still);
+    // Native (unbinned) display-referred pair, developed on first need and
+    // kept for the thread's life; `None` after a failed attempt too (logged
+    // once), so the binned source stands in.
+    let mut native: Option<(wgpu::Texture, wgpu::Texture)> = None;
+    let mut native_failed = false;
+    let native_possible = nat_w <= max_dim && nat_h <= max_dim;
 
     // ── Render loop: once now, then on every settings bump ───────────
     // `developed` caches the display-referred pair as uploaded textures,
@@ -3770,13 +3796,50 @@ fn run_still(
         } else {
             (tex_left_half, tex_right_half)
         };
-        let (calib_l, calib_r) = resolve_fisheye_calib_pair(&snap, kind, src_w, src_h, Some(&calib_imu));
         let (rot_l, rot_r) = still_eye_rotations(&snap.output_view_adjust());
 
-        // 3. Project each eye at the tier's eye size (output mode's shape).
-        //    The two tiers keep separate output slots so alternating sizes
-        //    don't re-allocate the cached textures every render.
-        let (ow, oh, slot_l, slot_r) = if tier_full {
+        // 3. Source + output size per tier (see the doc comment). The native
+        //    source serves every resting reframed render and the zoomed-in
+        //    magnifier; the latter also outputs at the native size. Each tier
+        //    keeps its own output slots so alternating sizes don't re-allocate
+        //    the cached textures every render.
+        let reframe = matches!(snap.fisheye_output_mode, FisheyeOutputMode::Reframe);
+        let want_native_src = tier_full && native_possible && (reframe || snap.still_native_zoom);
+        if want_native_src && native.is_none() && !native_failed {
+            let t = std::time::Instant::now();
+            let mut mk = |half: Half, label: &str| -> anyhow::Result<wgpu::Texture> {
+                let eye = raw_develop::develop_linear(&bayer, &params, &gain_maps, half, false);
+                let disp = raw_develop::develop_display(&eye, &color_like, &develop);
+                drop(eye);
+                upload_rgba16_for_preview(&pipeline, &disp, nat_w, nat_h, label)
+            };
+            match (mk(Half::Left, "still_left_native_rgba16"), mk(Half::Right, "still_right_native_rgba16")) {
+                (Ok(l), Ok(r)) => {
+                    tracing::info!("decoder (still): native {}×{} pair developed + uploaded in {:.0} ms",
+                        nat_w, nat_h, t.elapsed().as_secs_f64() * 1e3);
+                    native = Some((l, r));
+                }
+                (l, r) => {
+                    let e = l.err().or(r.err()).map(|e| e.to_string()).unwrap_or_default();
+                    tracing::warn!("decoder (still): native pair unavailable ({e}); using the binned source");
+                    native_failed = true;
+                }
+            }
+        }
+        let use_native_src = want_native_src && native.is_some();
+        let native_out = use_native_src && snap.still_native_zoom && !reframe;
+        let (s_l, s_r, s_w, s_h, carrier) = if use_native_src {
+            let (l, r) = native.as_ref().expect("checked above");
+            let (l, r) = if swap { (r, l) } else { (l, r) };
+            (l, r, nat_w, nat_h, &calib_imu_native)
+        } else {
+            (src_l, src_r, src_w, src_h, &calib_imu)
+        };
+        let (calib_l, calib_r) = resolve_fisheye_calib_pair(&snap, kind, s_w, s_h, Some(carrier));
+        let (ow, oh, slot_l, slot_r) = if native_out {
+            let (w, h) = preview_out_dims(snap.fisheye_output_mode, snap.reframe_aspect, nat_w, nat_h);
+            (w.min(full_cap_w), h.min(max_dim), 22, 23)
+        } else if tier_full {
             let (w, h) = preview_out_dims(snap.fisheye_output_mode, snap.reframe_aspect, src_w, src_h);
             (w.min(full_cap_w), h.min(max_dim), 20, 21)
         } else {
@@ -3786,15 +3849,15 @@ fn run_still(
         let (left_tex, right_tex) = match snap.fisheye_output_mode {
             FisheyeOutputMode::Fisheye => (
                 pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                    src_l, src_w, src_h, ow, oh, rot_l, calib_l, slot_l)?,
+                    s_l, s_w, s_h, ow, oh, rot_l, calib_l, slot_l)?,
                 pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                    src_r, src_w, src_h, ow, oh, rot_r, calib_r, slot_r)?,
+                    s_r, s_w, s_h, ow, oh, rot_r, calib_r, slot_r)?,
             ),
             FisheyeOutputMode::HalfEquirect | FisheyeOutputMode::Reframe => (
                 pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                    src_l, src_w, src_h, ow, oh, rot_l, calib_l, slot_l)?,
+                    s_l, s_w, s_h, ow, oh, rot_l, calib_l, slot_l)?,
                 pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                    src_r, src_w, src_h, ow, oh, rot_r, calib_r, slot_r)?,
+                    s_r, s_w, s_h, ow, oh, rot_r, calib_r, slot_r)?,
             ),
         };
         let (pe_w, pe_h) = (left_tex.width(), left_tex.height());
@@ -3805,8 +3868,10 @@ fn run_still(
             &pipeline, &snap, &left_tex, &right_tex, pe_w, pe_h, None,
         )?;
         last_render_end = std::time::Instant::now();
-        tracing::debug!("decoder (still): rendered {}×{} ({}) in {:.1} ms (gen {})",
-            out_w, out_h, if tier_full { "full" } else { "quick" },
+        tracing::debug!("decoder (still): rendered {}×{} ({}, {} source) in {:.1} ms (gen {})",
+            out_w, out_h,
+            if native_out { "native" } else if tier_full { "full" } else { "quick" },
+            if use_native_src { "native" } else { "binned" },
             t_render.elapsed().as_secs_f64() * 1e3, gen);
 
         // 5. Hand the single frame to the UI (frame 0 at t = 0). Unlike the

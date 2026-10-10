@@ -71,6 +71,10 @@ pub struct App {
     /// One-shot (reset by `spawn_decoder`): the "settings changed with no
     /// decoder alive" warning has been logged for the current stop.
     no_decoder_warned: bool,
+    /// Still photo: the magnifier currently asks for more pixels per eye
+    /// than the binned working size has (computed by the central panel from
+    /// zoom × on-screen eye size; fed to `Settings::still_native_zoom`).
+    still_native_wanted: bool,
     /// True from `spawn_decoder` until the decoder delivers its FIRST frame.
     /// While set, play/seek respawns are ignored — clicking Play repeatedly
     /// during a slow load would otherwise pile up detached decoder threads
@@ -1180,6 +1184,7 @@ impl App {
             playing: false,
             decoder_alive: false,
             no_decoder_warned: false,
+            still_native_wanted: false,
             decoder_starting: false,
             current_display: None,
             frame_rx: None,
@@ -3659,9 +3664,10 @@ impl App {
             *ctl.settings.write() = self.settings.clone();
             ctl.settings_generation.fetch_add(1, Ordering::SeqCst);
             tracing::debug!("settings changed → generation bumped");
-        } else if !self.no_decoder_warned {
-            // Once per stop: makes a "preview stopped following the sliders"
-            // report diagnosable from the log.
+        } else if !self.no_decoder_warned && self.loaded_path.is_some() && self.load_pending.is_none() {
+            // Once per stop, for a LOADED clip (a load restores settings
+            // before its decoder exists — not a lost preview): makes a
+            // "preview stopped following the sliders" report diagnosable.
             self.no_decoder_warned = true;
             tracing::warn!("settings changed with no decoder alive — the preview will not follow until it is restarted");
         }
@@ -4137,6 +4143,11 @@ impl eframe::App for App {
             && self.export_opts.still_format == StillFormatChoice::LinearDng;
         if self.settings.still_dng_mode != still_dng {
             self.settings.still_dng_mode = still_dng;
+        }
+        let still_native = self.still_native_wanted
+            && self.clip.as_ref().map_or(false, |c| c.source_kind.is_still());
+        if self.settings.still_native_zoom != still_native {
+            self.settings.still_native_zoom = still_native;
         }
         // Drain decoder frames first so the most recent texture is
         // ready by the time we render the central panel.
@@ -4709,6 +4720,18 @@ impl eframe::App for App {
                 let resp = ui.interact(
                     img_rect, ui.id().with("preview_zoom"),
                     egui::Sense::click_and_drag());
+
+                // Still photo: does the magnifier (last frame's zoom) need
+                // more pixels per eye than the binned working size offers?
+                // zoom × on-screen eye size in physical pixels vs the binned
+                // half width (7760 / 2 on the X6). The reframed view aims
+                // with the FOV instead and always gets the native source.
+                if let Some(c) = self.clip.as_ref().filter(|c| c.source_kind.is_still()) {
+                    let eye_disp = if self.settings.preview_mode == crate::decoder::PreviewMode::Sbs { w * 0.5 } else { w };
+                    let eye_phys = eye_disp * ui.ctx().pixels_per_point();
+                    let binned_eye = (c.fisheye_eye_w / 2).max(1) as f32;
+                    self.still_native_wanted = self.preview_zoom * eye_phys > binned_eye * 0.95;
+                }
 
                 let zoom = &mut self.preview_zoom;
                 let center = &mut self.preview_center;
