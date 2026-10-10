@@ -1082,6 +1082,15 @@ impl StillTrailer {
 /// the chain header of the protobuf, `trailer_len` at [38..42], version at
 /// [42..46], magic at [46..78]); records walk backward from the footer as
 /// `[data][u16 id BE][u32 size LE]` down to `EOF − trailer_len`.
+/// Every trailer record of an Insta360 still, `(id, payload)` in walk order
+/// (footer first) — for inspection tools; the app reads what it needs
+/// through [`read`].
+pub fn trailer_records(path: &Path) -> Result<Vec<(u16, Vec<u8>)>> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    Ok(read_still_trailer(&mut file, len)?.records)
+}
+
 fn read_still_trailer(file: &mut File, file_len: u64) -> Result<StillTrailer> {
     let terr = |m: String| Error::Insv(m);
     if file_len < FOOTER_LEN {
