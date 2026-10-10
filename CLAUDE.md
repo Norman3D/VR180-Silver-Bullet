@@ -904,6 +904,17 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    deterministic). `AudioFormat::Apac` + `as_str` stay for serde/match
    exhaustiveness. Stale gitignored harnesses that blocked local `cargo
    test` were parked under `examples/_stale/`.
+   WINDOW (mac, same day, `c3b0a8e`): `stereo_audio_source(cfg, t_in, dur)`
+   now renders only `[t_in, t_in + dur)` and returns `(src, tmp, offset)` —
+   the offset the mux must apply to THAT source (0 for the rendered temp,
+   `t_in` for a file / playlist); all 7 sites pass it on (the 3 Windows
+   arms edited blind: construction, the `(src, offset, dur)` maps, the
+   cleanups' 3-tuple patterns). `transcode_audio_window` is sample-accurate:
+   decoding starts `EDGE_S` = 0.1 s early (AAC overlap warm-up), the head is
+   dropped from the first kept packet's pts, the tail runs 0.1 s past the
+   window. Verified: X6 export audio starts at exactly t_in (lag 0 vs the
+   source, corr 0.999; before: the first packet after t_in, +10.7 ms), a 6 s
+   window renders in 68 ms; GoPro passthrough unchanged (offset = t_in).
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
