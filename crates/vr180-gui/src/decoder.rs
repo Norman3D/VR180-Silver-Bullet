@@ -3602,7 +3602,12 @@ fn still_lens_calibs(
 /// preview size (3880² for the X6, ~1–2 s) and those two `LinearEye`s are
 /// kept for the life of the thread. The loop then re-renders the same pair
 /// whenever `settings_generation` bumps — the video arms' pause-loop
-/// mechanics with nothing to pull — and parks in between. Per render:
+/// mechanics with nothing to pull — and parks in between. A photo has one
+/// frame, so the RESTING image is rendered at the source's working
+/// resolution (the binned half: 3880² per eye on the X6 → 7760×3880 SBS);
+/// the preview-size setting only sizes the quick renders that keep a
+/// slider drag fluid, and once the settings rest for `STILL_SETTLE` the
+/// full-size render replaces the quick one. Per render:
 /// `develop_display` (only when the develop params moved; cached as the
 /// uploaded `Rgba16Unorm` pair otherwise) → the texture-input fisheye
 /// projection the zero-copy arm uses, with the per-eye UCM calib at the
@@ -3692,6 +3697,17 @@ fn run_still(
     let mut developed: Option<(u32, wgpu::Texture, wgpu::Texture)> = None;
     let mut cached_gen = control.settings_generation.load(Ordering::SeqCst);
     let mut force_render = true;
+    // Two output tiers (see the doc comment): FULL = the source's working
+    // resolution, capped so the composed SBS fits the device texture limit;
+    // QUICK = the preview-size setting, used while settings are moving.
+    // A change arriving within `STILL_SETTLE` of the previous render's end
+    // is a drag → quick; an isolated change renders full straight away;
+    // after a quick render the full one follows once the settings rest.
+    const STILL_SETTLE: std::time::Duration = std::time::Duration::from_millis(120);
+    let full_cap_w = (max_dim / 2).max(2);
+    let mut last_render_end = std::time::Instant::now() - STILL_SETTLE;
+    let mut last_change = std::time::Instant::now();
+    let mut full_pending = false;
     loop {
         // Commands: Stop ends the thread; a Seek on a one-frame still is a
         // no-op (the UI's scrub/play controls land here harmlessly).
@@ -3702,13 +3718,24 @@ fn run_still(
             }
         }
         let gen = control.settings_generation.load(Ordering::SeqCst);
-        if !force_render && gen == cached_gen {
-            // Parked: the pause-loop cadence of the video arms.
-            std::thread::sleep(std::time::Duration::from_millis(16));
+        let changed = gen != cached_gen;
+        let now = std::time::Instant::now();
+        let tier_full = if force_render {
+            true
+        } else if changed {
+            last_change = now;
+            now.duration_since(last_render_end) >= STILL_SETTLE
+        } else if full_pending && now.duration_since(last_change) >= STILL_SETTLE {
+            true
+        } else {
+            // Parked: the pause-loop cadence of the video arms (finer while
+            // a full render is owed, so it lands promptly after a drag).
+            std::thread::sleep(std::time::Duration::from_millis(if full_pending { 8 } else { 16 }));
             continue;
-        }
+        };
         force_render = false;
         cached_gen = gen;
+        full_pending = !tier_full;
         let t_render = std::time::Instant::now();
         let snap = control.settings.read().clone();
 
@@ -3746,20 +3773,28 @@ fn run_still(
         let (calib_l, calib_r) = resolve_fisheye_calib_pair(&snap, kind, src_w, src_h, Some(&calib_imu));
         let (rot_l, rot_r) = still_eye_rotations(&snap.output_view_adjust());
 
-        // 3. Project each eye at the preview eye size (output mode's shape).
-        let (ow, oh) = preview_out_dims(snap.fisheye_output_mode, snap.reframe_aspect, eye_w, eye_h);
+        // 3. Project each eye at the tier's eye size (output mode's shape).
+        //    The two tiers keep separate output slots so alternating sizes
+        //    don't re-allocate the cached textures every render.
+        let (ow, oh, slot_l, slot_r) = if tier_full {
+            let (w, h) = preview_out_dims(snap.fisheye_output_mode, snap.reframe_aspect, src_w, src_h);
+            (w.min(full_cap_w), h.min(max_dim), 20, 21)
+        } else {
+            let (w, h) = preview_out_dims(snap.fisheye_output_mode, snap.reframe_aspect, eye_w, eye_h);
+            (w, h, 0, 1)
+        };
         let (left_tex, right_tex) = match snap.fisheye_output_mode {
             FisheyeOutputMode::Fisheye => (
                 pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                    src_l, src_w, src_h, ow, oh, rot_l, calib_l, 0)?,
+                    src_l, src_w, src_h, ow, oh, rot_l, calib_l, slot_l)?,
                 pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                    src_r, src_w, src_h, ow, oh, rot_r, calib_r, 1)?,
+                    src_r, src_w, src_h, ow, oh, rot_r, calib_r, slot_r)?,
             ),
             FisheyeOutputMode::HalfEquirect | FisheyeOutputMode::Reframe => (
                 pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                    src_l, src_w, src_h, ow, oh, rot_l, calib_l, 0)?,
+                    src_l, src_w, src_h, ow, oh, rot_l, calib_l, slot_l)?,
                 pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                    src_r, src_w, src_h, ow, oh, rot_r, calib_r, 1)?,
+                    src_r, src_w, src_h, ow, oh, rot_r, calib_r, slot_r)?,
             ),
         };
         let (pe_w, pe_h) = (left_tex.width(), left_tex.height());
@@ -3769,8 +3804,10 @@ fn run_still(
         let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
             &pipeline, &snap, &left_tex, &right_tex, pe_w, pe_h, None,
         )?;
-        tracing::debug!("decoder (still): rendered {}×{} in {:.1} ms (gen {})",
-            out_w, out_h, t_render.elapsed().as_secs_f64() * 1e3, gen);
+        last_render_end = std::time::Instant::now();
+        tracing::debug!("decoder (still): rendered {}×{} ({}) in {:.1} ms (gen {})",
+            out_w, out_h, if tier_full { "full" } else { "quick" },
+            t_render.elapsed().as_secs_f64() * 1e3, gen);
 
         // 5. Hand the single frame to the UI (frame 0 at t = 0). Unlike the
         //    video arms, a render dropped on a full channel would leave the

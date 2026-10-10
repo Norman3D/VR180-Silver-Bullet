@@ -122,6 +122,14 @@ Space on a still spun the playback repaint cadence; a restart of the same
 clip re-seeded hand-tuned lens Override values from the file; and the
 audio probe opened the whole DNG on the UI thread.
 
+The still preview is no longer the video's 768-px working size: a photo
+has one frame, so once the sliders rest it renders at the source's
+working resolution (7760×3880 side by side on the X6; the reframed view
+at 3880 px per eye), and the zoom magnifier looks into that image. While
+a slider or the pan is moving, quick renders at the preview size keep it
+fluid; the full one follows ~120 ms after the last change. The "Preview
+size" menu is not offered for photos.
+
 ### GoPro .360: rolling-shutter correction audited and tightened
 
 The GoPro rolling-shutter term was measured directly for the first time:

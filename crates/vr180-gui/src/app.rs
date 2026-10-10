@@ -4300,16 +4300,22 @@ impl eframe::App for App {
                     // (Export controls now live in the persistent bottom
                     // export bar — see `draw_export_bar`.)
 
-                    ui.separator();
-                    ui.label(RichText::new(tr("Preview size")).color(Color32::GRAY));
-                    egui::ComboBox::from_id_source("preview_w")
-                        .selected_text(format!("{}", self.settings.preview_eye_w))
-                        .show_ui(ui, |ui| {
-                            for &w in &[512_u32, 768, 1024, 1280, 1536, 1920] {
-                                ui.selectable_value(&mut self.settings.preview_eye_w, w,
-                                    format!("{w}"));
-                            }
-                        });
+                    // A still renders at its working resolution once the
+                    // settings rest (the size here only shapes the quick
+                    // renders during a drag) — not offered for photos.
+                    let preview_size_applies = !self.clip.as_ref().map_or(false, |c| c.source_kind.is_still());
+                    if preview_size_applies {
+                        ui.separator();
+                        ui.label(RichText::new(tr("Preview size")).color(Color32::GRAY));
+                        egui::ComboBox::from_id_source("preview_w")
+                            .selected_text(format!("{}", self.settings.preview_eye_w))
+                            .show_ui(ui, |ui| {
+                                for &w in &[512_u32, 768, 1024, 1280, 1536, 1920] {
+                                    ui.selectable_value(&mut self.settings.preview_eye_w, w,
+                                        format!("{w}"));
+                                }
+                            });
+                    }
 
                     ui.separator();
                     ui.label(RichText::new(tr("View")).color(Color32::GRAY));

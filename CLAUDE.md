@@ -735,6 +735,16 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    worker's `poll(wait)` holds wgpu's fence read guard per 64 MiB band, so
    a slider drag hitches for ms — same as previewing another clip during
    a video export.
+   FULL-RES PREVIEW (2026-10-09, evening): `run_still` renders two tiers —
+   QUICK = `preview_eye_w` (slots 0/1) while settings are moving, FULL =
+   the binned source size via `preview_out_dims(mode, aspect, src_w,
+   src_h)` capped to `max_texture_dimension_2d/2` (slots 20/21), chosen
+   by `STILL_SETTLE` = 120 ms since the previous render's end (a change
+   within it = drag → quick, then full once the settings rest). First
+   frame 7760×3880 SBS; the log line says "(full)"/"(quick)". The
+   "Preview size" menu is hidden for stills. The zoom magnifier on a still
+   samples `current_display` (no DetailCache for stills), so it is sharp
+   now without a separate full-res path.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
