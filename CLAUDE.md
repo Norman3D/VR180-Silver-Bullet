@@ -835,6 +835,17 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    expected mix, lag 0; ambisonic export carries SA3D identical to Studio's;
    APAC helper accepted the WAV. GUI: `ClipInfo::foa_audio` (probe at load)
    shows the Audio section for X6; `audio_player` decodes the pair itself.
+   **APAC TRAP (same day): the decoded WAV must NOT carry a positional
+   channel layout.** `ChannelLayout::default(4)` = 4.0 (L R C Cs) → WAV
+   channel mask 0x107 → AVFoundation reads "4.0" and the helper's
+   AVAssetWriter (output layout HOA_ACN_SN3D) converts quad→HOA as pure
+   SILENCE (1459 bytes of APAC for 6 s; afconvert decode = −240 dBFS; the
+   user's AVP file was silent). GoPro's packet-copied WAV has mask 0 ("no
+   channel layout") and works. Fix: `ambisonic_layout(n)` (ffmpeg
+   AMBISONIC order via `av_channel_layout_from_string("ambisonic 1")`,
+   UNSPEC fallback) → mask 0; verified the helper's output decodes with
+   per-channel corr ≈ 1 vs the raw track. Check any new APAC input with
+   `afinfo` ("no channel layout") and `afconvert … -f caff -d LEF32` + RMS.
    Open: the audio is NOT rotated to follow our stabilisation (Studio does);
    `.insv` recorded in Auto/Stereo modes are untouched.
 

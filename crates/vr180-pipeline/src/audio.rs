@@ -256,6 +256,30 @@ pub fn extract_ambisonic_to_wav_window(
     Ok(info)
 }
 
+/// An `N`-channel layout in ffmpeg's AMBISONIC order (`"ambisonic 1"` for
+/// 4). The WAV muxer then writes channel mask 0, which AVFoundation reads as
+/// "no channel layout" — exactly what GoPro's packet-copied track yields.
+/// The positional default (`4.0` = L R C Cs) made the APAC helper's
+/// AVAssetWriter "convert" quad → HOA and encode SILENCE (2026-10-10).
+fn ambisonic_layout(channels: i32) -> ffmpeg::ChannelLayout {
+    let order = ((channels as f64).sqrt() - 1.0).round().max(0.0) as i32; // (order+1)² channels
+    let spec = std::ffi::CString::new(format!("ambisonic {order}")).expect("no NUL");
+    // SAFETY: zero-initialised AVChannelLayout filled by ffmpeg from the spec string.
+    let mut raw: ffmpeg::ffi::AVChannelLayout = unsafe { std::mem::zeroed() };
+    let r = unsafe { ffmpeg::ffi::av_channel_layout_from_string(&mut raw, spec.as_ptr()) };
+    if r < 0 || raw.nb_channels != channels {
+        // Not a square count (or an old ffmpeg): fall back to an unspecified
+        // order, which also writes no positional mask.
+        unsafe {
+            ffmpeg::ffi::av_channel_layout_uninit(&mut raw);
+            raw = std::mem::zeroed();
+            raw.order = ffmpeg::ffi::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC;
+            raw.nb_channels = channels;
+        }
+    }
+    ffmpeg::ChannelLayout::from(raw)
+}
+
 /// Output of [`transcode_audio_window`].
 enum AudioOut {
     /// Stereo AAC-LC (ffmpeg's native encoder) in an `.m4a`.
@@ -312,7 +336,7 @@ fn transcode_audio_window(
         AudioOut::AacStereo { bit_rate } =>
             (ffmpeg::codec::Id::AAC, Sample::F32(Type::Planar), ChannelLayout::STEREO, 2usize, bit_rate),
         AudioOut::Pcm24 { channels } =>
-            (ffmpeg::codec::Id::PCM_S24LE, Sample::I32(Type::Packed), ChannelLayout::default(channels), channels as usize, 0),
+            (ffmpeg::codec::Id::PCM_S24LE, Sample::I32(Type::Packed), ambisonic_layout(channels), channels as usize, 0),
     };
     if mix.is_none() && out_ch != in_ch {
         return Err(Error::Ffmpeg(format!("channel count {in_ch} → {out_ch} without a mix")));

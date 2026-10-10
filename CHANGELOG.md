@@ -162,6 +162,10 @@ Studio does; **APAC** re-encodes it to Apple Positional Audio for Vision
 Pro (macOS). The preview player decodes the same stereo pair. Clips
 recorded in the Auto / Stereo audio modes are unchanged (stereo AAC
 passthrough).
+(The first cut of the APAC path handed the helper a WAV tagged as a
+positional 4.0 layout, which AVFoundation "converted" to ambisonics as
+silence; the WAV now carries the ambisonic channel order, as the GoPro
+path's always did.)
 
 ### GoPro .360: rolling-shutter correction audited and tightened
 
