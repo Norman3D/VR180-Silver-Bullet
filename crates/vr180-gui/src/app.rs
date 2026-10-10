@@ -712,6 +712,7 @@ fn tr(en: &'static str) -> &'static str {
         "Still format" => "照片格式",
         "Still photo — no timeline" => "静态照片——没有时间线",
         "Restart preview" => "重启预览",
+        "Shared by X6 video and stills — one camera, one eye alignment." => "X6 视频与照片共用——同一台机器，同一个双眼错位。",
         "Still photo — use Export for the full-size file" => "静态照片——请用导出获得全尺寸文件",
         "DNG output: the 3D LUT, sharpening and automatic eye matching cannot travel as DNG metadata — hidden, and not applied to the preview." => "DNG 输出：3D LUT、锐化和自动眼间匹配无法作为 DNG 元数据保存——已隐藏，预览中也不应用。",
         "Still" => "照片",
@@ -2110,17 +2111,56 @@ impl App {
     }
 
     /// Remembered settings template for `kind` (defaults if none saved yet).
+    /// An X6 kind takes the camera's shared stereo offset (see
+    /// `x6_shared_stereo`) over whatever its own template remembers.
     fn kind_template(&self, kind: vr180_pipeline::SourceKind) -> Settings {
-        self.kind_settings.get(Self::settings_class_key(kind))
-            .cloned().unwrap_or_default()
+        let mut s = self.kind_settings.get(Self::settings_class_key(kind))
+            .cloned().unwrap_or_default();
+        self.apply_x6_shared_stereo(kind, &mut s);
+        s
+    }
+
+    /// The Insta360 X6 writes `.insv` video and `.dng` stills from the same
+    /// two lenses, so the stereo offset (the rig's own eye alignment) is ONE
+    /// value shared by both kinds — whichever was edited last.
+    fn x6_stereo_shared(kind: vr180_pipeline::SourceKind) -> bool {
+        matches!(kind, vr180_pipeline::SourceKind::Insta360Insv | vr180_pipeline::SourceKind::Insta360Dng)
+    }
+
+    /// The shared X6 stereo offset `(yaw, pitch, roll)`: both X6 templates
+    /// carry it (kept equal by `save_active_kind_template`), so read either —
+    /// the video's first, for a user who has only ever tuned video.
+    fn x6_shared_stereo(&self) -> Option<(f32, f32, f32)> {
+        ["insv", "dng"].iter().find_map(|k| self.kind_settings.get(*k)
+            .map(|s| (s.stereo_yaw_deg, s.stereo_pitch_deg, s.stereo_roll_deg)))
+    }
+
+    fn apply_x6_shared_stereo(&self, kind: vr180_pipeline::SourceKind, s: &mut Settings) {
+        if !Self::x6_stereo_shared(kind) { return; }
+        if let Some((yaw, pitch, roll)) = self.x6_shared_stereo() {
+            s.stereo_yaw_deg = yaw;
+            s.stereo_pitch_deg = pitch;
+            s.stereo_roll_deg = roll;
+        }
     }
 
     /// Fold the active clip's live settings into ITS kind's template, so the
-    /// next same-kind clip inherits them (kept independent across kinds).
+    /// next same-kind clip inherits them (kept independent across kinds —
+    /// except the X6 stereo offset, written to both X6 templates).
     fn save_active_kind_template(&mut self) {
         if let Some(kind) = self.clip.as_ref().map(|c| c.source_kind) {
             self.kind_settings.insert(
                 Self::settings_class_key(kind).to_string(), self.settings.clone());
+            if Self::x6_stereo_shared(kind) {
+                let (yaw, pitch, roll) = (self.settings.stereo_yaw_deg,
+                    self.settings.stereo_pitch_deg, self.settings.stereo_roll_deg);
+                for key in ["insv", "dng"] {
+                    let t = self.kind_settings.entry(key.to_string()).or_default();
+                    t.stereo_yaw_deg = yaw;
+                    t.stereo_pitch_deg = pitch;
+                    t.stereo_roll_deg = roll;
+                }
+            }
         }
     }
 
@@ -2144,6 +2184,12 @@ impl App {
         let Some(path) = self.batch.get(idx).map(|b| b.path.clone()) else { return; };
         self.sync_active_clip_settings();
         self.settings = self.batch[idx].settings.clone();
+        // An X6 clip (video or still) takes the camera's shared stereo
+        // offset — the latest edit on either kind — over its own snapshot.
+        let kind = self.batch[idx].source_kind;
+        let mut restored = std::mem::take(&mut self.settings);
+        self.apply_x6_shared_stereo(kind, &mut restored);
+        self.settings = restored;
         tracing::info!("RESEED-DBG select_clip {idx}: restored cx_l={:.4} cy_l={:.4} fov_l={:.2} ov_l={}",
             self.settings.fisheye_cx_norm_left, self.settings.fisheye_cy_norm_left,
             self.settings.fisheye_fov_deg_left, self.settings.fisheye_override_left);
@@ -5867,6 +5913,7 @@ impl App {
         let align_running = self.align_rx.is_some();
         let align_status = self.align_status.clone();
         let is_still = self.clip.as_ref().map_or(false, |c| c.source_kind.is_still());
+        let x6_shared = self.clip.as_ref().map_or(false, |c| Self::x6_stereo_shared(c.source_kind));
         let s = &mut self.settings;
         ui.label(RichText::new(tr("Global (both eyes)")).small().color(Color32::GRAY));
         if matches!(s.fisheye_output_mode, crate::decoder::FisheyeOutputMode::Reframe) {
@@ -5885,6 +5932,10 @@ impl App {
         ui.add_space(4.0);
         ui.label(RichText::new(tr("Stereo offset (right = +, left = −)"))
             .small().color(Color32::GRAY));
+        if x6_shared {
+            ui.label(RichText::new(tr("Shared by X6 video and stills — one camera, one eye alignment."))
+                .small().color(Color32::from_rgb(130, 150, 175)));
+        }
         // Stereo offset: Up/Down arrows step 0.01° per press.
         let stereo_key_step = 0.01;
         fine_slider(ui, zoom, &mut s.stereo_yaw_deg, -10.0..=10.0, tr("Yaw (°)"), 3, rot_fine, stereo_key_step);

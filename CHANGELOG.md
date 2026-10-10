@@ -139,6 +139,11 @@ developed on first need (~1 GB of GPU textures, kept while the photo is
 open). The GPU device now asks for the adapter's own texture-size limit
 (16384 on every desktop GPU) instead of the 8192 default.
 
+The X6's stereo offset (yaw / pitch / roll between the eyes) is now one
+value shared by its `.insv` video and `.dng` stills: the same two lenses,
+the same alignment. Tune it on either and the other kind picks it up the
+next time a clip is activated or added; the sidebar says so.
+
 ### GoPro .360: rolling-shutter correction audited and tightened
 
 The GoPro rolling-shutter term was measured directly for the first time:

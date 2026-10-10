@@ -759,6 +759,12 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    scratch example `tex_limit_check` confirmed 16384 + a 15520×7760
    compose on the M5 Max. Log line: "(native|full|quick, native|binned
    source)".
+   SHARED X6 STEREO (same evening): `stereo_{yaw,pitch,roll}_deg` is one
+   value for the "insv" + "dng" kind templates — `save_active_kind_template`
+   writes it to both, `kind_template` and `select_clip` overlay it
+   (`apply_x6_shared_stereo`, read via `x6_shared_stereo`: insv first,
+   then dng). Per-clip INSV snapshots no longer keep their own stereo
+   offset (the rig's alignment is one number); pano_* stays per clip.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
