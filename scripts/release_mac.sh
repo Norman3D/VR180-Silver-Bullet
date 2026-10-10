@@ -5,6 +5,9 @@
 #   scripts/release_mac.sh                build + bundle + sign + verify
 #   scripts/release_mac.sh --notarize     … then notarize, staple, zip, DMG
 #   scripts/release_mac.sh --check-only   just verify dist/ (helpers current, signature valid)
+#   scripts/release_mac.sh --notarize-only   skip the build: verify the existing bundle, then
+#                                            notarize / staple / zip / DMG (a rerun after a
+#                                            notarization-side failure, e.g. an unsigned agreement)
 #
 # Steps (see CLAUDE.md "Release (macOS)"):
 #   1. cargo build --release -p vr180-gui   (build.rs rebuilds helpers/bin on source change)
@@ -55,7 +58,12 @@ verify_bundle() {
 }
 
 if [[ "$MODE" == "--check-only" ]]; then verify_bundle; exit 0; fi
+if [[ "$MODE" == "--notarize-only" ]]; then
+    [[ "$(plutil -extract CFBundleShortVersionString raw "$PLIST")" == "$VER" ]] || die "bundle is not $VER — run a full build first"
+    verify_bundle
+fi
 
+if [[ "$MODE" != "--notarize-only" ]]; then
 say "1. cargo build --release ($VER)"
 cargo build --release -p vr180-gui
 
@@ -79,8 +87,9 @@ for h in "${HELPERS[@]}"; do codesign --force --options runtime --timestamp -s "
 codesign --force --options runtime --timestamp -s "$IDENTITY" "$MACOS/vr180-gui"
 codesign --force --options runtime --timestamp -s "$IDENTITY" "$APP"
 verify_bundle
+fi  # (build + sign)
 
-if [[ "$MODE" != "--notarize" ]]; then
+if [[ "$MODE" != "--notarize" && "$MODE" != "--notarize-only" ]]; then
     say "done (not notarized). Next: scripts/release_mac.sh --notarize"
     exit 0
 fi
