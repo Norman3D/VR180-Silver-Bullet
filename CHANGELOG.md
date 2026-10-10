@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Windows: APAC is no longer offered
+- APAC (Apple Positional Audio) is encoded by a macOS helper and has no
+  Windows encoder; picking it on Windows only ever produced a stereo track
+  with a log warning. The Windows export-track picker now offers Stereo and
+  Ambisonic only, and a previously saved APAC choice is treated as Ambisonic
+  — the spatial option Windows can actually write.
+
+### Fixed on Windows: X6 360° Audio stereo export
+- On Windows the new stereo downmix of the X6's 360° Audio track silently
+  failed to open its temporary file and fell back to muxing the raw
+  4-channel track, so a "stereo" export still carried a 4.0 track. The
+  FFmpeg build bundled with the Windows app has no `ipod` muxer, which is
+  what a `.m4a` name resolves to; the audio writer now names its container
+  explicitly instead of guessing from the extension. Windows exports of such
+  clips now get a real stereo track, at the source's level.
+
 ### Insta360 X6: automatic per-frame eye-exposure matching
 
 The X6's two sensors auto-expose independently — shutter *and* gain — so the

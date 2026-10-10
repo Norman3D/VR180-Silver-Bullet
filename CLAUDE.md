@@ -871,6 +871,40 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    Open: the audio is NOT rotated to follow our stabilisation (Studio does);
    `.insv` recorded in Auto/Stereo modes are untouched.
 
+20. **X6 360° Audio on Windows (2026-10-10, Windows box)** — the mac
+   side's ambisonic work pulled, built clean first try (the new `build.rs`
+   helper rebuild is gated on `CARGO_CFG_TARGET_OS`, a no-op here); export
+   matrix byte-identical through the changed audio mux. The October rig clips
+   (`W:/261007 3 test/x6/VID_…_046–059`) carry the 4-channel AAC track tagged
+   `4.0`; the August clips are stereo only. ONE REAL BUG, Windows-only, FIXED
+   (`ab894a6`): the default STEREO export of such a clip logged "X6 360°
+   Audio → stereo decode failed (open output …foa_stereo.m4a: Invalid
+   argument); muxing the 4-channel track as is" — the bundled gpl-lite FFmpeg
+   has `mp4`/`mov`/`wav`/`matroska` muxers but NO `ipod`, which is what
+   `ffmpeg::format::output(path)` resolves `.m4a` to (CLI-verified: an `.m4a`
+   output fails, `.mp4` writes); Homebrew's build has it, so the mac never
+   saw it. `transcode_audio_window` now opens with `output_as(path, muxer)`
+   — `"mp4"` for `AacStereo`, `"wav"` for `Pcm24` — no extension guessing on
+   either platform. VERIFIED on clip 059: the stereo export logs the
+   AmbiX→stereo decode and carries a 2-ch 48 kHz AAC at −28.5 dBFS RMS (the
+   4-ch source copy reads −28.2; peak 3 dB lower as a front-facing downmix
+   should); the `Ambisonic` track copies the 4-ch stream + injects `SA3D`
+   (1 box, 4 ch). Pipeline lib tests 75/75. NOTE for the mac side:
+   `stereo_audio_source` decodes the WHOLE clip (`dur_s = None`, 6.08 M
+   samples for a 2 s window) and the one-pass mux trims afterwards — ~7 s
+   extra on a 127 s clip; passing the export window would make it
+   proportional. SAME DAY, **APAC hidden on Windows** (`cbe4d16`, GUI only;
+   pipeline untouched — its `#[cfg(not(macos))]` arm already falls back:
+   "APAC is macOS-only — stereo fallback", verified on 059 as a 2-ch AAC at
+   −28.5 dBFS, byte-identical to the stereo export): the `AF::Apac`
+   `selectable_value` is `cfg(target_os = "macos")`, and a persisted/carried
+   `AudioFormat::Apac` is folded to `Ambisonic` in TWO places — at picker
+   draw and in `build_export_cfg`'s mapping (the picker runs only while the
+   Audio section is expanded, so the mapping is what makes it
+   deterministic). `AudioFormat::Apac` + `as_str` stay for serde/match
+   exhaustiveness. Stale gitignored harnesses that blocked local `cargo
+   test` were parked under `examples/_stale/`.
+
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
   Swift helper); GPU-resident zero-copy P010 for OSV **and** `.360`/EAC. The
