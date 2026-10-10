@@ -3,7 +3,7 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ Status: **Unreleased on `main`: X6 automatic per-frame eye-exposure matching (2026-09-27, item 15) + GoPro per-frame exposure timing from SHUT (2026-10-07, item 16).** 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
+## ⚡ Status: **Unreleased on `main`: X6 automatic per-frame eye-exposure matching (2026-09-27, item 15) + GoPro per-frame exposure timing from SHUT (2026-10-07, item 16).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
 
 VR180 Silver Bullet **2.0** is feature-complete and building/running on both
 **macOS (Apple Silicon)** and **Windows (NVIDIA)**. The Windows GPU-resident
@@ -914,22 +914,7 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    dropped from the first kept packet's pts, the tail runs 0.1 s past the
    window. Verified: X6 export audio starts at exactly t_in (lag 0 vs the
    source, corr 0.999; before: the first packet after t_in, +10.7 ms), a 6 s
-   window renders in 68 ms; GoPro passthrough unchanged (offset = t_in).
-
-21. **2.5.2 release (2026-10-10) — macOS PUBLISHED (tag `v2.5.2` @ `fe41028`,
-   marked Latest; live `releases/latest/download/latest.json` serves 2.5.2
-   darwin-aarch64); Windows artifacts pending.** macOS side cut with
-   `scripts/release_mac.sh` at `8dfa2d8`: bundle 2.5.2, helpers hash-current,
-   app + DMG notarized (Accepted) and stapled, `spctl` "Notarized Developer
-   ID"; update zip + `.minisig` + darwin-only `latest.json`
-   (`make-latest-json.mjs`); **GitHub release v2.5.2 created as a DRAFT**
-   with those four assets (tag is created on publish). Apple's first
-   `notarytool` call failed 403 until the Account Holder accepted the updated
-   Program License Agreement; propagation was uneven for ~10 min (a 403 can
-   land mid-`--wait` while the submission is already Accepted — `notarytool
-   history`/`info` + `stapler staple`). Pending: publish decision (mac-only
-   manifest first, as 2.5.1, or wait for Windows), Windows setup.exe + merged
-   `latest.json` via `--clobber`, memory recipe updated. **WINDOWS ARMS VERIFIED (2026-10-10, Windows box):** my explicit-muxer
+   window renders in 68 ms; GoPro passthrough unchanged (offset = t_in). **WINDOWS ARMS VERIFIED (2026-10-10, Windows box):** my explicit-muxer
    open survived the edit; clip 059 through BOTH blind-edited arms (zc
    readback = Libx265, GPU-resident = NVENC), trimmed at t_in = 5 s: the
    audio starts at **+0 ms** (10 ms RMS-envelope cross-correlation vs the
@@ -941,6 +926,33 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    documented for passthrough. Export matrix byte-identical; untrimmed X6
    output byte-identical to the pre-window run. Harness: the measurement
    lives in scratchpad `ev/x6audio/lag.py`.
+
+21. **2.5.2 release (2026-10-10) — macOS PUBLISHED (tag `v2.5.2` @ `fe41028`,
+   marked Latest; live `releases/latest/download/latest.json` serves 2.5.2
+   darwin-aarch64); **Windows RELEASED 2026-10-10** (Windows box).** macOS side cut with
+   `scripts/release_mac.sh` at `8dfa2d8`: bundle 2.5.2, helpers hash-current,
+   app + DMG notarized (Accepted) and stapled, `spctl` "Notarized Developer
+   ID"; update zip + `.minisig` + darwin-only `latest.json`
+   (`make-latest-json.mjs`); **GitHub release v2.5.2 created as a DRAFT**
+   with those four assets (tag is created on publish). Apple's first
+   `notarytool` call failed 403 until the Account Holder accepted the updated
+   Program License Agreement; propagation was uneven for ~10 min (a 403 can
+   land mid-`--wait` while the submission is already Accepted — `notarytool
+   history`/`info` + `stapler staple`). Pending: publish decision (mac-only
+   manifest first, as 2.5.1, or wait for Windows), Windows setup.exe + merged
+   `latest.json` via `--clobber`, memory recipe updated. **WINDOWS (2026-10-10, Windows box):** the five release commits are
+   version-bump-only, so the tree verified the same day (items 20/WINDOW) IS
+   the 2.5.2 code — built, exe + installer identify as "VR180 Silver Bullet"
+   v2.5.2. Bundle = exe + the 7 FFmpeg DLLs + README (as 2.5.1), ISCC with
+   `MSYS_NO_PATHCONV=1`, portable zip in the 2.5.1 layout. The release's
+   `latest.json` was pulled down FIRST (respin hazard), notes extracted from
+   it, `make-latest-json.mjs --version 2.5.2` signed + merged (mac entry
+   preserved byte-for-byte). Uploaded `--clobber`: setup.exe (16 381 071 B),
+   its `.minisig` (mirroring the mac script's new standalone-sig upload),
+   the zip (20 883 820 B) and the merged manifest. VERIFIED live: manifest
+   and installer sha256 identical to local; the live installer verifies
+   against the signature IN the live manifest with the updater.rs pubkey;
+   darwin entry present. Feed serves 2.5.2 to BOTH platforms.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
