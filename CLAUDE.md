@@ -707,7 +707,26 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    wide) would fix that cosmetically — writer's call. Lightroom CC IS
    installed on the Windows box but is GUI-only (no CLI), so it was not
    driven; the exported DNGs sit in the session scratchpad `stills/` for a
-   by-hand open.
+   by-hand open. **SECOND BODY / NEW FIRMWARE (2026-10-10):** four stills from the
+   2026-10-07 rig test (`W:/261007 3 test/x6/IMG_…_051/052/053/057.dng`, the
+   `//DATA/Database` share) — a DIFFERENT X6 (serial BXEA3ABFS89CAV vs the
+   concert body's …QE5UCJ) on firmware **v1.2.35** (concert: v1.0.20) — all
+   pass every shape (20/20 exports, native tier included, no GPU error).
+   Nothing in the reader needed changing: TIFF/DNG tags identical to v1.0.20
+   (DNG 1.3, 14-bit GBRG `[1,2,0,1]` in a 16-bit container, Deflate 256-row
+   strips, WhiteLevel 16383, the same 7444-byte OpcodeList2; only
+   AsShotNeutral / BaselineExposure 2.63–2.74 / capture time differ), and
+   the trailer parse is structurally identical (records 0x0101 0x0003
+   0x0009 0x001b 0x001c, 2 lens entries, crop, RS 37.507 ms, orientation
+   3×3, 4 gain maps, calib_frame 15488×7744) except the 0x0003 IMU record
+   is 396 samples on 051/052 vs 594 on 053/057 and the concert file —
+   handled; the IMU is not consumed yet anyway. Output sanity: eye means
+   98–140 / 255 with contrast ~64 and the two eyes within **0.04 EV** on all
+   four, where the concert still's eyes sit **0.38 EV** apart (L 121 / R 157)
+   — the per-sensor AE mismatch of item 15 shows in stills too, and only
+   on that body/scene. WIC behaviour unchanged (PNG16 Rgb48 full-size,
+   DNG thumbnail-only, the camera's own file fails). The harness gained a
+   `probe` mode (third arg) that dumps the trailer fields without exporting.
    GRADE (2026-10-09, same day): PNG/JPEG bake the 16-bit colour stack
    (`apply_color_stack_pair_16` on the two eye textures, as video). The
    linear DNG carries the grade as METADATA (`still_export::grade_metadata`,
