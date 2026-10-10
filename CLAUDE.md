@@ -684,7 +684,28 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    the trailer IMU/field 210 not implemented (pitch sign unverified); raw
    exposure/WB sliders not exposed (develop at 0 EV as-shot); `.insp` JPEG
    not supported; Windows readers (WIC/Lightroom) untested; the headless
-   harness is `examples/dng_still_check.rs` (gitignored).
+   harness is `examples/dng_still_check.rs` (gitignored). **WINDOWS (2026-10-10, Windows box):** pulled + built clean first try
+   (`flate2`/`image` are pure Rust). Twin harness
+   `examples/dng_still_check_win.rs` (gitignored) exports the X6 concert still
+   010 on the RTX 4090 Vulkan device in all five shapes — PNG16 / JPEG / DNG
+   uncompressed / DNG lossless-JPEG at 2048/eye and PNG16 at the NATIVE
+   7760/eye tier (15520×7760, 536 MB file) — all OK, no GPU error recorded:
+   the row-band readback carries the 482 MB native eye on Windows too. The
+   Windows dedicated export device, whose descriptor now requests the 16384
+   texture limit, exports the OSV byte-identical to the shared device; hybrid
+   smoke both GPUs, SBS parity and the export matrix all unchanged. **WIC
+   (Explorer / Photos):** PNG16 decodes as Rgb48 at full size (both tiers),
+   JPEG fine. Both linear DNGs OPEN under Microsoft's Raw Image Extension
+   2.5.35 but it exposes ONE frame = the 256×128 IFD0 thumbnail (every
+   BitmapCreateOption; no Preview/Thumbnail properties), while the camera's
+   OWN X6 DNG fails outright in the same codec ("cannot decode") — so this
+   is the codec stopping at IFD0, not our file: the IFD walk is textbook
+   (IFD0 NewSubFileType 1, 256×128 RGB8; SubIFD[0] NewSubFileType 0,
+   4096×2048 LinearRaw 16-bit, DNG 1.4 / back 1.1, LJPEG 256² tiles, Black 0
+   / White 65535). Practical consequence: Explorer and Photos show a soft
+   256-px preview of our DNG; a larger embedded preview (Adobe writes ~1024
+   wide) would fix that cosmetically — writer's call. Lightroom is not
+   installed on the Windows box: still untested there.
    GRADE (2026-10-09, same day): PNG/JPEG bake the 16-bit colour stack
    (`apply_color_stack_pair_16` on the two eye textures, as video). The
    linear DNG carries the grade as METADATA (`still_export::grade_metadata`,
