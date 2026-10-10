@@ -1611,7 +1611,15 @@ impl App {
             audio_track: match settings.audio_format {
                 crate::decoder::AudioFormat::Stereo    => vr180_pipeline::fisheye_export::AudioTrack::Stereo,
                 crate::decoder::AudioFormat::Ambisonic => vr180_pipeline::fisheye_export::AudioTrack::Ambisonic,
+                // No APAC encoder on Windows: a persisted/carried-over Apac
+                // becomes Ambisonic here too, so the export does not depend
+                // on the Audio panel having been drawn (which is where the
+                // picker folds it). The pipeline's own fallback stays as the
+                // last net.
+                #[cfg(target_os = "macos")]
                 crate::decoder::AudioFormat::Apac      => vr180_pipeline::fisheye_export::AudioTrack::Apac,
+                #[cfg(not(target_os = "macos"))]
+                crate::decoder::AudioFormat::Apac      => vr180_pipeline::fisheye_export::AudioTrack::Ambisonic,
             },
             eye_w,
             eye_h,
@@ -5623,6 +5631,16 @@ impl App {
             )).small().color(Color32::GRAY));
         }
         let s = &mut self.settings;
+        // APAC is Apple's Positional Audio Codec, encoded by the macOS
+        // `apac_encode` helper over AVFoundation — there is no Windows encoder,
+        // and the export would only log "APAC is macOS-only" and fall back to
+        // stereo. So the choice is not offered here, and a value persisted
+        // before it was hidden (or carried over from a mac) is folded into
+        // Ambisonic, the nearest spatial option Windows can actually write.
+        #[cfg(not(target_os = "macos"))]
+        if s.audio_format == AF::Apac {
+            s.audio_format = AF::Ambisonic;
+        }
         ui.horizontal(|ui| {
             ui.label(tr("Export track"));
             egui::ComboBox::from_id_source("audio_format")
@@ -5630,6 +5648,7 @@ impl App {
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut s.audio_format, AF::Stereo, AF::Stereo.as_str());
                     ui.selectable_value(&mut s.audio_format, AF::Ambisonic, AF::Ambisonic.as_str());
+                    #[cfg(target_os = "macos")]
                     ui.selectable_value(&mut s.audio_format, AF::Apac, AF::Apac.as_str());
                 });
         });
