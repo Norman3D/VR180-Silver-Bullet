@@ -165,7 +165,11 @@ passthrough).
 (The first cut of the APAC path handed the helper a WAV tagged as a
 positional 4.0 layout, which AVFoundation "converted" to ambisonics as
 silence; the WAV now carries the ambisonic channel order, as the GoPro
-path's always did.)
+path's always did.) The APAC helper also labels its input as HOA ACN/SN3D
+now: without that label AVFoundation wrote the track as "Quadraphonic"
+instead of ambisonics — the `.360` APAC exports had been tagged that way
+all along, so Vision Pro saw a 4-channel surround track, not a spatial
+sound field. Both sources now produce the HOA-tagged APAC track.
 
 ### GoPro .360: rolling-shutter correction audited and tightened
 

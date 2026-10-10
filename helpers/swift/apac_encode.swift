@@ -134,6 +134,22 @@ do {
 // Decode to 32-bit float interleaved PCM @ original rate. APAC's encoder
 // path expects float PCM input; the converter handles bit-depth promotion
 // from s24le → float.
+// 1st-order ambisonic channel layout tag.
+//   kAudioChannelLayoutTag_HOA_ACN_SN3D = (190 << 16)
+//   The low 16 bits encode the channel count.
+//   For 1st order: 4 channels (W, Y, Z, X in ACN ordering).
+//   SN3D normalisation = AmbiX standard (matches GoPro/YouTube/Apple).
+var layout = AudioChannelLayout()
+layout.mChannelLayoutTag = kAudioChannelLayoutTag_HOA_ACN_SN3D | 4
+layout.mChannelBitmap = AudioChannelBitmap(rawValue: 0)
+layout.mNumberChannelDescriptions = 0
+let layoutData = withUnsafeBytes(of: &layout) { Data($0) }
+
+// The reader's output is LABELLED as that HOA layout. The source WAV carries
+// no channel layout (ffmpeg writes channel mask 0 for an ambisonic / unspec
+// order), so AVFoundation only labels — no remapping. Without this label the
+// writer, asked for HOA, silently fell back to a "Quadraphonic" track; with a
+// positional source label (a 4.0 WAV) it "converted" quad → HOA as silence.
 let decodeSettings: [String: Any] = [
     AVFormatIDKey: kAudioFormatLinearPCM,
     AVLinearPCMBitDepthKey: 32,
@@ -142,6 +158,7 @@ let decodeSettings: [String: Any] = [
     AVLinearPCMIsNonInterleaved: false,
     AVNumberOfChannelsKey: 4,
     AVSampleRateKey: srcRate,
+    AVChannelLayoutKey: layoutData,
 ]
 let audioReaderOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: decodeSettings)
 audioReaderOutput.alwaysCopiesSampleData = false
@@ -207,16 +224,6 @@ do {
     exit(1)
 }
 
-// 1st-order ambisonic channel layout tag.
-//   kAudioChannelLayoutTag_HOA_ACN_SN3D = (190 << 16)
-//   The low 16 bits encode the channel count.
-//   For 1st order: 4 channels (W, Y, Z, X in ACN ordering).
-//   SN3D normalisation = AmbiX standard (matches GoPro/YouTube/Apple).
-var layout = AudioChannelLayout()
-layout.mChannelLayoutTag = kAudioChannelLayoutTag_HOA_ACN_SN3D | 4
-layout.mChannelBitmap = AudioChannelBitmap(rawValue: 0)
-layout.mNumberChannelDescriptions = 0
-let layoutData = withUnsafeBytes(of: &layout) { Data($0) }
 
 // APAC encoder settings. AVFormatIDKey wants Int from the FourCC.
 // AVEncoderBitRateKey is honored by the APAC encoder as a VBR target hint.

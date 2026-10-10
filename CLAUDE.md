@@ -846,6 +846,19 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    UNSPEC fallback) → mask 0; verified the helper's output decodes with
    per-channel corr ≈ 1 vs the raw track. Check any new APAC input with
    `afinfo` ("no channel layout") and `afconvert … -f caff -d LEF32` + RMS.
+   **SECOND HALF OF THE TRAP: an UNLABELLED input made the helper's
+   AVAssetWriter ignore the requested HOA layout and write a
+   "Quadraphonic" APAC track** (afinfo on every `.360` APAC export so far:
+   "Channel layout: Quadraphonic") — audio present, but not a sound field
+   for visionOS. Fix in `helpers/swift/apac_encode.swift`: the reader's
+   `decodeSettings` now carry `AVChannelLayoutKey` = HOA_ACN_SN3D|4, so the
+   PCM is LABELLED (not remapped — the source has no layout) and the writer
+   emits "High-Order Ambisonics, ACN/SN3D" with the samples intact (corr
+   0.98–0.999 vs source for both X6 and GoPro). ffmpeg's CAF muxer does NOT
+   write an HOA `chan` chunk for the ambisonic order (tried), hence the
+   label on the reader. Rebuild with `bash helpers/build_swift.sh`; the
+   Dev bundle keeps its own copy in Contents/MacOS. Both sources verified
+   through the real export path (2026-10-10).
    Open: the audio is NOT rotated to follow our stabilisation (Studio does);
    `.insv` recorded in Auto/Stereo modes are untouched.
 
