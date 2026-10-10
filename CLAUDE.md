@@ -916,7 +916,9 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    source, corr 0.999; before: the first packet after t_in, +10.7 ms), a 6 s
    window renders in 68 ms; GoPro passthrough unchanged (offset = t_in).
 
-21. **2.5.2 release (2026-10-10, in progress).** macOS side cut with
+21. **2.5.2 release (2026-10-10) — macOS PUBLISHED (tag `v2.5.2` @ `fe41028`,
+   marked Latest; live `releases/latest/download/latest.json` serves 2.5.2
+   darwin-aarch64); Windows artifacts pending.** macOS side cut with
    `scripts/release_mac.sh` at `8dfa2d8`: bundle 2.5.2, helpers hash-current,
    app + DMG notarized (Accepted) and stapled, `spctl` "Notarized Developer
    ID"; update zip + `.minisig` + darwin-only `latest.json`
