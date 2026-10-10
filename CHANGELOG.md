@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.5.2 — 2026-10-10
 
 ### Windows: APAC is no longer offered
 - APAC (Apple Positional Audio) is encoded by a macOS helper and has no
