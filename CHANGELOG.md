@@ -144,6 +144,25 @@ value shared by its `.insv` video and `.dng` stills: the same two lenses,
 the same alignment. Tune it on either and the other kind picks it up the
 next time a clip is activated or added; the sidebar says so.
 
+### Insta360 X6 "360° Audio": the camera's ambisonics, decoded instead of copied
+
+With the camera's audio mode set to 360° Audio the X6 writes a 4-channel
+AAC track with no channel semantics in the file. It is first-order
+ambisonics (AmbiX W, Y, Z, X — matched against Insta360 Studio's SA3D-tagged
+export, which only rotates it by the stabilisation yaw). Copied as is, the
+standard layout downmix every player applies cancels two anti-phase
+channels and plays ~9 dB left-heavy; that is what an export of such a clip
+sounded like until now.
+
+The X6 now gets the same Audio section as the `.360`: **Stereo** (default)
+decodes a front-facing pair of virtual cardioids (±45°, the camera's front
+= the rig's forward) to a 192 kb/s AAC; **Ambisonic** copies the 4-channel
+track and tags it SA3D for YouTube VR / Quest head-tracking, exactly as
+Studio does; **APAC** re-encodes it to Apple Positional Audio for Vision
+Pro (macOS). The preview player decodes the same stereo pair. Clips
+recorded in the Auto / Stereo audio modes are unchanged (stereo AAC
+passthrough).
+
 ### GoPro .360: rolling-shutter correction audited and tightened
 
 The GoPro rolling-shutter term was measured directly for the first time:

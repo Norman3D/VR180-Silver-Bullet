@@ -401,8 +401,9 @@ fn eac_audio_source(cfg: &FisheyeExportConfig) -> (PathBuf, Option<PathBuf>) {
     }
 }
 
-/// Finalize EAC audio per `cfg.audio_track`. The video temp is consumed
-/// (renamed or muxed away) regardless of branch.
+/// Finalize the audio of a source with a 4-channel ambisonic track (GoPro
+/// `.360`, Insta360 X6 in 360° Audio mode) per `cfg.audio_track`. The video
+/// temp is consumed (renamed or muxed away) regardless of branch.
 /// - **Stereo**: passthrough-mux the source's stereo AAC (universal).
 /// - **Ambisonic**: passthrough-mux the 4-channel ambisonic track + an
 ///   SA3D atom so VR players head-track it.
@@ -424,7 +425,11 @@ fn finalize_eac_audio(
     let out = &cfg.output_path;
 
     let stereo = |audio_tmp: &Option<PathBuf>| -> Result<()> {
-        finalize_with_audio(&audio_src, video_tmp, out, offset_s, dur_s)?;
+        // (The X6's 360° Audio is decoded to a stereo temp here.)
+        let (s_src, s_tmp) = stereo_audio_source(cfg);
+        let r = finalize_with_audio(&s_src, video_tmp, out, offset_s, dur_s);
+        if let Some(t) = s_tmp { std::fs::remove_file(t).ok(); }
+        r?;
         drop_tmp(audio_tmp);
         Ok(())
     };
@@ -432,7 +437,7 @@ fn finalize_eac_audio(
     match cfg.audio_track {
         AudioTrack::Stereo => stereo(&audio_tmp)?,
 
-        AudioTrack::Ambisonic => match crate::audio::probe_ambisonic(&audio_src) {
+        AudioTrack::Ambisonic => match crate::audio::probe_spatial_4ch(&audio_src) {
             Ok(Some(info)) => {
                 let n = crate::audio::mux_video_with_audio_stream(
                     &audio_src, video_tmp, out, offset_s, Some(dur_s),
@@ -550,8 +555,59 @@ fn finalize_with_audio(
 /// stereo passthrough; the `.360` ambisonic + APAC formats need post-encode
 /// steps (SA3D atom / APAC re-encode) so they keep the temp+finalize path.
 fn one_pass_audio_eligible(cfg: &FisheyeExportConfig) -> bool {
-    !matches!(cfg.source_kind, SourceKind::GoProEac)
-        || matches!(cfg.audio_track, AudioTrack::Stereo)
+    match cfg.source_kind {
+        // Sources with a 4-channel ambisonic track: SA3D / APAC need the
+        // post-encode steps; their Stereo export muxes inline (the X6's
+        // from a decoded stereo temp — `stereo_audio_source`).
+        SourceKind::GoProEac | SourceKind::Insta360Insv =>
+            matches!(cfg.audio_track, AudioTrack::Stereo),
+        _ => true,
+    }
+}
+
+/// The audio source for a STEREO export: the source file (or the chain
+/// playlist) — except an Insta360 X6 clip recorded in "360° Audio" mode,
+/// whose 4-channel AmbiX track is first decoded to a front-facing stereo
+/// AAC temp (`audio::foa_to_stereo_aac`): copied as is, a layout downmix of
+/// that track cancels two anti-phase channels and lands ~9 dB left-heavy.
+/// The whole track is rendered so the caller's trim offsets still apply.
+/// Second element = a temp to delete when done (the playlist or the m4a).
+fn stereo_audio_source(cfg: &FisheyeExportConfig) -> (PathBuf, Option<PathBuf>) {
+    let (src, tmp) = eac_audio_source(cfg);
+    if cfg.source_kind == SourceKind::Insta360Insv {
+        if let Ok(Some(_)) = crate::audio::probe_foa_aac(&src) {
+            let out = video_only_temp_path(&cfg.output_path).with_extension("foa_stereo.m4a");
+            match crate::audio::foa_to_stereo_aac(&src, &out, 0.0, None, 192_000) {
+                Ok(_) => {
+                    if let Some(t) = tmp { std::fs::remove_file(t).ok(); }
+                    return (out.clone(), Some(out));
+                }
+                Err(e) => tracing::warn!(
+                    "X6 360° Audio → stereo decode failed ({e}); muxing the 4-channel track as is"),
+            }
+        }
+    }
+    (src, tmp)
+}
+
+/// Two-pass audio finalize for the fisheye (non-EAC) exports: the X6 takes
+/// the spatial-aware path (its 360° Audio track serves Stereo / Ambisonic /
+/// APAC like the `.360`'s); everything else passthrough-muxes its stereo.
+fn finalize_fisheye_audio(
+    cfg: &FisheyeExportConfig,
+    video_tmp: &std::path::Path,
+    offset_s: f64,
+    dur_s: f64,
+) -> Result<()> {
+    if cfg.source_kind == SourceKind::Insta360Insv {
+        return finalize_eac_audio(cfg, video_tmp, offset_s, dur_s);
+    }
+    // Multi-segment: the audio source is an ffconcat playlist so a merged
+    // recording keeps its FULL audio (source_path alone = segment 0 only).
+    let (audio_src, audio_tmp) = eac_audio_source(cfg);
+    let r = finalize_with_audio(&audio_src, video_tmp, &cfg.output_path, offset_s, dur_s);
+    if let Some(p) = &audio_tmp { std::fs::remove_file(p).ok(); }
+    r
 }
 
 /// Build a per-segment opener for the portable fisheye export decode loop
@@ -1155,7 +1211,7 @@ fn export_fisheye_inner(
 
     // Inline audio passthrough — must attach before the first frame.
     let one_pass_audio_tmp = if one_pass {
-        let (asrc, atmp) = eac_audio_source(&cfg);
+        let (asrc, atmp) = stereo_audio_source(&cfg);
         let dur = total_frames_to_write as f64 / cfg.fps as f64;
         if let Err(e) = encoder.attach_audio_passthrough(&asrc, t_in, dur) {
             tracing::warn!("one-pass audio attach failed: {e} — video-only output");
@@ -1430,10 +1486,7 @@ fn export_fisheye_inner(
         // Multi-segment uses an ffconcat playlist so the merged recording's
         // audio is one continuous track the trim window cuts from; a lone
         // file muxes its own. (`eac_audio_source` is segment-generic.)
-        let (audio_src, audio_tmp) = eac_audio_source(&cfg);
-        finalize_with_audio(&audio_src, &video_tmp, &cfg.output_path,
-            t_in, frame_idx as f64 * dt)?;
-        if let Some(tmp) = audio_tmp { std::fs::remove_file(tmp).ok(); }
+        finalize_fisheye_audio(&cfg, &video_tmp, t_in, frame_idx as f64 * dt)?;
     }
     finalize_metadata(
         &cfg.output_path,
@@ -1721,7 +1774,7 @@ fn export_eac_inner(
     // covers the whole chain when stabilizing; otherwise (empty per_eye)
     // probe the chain — per_eye.len() would clip the audio to nothing.
     let one_pass_audio_tmp = if one_pass {
-        let (asrc, atmp) = eac_audio_source(&cfg);
+        let (asrc, atmp) = stereo_audio_source(&cfg);
         let total_video_frames = if per_eye.is_empty() {
             if cfg.segments.len() > 1 {
                 cfg.segments.iter().map(|s| chain_segment_frames(s, cfg.fps)).sum::<usize>()
@@ -1926,7 +1979,7 @@ fn export_eac_zerocopy_vt(
     // covers the whole chain when stabilizing; otherwise (empty per_eye)
     // probe the chain — per_eye.len() would clip the audio to nothing.
     let one_pass_audio_tmp = if one_pass {
-        let (asrc, atmp) = eac_audio_source(&cfg);
+        let (asrc, atmp) = stereo_audio_source(&cfg);
         let total_video_frames = if per_eye.is_empty() {
             if cfg.segments.len() > 1 {
                 cfg.segments.iter().map(|s| chain_segment_frames(s, cfg.fps)).sum::<usize>()
@@ -2173,7 +2226,7 @@ fn export_eac_gpu_resident(
     let one_pass = one_pass_audio_eligible(&cfg);
     let video_tmp = if one_pass { cfg.output_path.clone() }
                     else { video_only_temp_path(&cfg.output_path) };
-    let one_pass_audio = if one_pass { Some(eac_audio_source(&cfg)) } else { None };
+    let one_pass_audio = if one_pass { Some(stereo_audio_source(&cfg)) } else { None };
     // (source, offset, clip) for whichever encode thread engages — the
     // source is the ffconcat chain playlist for a merged recording, so
     // multi-segment audio is one continuous timeline the window cuts from.
@@ -2661,7 +2714,7 @@ fn export_fisheye_osv_zerocopy_p010(
     };
     // Inline audio passthrough (must be attached before the first frame).
     let one_pass_audio_tmp = if one_pass {
-        let (asrc, atmp) = eac_audio_source(&cfg);
+        let (asrc, atmp) = stereo_audio_source(&cfg);
         let dur = total_frames_to_write as f64 / cfg.fps as f64;
         if let Err(e) = encoder.attach_audio_passthrough(&asrc, t_in, dur) {
             tracing::warn!("one-pass audio attach failed: {e} — video-only output");
@@ -2925,8 +2978,7 @@ fn export_fisheye_osv_zerocopy_p010(
         // Audio already muxed inline — drop the playlist temp, if any.
         if let Some(t) = one_pass_audio_tmp { std::fs::remove_file(t).ok(); }
     } else {
-        finalize_with_audio(&cfg.source_path, &enc_out, &cfg.output_path,
-            t_in, frame_idx as f64 * dt)?;
+        finalize_fisheye_audio(&cfg, &enc_out, t_in, frame_idx as f64 * dt)?;
     }
     finalize_metadata(
         &cfg.output_path,
@@ -3024,7 +3076,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
     let one_pass = one_pass_audio_eligible(&cfg);
     let video_tmp = if one_pass { cfg.output_path.clone() }
                     else { video_only_temp_path(&cfg.output_path) };
-    let one_pass_audio = if one_pass { Some(eac_audio_source(&cfg)) } else { None };
+    let one_pass_audio = if one_pass { Some(stereo_audio_source(&cfg)) } else { None };
 
     let dt = 1.0 / cfg.fps as f64;
     let color_plan = cfg.color_stack.clone();
@@ -3405,11 +3457,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
     } else {
         // Multi-segment: the audio source is an ffconcat playlist so a merged
         // recording keeps its FULL audio (source_path alone = segment 0 only).
-        let (audio_src, audio_tmp) = eac_audio_source(&cfg);
-        let mux = finalize_with_audio(&audio_src, &video_tmp, &cfg.output_path,
-            t_in, frame_idx as f64 * dt);
-        if let Some(p) = &audio_tmp { std::fs::remove_file(p).ok(); }
-        mux?;
+        finalize_fisheye_audio(&cfg, &video_tmp, t_in, frame_idx as f64 * dt)?;
     }
     finalize_metadata(
         &cfg.output_path,
@@ -3505,7 +3553,7 @@ fn export_fisheye_osv_gpu_resident(
     let one_pass = one_pass_audio_eligible(&cfg);
     let video_tmp = if one_pass { cfg.output_path.clone() }
                     else { video_only_temp_path(&cfg.output_path) };
-    let one_pass_audio = if one_pass { Some(eac_audio_source(&cfg)) } else { None };
+    let one_pass_audio = if one_pass { Some(stereo_audio_source(&cfg)) } else { None };
     // Ring of shared P010 frames: the main thread composes frame N+k while the
     // encode thread is still feeding NVENC frame N. RING slots + a bounded
     // channel of depth RING-2 keep main from overwriting an in-flight slot.
@@ -3751,11 +3799,7 @@ fn export_fisheye_osv_gpu_resident(
         }
     } else {
         // Multi-segment: ffconcat playlist keeps a merged recording's FULL audio.
-        let (audio_src, audio_tmp) = eac_audio_source(&cfg);
-        let mux = finalize_with_audio(&audio_src, &video_tmp, &cfg.output_path,
-            t_in, frame_idx as f64 * dt);
-        if let Some(p) = &audio_tmp { std::fs::remove_file(p).ok(); }
-        mux?;
+        finalize_fisheye_audio(&cfg, &video_tmp, t_in, frame_idx as f64 * dt)?;
     }
     finalize_metadata(&cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp, cfg.apmp_baseline_mm)?;
     tracing::info!(

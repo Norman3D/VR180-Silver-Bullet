@@ -808,6 +808,36 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    then dng). Per-clip INSV snapshots no longer keep their own stereo
    offset (the rig's alignment is one number); pano_* stays per clip.
 
+19. **X6 "360° Audio" = first-order AmbiX (2026-10-10).** With the camera's
+   audio mode set to 360° Audio (user did this on 2026-10-07; firmware
+   v1.2.35, second body) the `.insv` carries a 4-ch AAC (channel config 4,
+   no `chan`/SA3D; the LRV too). Proven against Insta360 Studio's export of
+   `VID_20261008_193907_00_046`: Studio's track is SA3D (order 1, ACN,
+   SN3D, map 0..3) and equals the raw decoded channels `[W, Y, Z, X]` up to
+   a time-varying YAW rotation of (X, Y) (its stabilisation heading) and a
+   gain (W/Z R² 0.97/0.93 per 60 s; X/Y R² 0.88–0.98 per 1 s with the fitted
+   2×2 a scaled rotation, det > 0; elevations of the active-intensity DOA
+   agree within 2°). Studio = gain(t)·Rot_z(θ(t))·raw, offset 26.3 ms.
+   A layout downmix (swresample / most players) cancels c2+c3 (anti-phase)
+   → 9.5 dB L/R imbalance = the "audio is wrong" report. Implementation:
+   `audio::probe_foa_aac` (4-ch AAC), `probe_spatial_4ch` (PCM or AAC),
+   `FOA_STEREO_MATRIX` / `foa_to_stereo_sample` (±45° SN3D cardioids, +X =
+   camera front = front lens = rig forward), `transcode_audio_window`
+   (decode → optional 4→2 mix → `aac` fltp or `pcm_s24le` → m4a/wav;
+   planar frame planes via raw pointers — ffmpeg sets only linesize[0]),
+   `foa_to_stereo_aac`; `extract_ambisonic_to_wav_window` decodes non-PCM.
+   Export: `one_pass_audio_eligible` = Stereo-only for GoProEac AND
+   Insta360Insv; `stereo_audio_source` renders the whole-track stereo temp
+   (`<out>.video.tmp` → `.foa_stereo.m4a`) that the inline mux / finalize
+   copies with the normal trim offsets; `finalize_fisheye_audio` routes the
+   X6 to `finalize_eac_audio` (Ambisonic = passthrough + `inject_sa3d_ambix`,
+   APAC = decoded WAV → helper). Verified: stereo export R² 0.999 vs the
+   expected mix, lag 0; ambisonic export carries SA3D identical to Studio's;
+   APAC helper accepted the WAV. GUI: `ClipInfo::foa_audio` (probe at load)
+   shows the Audio section for X6; `audio_player` decodes the pair itself.
+   Open: the audio is NOT rotated to follow our stabilisation (Studio does);
+   `.insv` recorded in Auto/Stereo modes are untouched.
+
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
   Swift helper); GPU-resident zero-copy P010 for OSV **and** `.360`/EAC. The

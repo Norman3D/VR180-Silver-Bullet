@@ -253,12 +253,20 @@ fn decoder_worker(
         src_rate, src_format, src_ch_layout
     );
 
-    // Resampler: source → device's stereo f32 packed.
-    let dst_ch_layout = if device_channels == 1 {
+    // X6 "360° Audio": a 4-channel AAC that is first-order AmbiX. swresample's
+    // layout downmix cancels two of its channels (anti-phase) and plays ~9 dB
+    // left-heavy, so keep the 4 channels through the resampler and decode a
+    // front-facing stereo pair ourselves (`audio::foa_to_stereo_sample`).
+    let foa = src_ch_layout.channels() == 4 && decoder.id() == ffmpeg::codec::Id::AAC;
+    // Resampler: source → device's stereo f32 packed (4-ch AmbiX stays 4-ch).
+    let dst_ch_layout = if foa {
+        src_ch_layout
+    } else if device_channels == 1 {
         ffmpeg::channel_layout::ChannelLayout::MONO
     } else {
         ffmpeg::channel_layout::ChannelLayout::STEREO
     };
+    if foa { tracing::info!("audio_player worker: 4-ch AmbiX source — decoding a front-facing stereo pair"); }
     let mut resampler = Resampler::get(
         src_format,
         src_ch_layout,
@@ -344,14 +352,22 @@ fn decoder_worker(
                 continue;
             }
             let n_samples = out_frame.samples() as usize;
-            let stride = device_channels * std::mem::size_of::<f32>();
+            let frame_ch = if foa { 4 } else { device_channels };
+            let stride = frame_ch * std::mem::size_of::<f32>();
             let plane = out_frame.data(0);
             let needed_bytes = n_samples * stride;
             let bytes = &plane[..needed_bytes.min(plane.len())];
             let samples: &[f32] = bytemuck::cast_slice(bytes);
 
             let mut g = buf.lock();
-            g.extend(samples.iter().copied());
+            if foa {
+                for s in samples.chunks_exact(4) {
+                    let [l, r] = vr180_pipeline::audio::foa_to_stereo_sample([s[0], s[1], s[2], s[3]]);
+                    if device_channels == 1 { g.push_back(0.5 * (l + r)); } else { g.push_back(l); g.push_back(r); }
+                }
+            } else {
+                g.extend(samples.iter().copied());
+            }
         }
     }
 }

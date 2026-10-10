@@ -74,6 +74,61 @@ pub fn probe_ambisonic(input: &Path) -> Result<Option<AmbisonicInfo>> {
     Ok(None)
 }
 
+/// The Insta360 X6's "360° Audio" track: a 4-channel AAC with no channel
+/// semantics in the file (AAC channel config 4, no `chan`/SA3D). Measured
+/// against Insta360 Studio's SA3D-tagged export (2026-10-10): the decoded
+/// channels ARE first-order AmbiX — `[W, Y, Z, X]` (ACN order, SN3D) — Studio
+/// only rotates X/Y by its stabilisation yaw, scales, and tags SA3D.
+/// (Older firmware / the "Auto" or "Stereo" audio modes write stereo AAC,
+/// for which this returns `None`.)
+pub fn probe_foa_aac(input: &Path) -> Result<Option<AmbisonicInfo>> {
+    crate::decode::init();
+    let ictx = open_input_concat_aware(input)
+        .map_err(|e| Error::Ffmpeg(format!("open {input:?}: {e}")))?;
+    for stream in ictx.streams() {
+        let params = stream.parameters();
+        if params.medium() != ffmpeg::media::Type::Audio { continue; }
+        // SAFETY: we hold the input context borrow via `stream`.
+        let (channels, codec_id, sample_rate) = unsafe {
+            let raw = params.as_ptr();
+            ((*raw).ch_layout.nb_channels as u32, (*raw).codec_id as i32, (*raw).sample_rate as u32)
+        };
+        if channels != 4 || codec_id != ffmpeg::ffi::AVCodecID::AV_CODEC_ID_AAC as i32 { continue; }
+        return Ok(Some(AmbisonicInfo { stream_index: stream.index(), sample_rate, channels, codec_id }));
+    }
+    Ok(None)
+}
+
+/// Any 4-channel first-order ambisonic track: GoPro's PCM
+/// (`probe_ambisonic`) or the X6's AAC (`probe_foa_aac`).
+pub fn probe_spatial_4ch(input: &Path) -> Result<Option<AmbisonicInfo>> {
+    match probe_ambisonic(input)? {
+        Some(i) => Ok(Some(i)),
+        None => probe_foa_aac(input),
+    }
+}
+
+/// Front-facing stereo decode of first-order AmbiX: a pair of virtual
+/// cardioids at ±45° — SN3D cardioid = ½·W + ½·(X·cos θ + Y·sin θ), +X the
+/// camera's front (its front lens, the VR180 rig's forward), +Y left.
+/// Rows `[L, R]`, columns `[W, Y, Z, X]` (decoded channel order).
+/// A plain layout downmix of the X6 track instead cancels two anti-phase
+/// channels and lands ~9 dB left-heavy (measured 2026-10-10).
+pub const FOA_STEREO_MATRIX: [[f32; 4]; 2] = [
+    [0.5,  0.353_553_4, 0.0, 0.353_553_4],
+    [0.5, -0.353_553_4, 0.0, 0.353_553_4],
+];
+
+/// One sample of `[W, Y, Z, X]` → `[L, R]` through [`FOA_STEREO_MATRIX`].
+#[inline]
+pub fn foa_to_stereo_sample(wyzx: [f32; 4]) -> [f32; 2] {
+    let m = &FOA_STEREO_MATRIX;
+    [
+        m[0][0] * wyzx[0] + m[0][1] * wyzx[1] + m[0][2] * wyzx[2] + m[0][3] * wyzx[3],
+        m[1][0] * wyzx[0] + m[1][1] * wyzx[1] + m[1][2] * wyzx[2] + m[1][3] * wyzx[3],
+    ]
+}
+
 /// Codec-ID set we recognize as "uncompressed PCM suitable for
 /// ambisonic extraction". Extracted to its own function so the list of
 /// fallback codecs is documented in one place.
@@ -110,10 +165,21 @@ pub fn extract_ambisonic_to_wav_window(
     dur_s: Option<f64>,
 ) -> Result<AmbisonicInfo> {
     crate::decode::init();
-    let info = probe_ambisonic(input)?
+    let info = probe_spatial_4ch(input)?
         .ok_or_else(|| Error::Ffmpeg(format!(
             "no ambisonic audio track in {input:?}"
         )))?;
+    if !is_pcm_codec_id(info.codec_id) {
+        // Compressed (the X6's AAC): decode to 24-bit PCM — the packet copy
+        // below is PCM-only.
+        let n = transcode_audio_window(
+            input, info.stream_index, output_wav, offset_s, dur_s, None,
+            AudioOut::Pcm24 { channels: info.channels as i32 },
+        )?;
+        tracing::info!(wav = %output_wav.display(), samples = n, channels = info.channels,
+            sample_rate = info.sample_rate, "decoded 4-ch AAC ambisonic audio to WAV");
+        return Ok(info);
+    }
 
     let mut ictx = open_input_concat_aware(input)
         .map_err(|e| Error::Ffmpeg(format!("open input: {e}")))?;
@@ -188,6 +254,215 @@ pub fn extract_ambisonic_to_wav_window(
         "extracted ambisonic audio to WAV"
     );
     Ok(info)
+}
+
+/// Output of [`transcode_audio_window`].
+enum AudioOut {
+    /// Stereo AAC-LC (ffmpeg's native encoder) in an `.m4a`.
+    AacStereo { bit_rate: usize },
+    /// 24-bit PCM, `channels` wide, in a `.wav`.
+    Pcm24 { channels: i32 },
+}
+
+/// Decode the `[offset_s, offset_s + dur_s)` window of audio stream
+/// `stream_index` (packet granularity at the edges, like the passthrough
+/// mux), optionally mix it 4→2 through `mix` (rows = output channels), and
+/// encode it to `out_path`. Returns the number of samples written.
+fn transcode_audio_window(
+    input: &Path,
+    stream_index: usize,
+    out_path: &Path,
+    offset_s: f64,
+    dur_s: Option<f64>,
+    mix: Option<&[[f32; 4]; 2]>,
+    out: AudioOut,
+) -> Result<u64> {
+    use ffmpeg::format::sample::{Sample, Type};
+    use ffmpeg::ChannelLayout;
+    crate::decode::init();
+
+    let mut ictx = open_input_concat_aware(input)
+        .map_err(|e| Error::Ffmpeg(format!("open input {input:?}: {e}")))?;
+    if offset_s > 0.001 {
+        let ts = (offset_s * 1_000_000.0) as i64;
+        let _ = ictx.seek(ts, ..ts);
+    }
+    let (src_params, src_tb) = {
+        let st = ictx.stream(stream_index)
+            .ok_or_else(|| Error::Ffmpeg(format!("audio stream {stream_index} vanished")))?;
+        (st.parameters(), st.time_base())
+    };
+    let mut decoder = ffmpeg::codec::context::Context::from_parameters(src_params)
+        .map_err(|e| Error::Ffmpeg(format!("decoder params: {e}")))?
+        .decoder().audio()
+        .map_err(|e| Error::Ffmpeg(format!("audio decoder: {e}")))?;
+    let rate = decoder.rate();
+    let src_layout = decoder.channel_layout();
+    let in_ch = src_layout.channels().max(1) as usize;
+    if mix.is_some() && in_ch != 4 {
+        return Err(Error::Ffmpeg(format!("FOA mix needs 4 input channels, stream has {in_ch}")));
+    }
+    // Decoded frames → packed f32 at the source rate (format change only).
+    let mut to_f32 = ffmpeg::software::resampling::Context::get(
+        decoder.format(), src_layout, rate,
+        Sample::F32(Type::Packed), src_layout, rate,
+    ).map_err(|e| Error::Ffmpeg(format!("resampler: {e}")))?;
+
+    let (codec_id, enc_fmt, enc_layout, out_ch, bit_rate) = match out {
+        AudioOut::AacStereo { bit_rate } =>
+            (ffmpeg::codec::Id::AAC, Sample::F32(Type::Planar), ChannelLayout::STEREO, 2usize, bit_rate),
+        AudioOut::Pcm24 { channels } =>
+            (ffmpeg::codec::Id::PCM_S24LE, Sample::I32(Type::Packed), ChannelLayout::default(channels), channels as usize, 0),
+    };
+    if mix.is_none() && out_ch != in_ch {
+        return Err(Error::Ffmpeg(format!("channel count {in_ch} → {out_ch} without a mix")));
+    }
+    let codec = ffmpeg::encoder::find(codec_id)
+        .ok_or_else(|| Error::Ffmpeg(format!("no encoder for {codec_id:?}")))?;
+    let mut octx = ffmpeg::format::output(&out_path)
+        .map_err(|e| Error::Ffmpeg(format!("open output {out_path:?}: {e}")))?;
+    let global_header = octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER);
+    let (ost_idx, mut encoder) = {
+        let mut ost = octx.add_stream(codec)
+            .map_err(|e| Error::Ffmpeg(format!("add stream: {e}")))?;
+        let mut enc = ffmpeg::codec::context::Context::from_parameters(ost.parameters())
+            .map_err(|e| Error::Ffmpeg(format!("encoder params: {e}")))?
+            .encoder().audio()
+            .map_err(|e| Error::Ffmpeg(format!("audio encoder: {e}")))?;
+        enc.set_rate(rate as i32);
+        enc.set_format(enc_fmt);
+        enc.set_channel_layout(enc_layout);
+        enc.set_time_base((1, rate as i32));
+        if bit_rate > 0 { enc.set_bit_rate(bit_rate); }
+        if global_header { enc.set_flags(ffmpeg::codec::Flags::GLOBAL_HEADER); }
+        let encoder = enc.open_as(codec)
+            .map_err(|e| Error::Ffmpeg(format!("open encoder {codec_id:?}: {e}")))?;
+        ost.set_parameters(&encoder);
+        (ost.index(), encoder)
+    };
+    octx.write_header().map_err(|e| Error::Ffmpeg(format!("write_header: {e}")))?;
+    let ost_tb = octx.stream(ost_idx).unwrap().time_base();
+    let enc_tb = ffmpeg::Rational(1, rate as i32);
+    let frame_size = match encoder.frame_size() { 0 => 4096, n => n as usize };
+
+    // Interleaved f32 output samples waiting to be framed.
+    let mut pending: Vec<f32> = Vec::with_capacity(frame_size * out_ch * 4);
+    let mut written: u64 = 0;
+    let mut packet = ffmpeg::Packet::empty();
+    let mut drain = |encoder: &mut ffmpeg::encoder::Audio, octx: &mut ffmpeg::format::context::Output| -> Result<()> {
+        while encoder.receive_packet(&mut packet).is_ok() {
+            packet.set_stream(ost_idx);
+            packet.rescale_ts(enc_tb, ost_tb);
+            packet.write_interleaved(octx)
+                .map_err(|e| Error::Ffmpeg(format!("write audio packet: {e}")))?;
+        }
+        Ok(())
+    };
+    let mut emit = |pending: &mut Vec<f32>, flush: bool, encoder: &mut ffmpeg::encoder::Audio,
+                    octx: &mut ffmpeg::format::context::Output, written: &mut u64| -> Result<()> {
+        while pending.len() >= frame_size * out_ch || (flush && !pending.is_empty()) {
+            let n = (pending.len() / out_ch).min(frame_size);
+            let mut frame = ffmpeg::frame::Audio::new(enc_fmt, frame_size, enc_layout);
+            frame.set_rate(rate);
+            frame.set_pts(Some(*written as i64));
+            // Plane access through the raw pointers: ffmpeg sets only
+            // `linesize[0]` for planar audio, so `data_mut(c > 0)` is empty.
+            match enc_fmt {
+                Sample::F32(Type::Planar) => {
+                    for c in 0..out_ch {
+                        // SAFETY: `Audio::new` allocated `frame_size` samples per plane.
+                        let plane = unsafe {
+                            std::slice::from_raw_parts_mut((*frame.as_mut_ptr()).data[c] as *mut f32, frame_size)
+                        };
+                        for i in 0..frame_size {
+                            plane[i] = if i < n { pending[i * out_ch + c] } else { 0.0 };
+                        }
+                    }
+                }
+                _ => {
+                    // SAFETY: packed — one plane of `frame_size × out_ch` samples.
+                    let plane = unsafe {
+                        std::slice::from_raw_parts_mut((*frame.as_mut_ptr()).data[0] as *mut i32, frame_size * out_ch)
+                    };
+                    for i in 0..frame_size * out_ch {
+                        plane[i] = if i < n * out_ch {
+                            (pending[i].clamp(-1.0, 1.0) as f64 * 2_147_483_647.0) as i32
+                        } else { 0 };
+                    }
+                }
+            }
+            // PCM takes any frame length; AAC wants full frames — a padded
+            // last frame is at most 1023 samples (21 ms) of silence.
+            if frame_size != 4096 || n == frame_size { frame.set_samples(frame_size); } else { frame.set_samples(n); }
+            encoder.send_frame(&frame).map_err(|e| Error::Ffmpeg(format!("send_frame: {e}")))?;
+            drain(encoder, octx)?;
+            *written += n as u64;
+            pending.drain(..n * out_ch);
+        }
+        Ok(())
+    };
+
+    let tb_s = src_tb.numerator() as f64 / src_tb.denominator().max(1) as f64;
+    let win_end = dur_s.map(|d| offset_s + d);
+    let mut decoded = ffmpeg::frame::Audio::empty();
+    let mut f32_frame = ffmpeg::frame::Audio::empty();
+    let mut push = |f: &ffmpeg::frame::Audio, pending: &mut Vec<f32>| {
+        let n = f.samples();
+        let bytes = &f.data(0)[..n * in_ch * 4];
+        let src: &[f32] = bytemuck::cast_slice(bytes);
+        match mix {
+            Some(m) => for i in 0..n {
+                let s = &src[i * 4..i * 4 + 4];
+                for row in m.iter() {
+                    pending.push(row[0] * s[0] + row[1] * s[1] + row[2] * s[2] + row[3] * s[3]);
+                }
+            },
+            None => pending.extend_from_slice(src),
+        }
+    };
+    for (stream, pkt) in ictx.packets() {
+        if stream.index() != stream_index { continue; }
+        let t = pkt.pts().or(pkt.dts()).unwrap_or(0) as f64 * tb_s;
+        if t < offset_s - 0.05 { continue; }
+        if let Some(end) = win_end { if t >= end { break; } }
+        if decoder.send_packet(&pkt).is_err() { continue; }
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            if to_f32.run(&decoded, &mut f32_frame).is_ok() && f32_frame.samples() > 0 {
+                push(&f32_frame, &mut pending);
+            }
+        }
+        emit(&mut pending, false, &mut encoder, &mut octx, &mut written)?;
+    }
+    let _ = decoder.send_eof();
+    while decoder.receive_frame(&mut decoded).is_ok() {
+        if to_f32.run(&decoded, &mut f32_frame).is_ok() && f32_frame.samples() > 0 {
+            push(&f32_frame, &mut pending);
+        }
+    }
+    if to_f32.flush(&mut f32_frame).is_ok() && f32_frame.samples() > 0 {
+        push(&f32_frame, &mut pending);
+    }
+    emit(&mut pending, true, &mut encoder, &mut octx, &mut written)?;
+    encoder.send_eof().map_err(|e| Error::Ffmpeg(format!("send_eof: {e}")))?;
+    drain(&mut encoder, &mut octx)?;
+    octx.write_trailer().map_err(|e| Error::Ffmpeg(format!("write_trailer: {e}")))?;
+    Ok(written)
+}
+
+/// Decode the X6's 4-channel 360° Audio (first-order AmbiX) to a
+/// front-facing stereo AAC `.m4a` — see [`FOA_STEREO_MATRIX`]. The whole
+/// track when `dur_s` is `None`, so the caller can keep muxing with the
+/// source's trim offsets. Returns the number of samples written.
+pub fn foa_to_stereo_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Option<f64>, bit_rate: usize) -> Result<u64> {
+    let info = probe_foa_aac(input)?
+        .ok_or_else(|| Error::Ffmpeg(format!("no 4-channel AAC (360° Audio) track in {input:?}")))?;
+    let n = transcode_audio_window(
+        input, info.stream_index, output_m4a, offset_s, dur_s,
+        Some(&FOA_STEREO_MATRIX), AudioOut::AacStereo { bit_rate },
+    )?;
+    tracing::info!(m4a = %output_m4a.display(), samples = n, sample_rate = info.sample_rate,
+        "X6 360° Audio: decoded first-order AmbiX to a front-facing stereo AAC");
+    Ok(n)
 }
 
 /// Pick the most useful audio stream in `path` — first non-attached-pic
@@ -459,4 +734,25 @@ pub fn mux_video_with_audio_stream(
         "mux complete — video + audio passthrough"
     );
     Ok(a_packets)
+}
+
+#[cfg(test)]
+mod foa_tests {
+    use super::*;
+
+    #[test]
+    fn frontal_source_is_centred_and_left_source_favours_left() {
+        // SN3D plane wave from the front: W = 1, X = 1, Y = Z = 0.
+        let [l, r] = foa_to_stereo_sample([1.0, 0.0, 0.0, 1.0]);
+        assert!((l - r).abs() < 1e-6 && (l - 0.853_553).abs() < 1e-4, "{l} {r}");
+        // From the left (+Y): the left cardioid is on axis, the right one at 90°.
+        let [l, r] = foa_to_stereo_sample([1.0, 1.0, 0.0, 0.0]);
+        assert!(l > r && (l - 0.853_553).abs() < 1e-4 && (r - 0.146_447).abs() < 1e-4, "{l} {r}");
+        // From straight above: both cardioids see only W.
+        let [l, r] = foa_to_stereo_sample([1.0, 0.0, 1.0, 0.0]);
+        assert!((l - 0.5).abs() < 1e-6 && (r - 0.5).abs() < 1e-6);
+        // From behind: the pair is 135° off axis — attenuated, still centred.
+        let [l, r] = foa_to_stereo_sample([1.0, 0.0, 0.0, -1.0]);
+        assert!((l - r).abs() < 1e-6 && l < 0.2, "{l} {r}");
+    }
 }

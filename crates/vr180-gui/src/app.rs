@@ -712,6 +712,8 @@ fn tr(en: &'static str) -> &'static str {
         "Still format" => "照片格式",
         "Still photo — no timeline" => "静态照片——没有时间线",
         "Restart preview" => "重启预览",
+        "Recorded in 360° Audio: first-order ambisonics (AmbiX). A plain copy plays lopsided, so Stereo decodes a front-facing pair from it." => "以 360° 音频录制：一阶 Ambisonics（AmbiX）。直接拷贝播放会左右失衡，所以立体声是从它解码出的朝前声像对。",
+        "Stereo AAC decoded from the ambisonics (virtual cardioids ±45°, camera front) — universal." => "由 Ambisonics 解码的立体声 AAC（±45° 虚拟心形，以相机正前为准）——通用。",
         "Shared by X6 video and stills — one camera, one eye alignment." => "X6 视频与照片共用——同一台机器，同一个双眼错位。",
         "Still photo — use Export for the full-size file" => "静态照片——请用导出获得全尺寸文件",
         "DNG output: the 3D LUT, sharpening and automatic eye matching cannot travel as DNG metadata — hidden, and not applied to the preview." => "DNG 输出：3D LUT、锐化和自动眼间匹配无法作为 DNG 元数据保存——已隐藏，预览中也不应用。",
@@ -1062,6 +1064,9 @@ struct ClipInfo {
     /// has no GEOC. The ".360 Lens calibration" panel displays cx/cy in
     /// this pixel space (matching CTRX/CTRY units).
     eac_cal_dim: Option<u32>,
+    /// Insta360 X6 recorded in "360° Audio" mode: the source carries a
+    /// 4-channel first-order AmbiX track (so the Audio section applies).
+    foa_audio: bool,
 }
 
 /// An async clip load in flight (see `App::load_pending`). The worker
@@ -1098,6 +1103,9 @@ struct LoadedMeta {
     fisheye_eye_w: u32,
     fisheye_eye_h: u32,
     eac_cal_dim: Option<u32>,
+    /// Insta360 X6 recorded in "360° Audio" mode: the source carries a
+    /// 4-channel first-order AmbiX track (so the Audio section applies).
+    foa_audio: bool,
 }
 
 impl App {
@@ -3177,13 +3185,18 @@ impl App {
             None
         };
 
+        // X6 "360° Audio": a 4-channel AmbiX AAC instead of stereo. Header
+        // read only; the worker is off the UI thread.
+        let foa_audio = source_kind == vr180_pipeline::SourceKind::Insta360Insv
+            && vr180_pipeline::audio::probe_foa_aac(&path).ok().flatten().is_some();
+        if foa_audio { tracing::info!("load: X6 360° Audio track (4-ch AmbiX) detected"); }
         Ok(LoadedMeta {
             token, path, preserve_clip_settings, source_kind,
             width: probe.width, height: probe.height, fps: probe.fps,
             duration_sec, frame_count, segments,
             cori_count, grav_count, srot_ms,
             detected_rs_mode, fisheye_eye_w, fisheye_eye_h,
-            eac_cal_dim,
+            eac_cal_dim, foa_audio,
         })
     }
 
@@ -3278,6 +3291,7 @@ impl App {
             source_kind,
             fisheye_eye_w: meta.fisheye_eye_w, fisheye_eye_h: meta.fisheye_eye_h,
             eac_cal_dim: meta.eac_cal_dim,
+            foa_audio: meta.foa_audio,
         });
         self.loaded_path = Some(meta.path);
 
@@ -4528,6 +4542,17 @@ impl eframe::App for App {
                     .default_open(true)
                     .show(ui, |ui| { self.draw_fisheye_output_panel(ui); });
 
+                    // X6 recorded in 360° Audio: its 4-channel AmbiX track
+                    // serves the same Stereo / Ambisonic / APAC choice as .360.
+                    if self.clip.as_ref().map_or(false, |c| c.foa_audio) {
+                        ui.add_space(4.0);
+                        egui::CollapsingHeader::new(
+                            RichText::new(tr("Audio")).strong()
+                        )
+                        .default_open(false)
+                        .show(ui, |ui| { self.draw_audio_panel(ui); });
+                    }
+
                     ui.add_space(4.0);
                     egui::CollapsingHeader::new(
                         RichText::new(tr("Fisheye lens")).strong()
@@ -5590,6 +5615,13 @@ impl App {
     /// Applies to export only — the live preview always plays stereo.
     fn draw_audio_panel(&mut self, ui: &mut egui::Ui) {
         use crate::decoder::AudioFormat as AF;
+        let x6 = self.clip.as_ref().map_or(false, |c| c.foa_audio);
+        if x6 {
+            ui.label(RichText::new(tr(
+                "Recorded in 360° Audio: first-order ambisonics (AmbiX). A plain copy plays \
+                 lopsided, so Stereo decodes a front-facing pair from it."
+            )).small().color(Color32::GRAY));
+        }
         let s = &mut self.settings;
         ui.horizontal(|ui| {
             ui.label(tr("Export track"));
@@ -5602,6 +5634,7 @@ impl App {
                 });
         });
         let hint = match s.audio_format {
+            AF::Stereo if x6 => tr("Stereo AAC decoded from the ambisonics (virtual cardioids ±45°, camera front) — universal."),
             AF::Stereo    => tr("Stereo AAC — universal compatibility."),
             AF::Ambisonic => tr("4-channel 1st-order ambisonic (AmbiX) + SA3D — \
                               YouTube VR / Quest head-track it."),
