@@ -32,6 +32,19 @@ import VideoToolbox
 import CoreMedia
 import CoreVideo
 
+// Build identity. `helpers/build_swift.sh` compiles this file as main.swift
+// next to a generated version.swift that defines HELPER_SOURCE_HASH (the
+// sha256 of this source) under `-D HELPER_VERSION_EMBEDDED`; a bare `swiftc`
+// build reports "unknown". `--version` lets the release script prove that a
+// bundled helper was built from the current source (`build_swift.sh --check`).
+#if !HELPER_VERSION_EMBEDDED
+let HELPER_SOURCE_HASH = "unknown"
+#endif
+if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "--version" {
+    print("mvhevc_encode \(HELPER_SOURCE_HASH)")
+    exit(0)
+}
+
 // MARK: - Argument parsing
 
 var perEyeW: Int = 0

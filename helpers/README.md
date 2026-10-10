@@ -25,6 +25,23 @@ Output binaries go to `helpers/bin/`, which is `.gitignore`d. The
 sources in `helpers/swift/` and `helpers/braw/` are committed; the
 binaries are not.
 
+### Keeping shipped helpers current
+
+Because the binaries are not in git, a release bundle could carry a
+helper built from older sources (it happened: the 2026-10-10 APAC fix).
+Three guards now close that gap:
+
+- Every Swift helper answers `--version` with `<name> <sha256 of its
+  source>` — the build script compiles the source as `main.swift` next to
+  a generated `version.swift` (`-D HELPER_VERSION_EMBEDDED`).
+- `./helpers/build_swift.sh --check DIR` compares a directory's helpers
+  against the current sources; `--install DIR` rebuilds and copies them.
+  `scripts/release_mac.sh` always installs fresh helpers and refuses to
+  continue on a mismatch.
+- `crates/vr180-gui/build.rs` runs the build script on macOS whenever a
+  helper source changes, so `helpers/bin/` (what the Dev bundles copy)
+  stays current after a plain `cargo build`.
+
 `braw_helper` is C++ (not Swift) because the Blackmagic RAW SDK ships
 only C++ headers. It links against the user's installed `Blackmagic
 RAW.framework` at build time (the SDK is not redistributable). Without

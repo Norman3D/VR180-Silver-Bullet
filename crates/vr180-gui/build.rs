@@ -12,6 +12,26 @@
 //! build-dependency on Windows hosts (`[target.'cfg(windows)'.build-dependencies]`)
 //! and the body below is `cfg`-gated to match.
 fn main() {
+    // macOS: keep the Swift helpers (`helpers/bin/*`, what the Dev bundles and
+    // the release script copy next to the app) built from the CURRENT
+    // sources. Reruns only when a helper source or the build script changes;
+    // a missing toolchain is a warning, never a failed build.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let script = root.join("helpers/build_swift.sh");
+        for f in ["apac_encode", "mvhevc_encode", "vt_denoise"] {
+            println!("cargo:rerun-if-changed={}", root.join("helpers/swift").join(format!("{f}.swift")).display());
+        }
+        println!("cargo:rerun-if-changed={}", script.display());
+        match std::process::Command::new("bash").arg(&script).output() {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => println!(
+                "cargo:warning=vr180-gui: Swift helpers NOT rebuilt ({}); helpers/bin may be stale: {}",
+                o.status, String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or("")
+            ),
+            Err(e) => println!("cargo:warning=vr180-gui: could not run helpers/build_swift.sh: {e}"),
+        }
+    }
     #[cfg(windows)]
     {
         // Re-run if the artwork changes so a new `icon.ico` is picked up.

@@ -856,9 +856,18 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    emits "High-Order Ambisonics, ACN/SN3D" with the samples intact (corr
    0.98–0.999 vs source for both X6 and GoPro). ffmpeg's CAF muxer does NOT
    write an HOA `chan` chunk for the ambisonic order (tried), hence the
-   label on the reader. Rebuild with `bash helpers/build_swift.sh`; the
-   Dev bundle keeps its own copy in Contents/MacOS. Both sources verified
-   through the real export path (2026-10-10).
+   label on the reader. Both sources verified through the real export
+   path (2026-10-10). **Helper staleness guard (same day):** every Swift
+   helper answers `--version` with its source sha256 (compiled as
+   main.swift + generated version.swift, `-D HELPER_VERSION_EMBEDDED`);
+   `helpers/build_swift.sh --check DIR` / `--install DIR`;
+   `crates/vr180-gui/build.rs` rebuilds helpers/bin on macOS when a source
+   changes; **`scripts/release_mac.sh` is now the release recipe** (build →
+   fresh helpers installed → Info.plist bump → dylibbundler → inside-out
+   Developer ID signing → verify incl. the helper check; `--notarize` adds
+   notarytool/staple/update-zip/DMG; manifest + upload stay manual). A Dev
+   bundle in the scratchpad keeps its own helper copies in Contents/MacOS —
+   copy from helpers/bin after a rebuild (and re-sign ad hoc).
    Open: the audio is NOT rotated to follow our stabilisation (Studio does);
    `.insv` recorded in Auto/Stereo modes are untouched.
 
