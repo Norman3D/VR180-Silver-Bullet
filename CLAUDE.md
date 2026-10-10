@@ -914,7 +914,18 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    dropped from the first kept packet's pts, the tail runs 0.1 s past the
    window. Verified: X6 export audio starts at exactly t_in (lag 0 vs the
    source, corr 0.999; before: the first packet after t_in, +10.7 ms), a 6 s
-   window renders in 68 ms; GoPro passthrough unchanged (offset = t_in).
+   window renders in 68 ms; GoPro passthrough unchanged (offset = t_in). **WINDOWS ARMS VERIFIED (2026-10-10, Windows box):** my explicit-muxer
+   open survived the edit; clip 059 through BOTH blind-edited arms (zc
+   readback = Libx265, GPU-resident = NVENC), trimmed at t_in = 5 s: the
+   audio starts at **+0 ms** (10 ms RMS-envelope cross-correlation vs the
+   source decoded around the window; corr 0.89) on both, 2-ch 48 kHz,
+   duration 2.005 s; the window is honoured — 101 376 samples decoded
+   (2 s + the 0.1 s edges) instead of 6.08 M, the zc export back from
+   14.2 s to 7.6 s. OSV stereo PASSTHROUGH on the zc arm with t_in = 2 s:
+   `offset 2.00s` applied, start **+10 ms** = AAC packet granularity, as
+   documented for passthrough. Export matrix byte-identical; untrimmed X6
+   output byte-identical to the pre-window run. Harness: the measurement
+   lives in scratchpad `ev/x6audio/lag.py`.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
