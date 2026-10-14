@@ -3668,8 +3668,8 @@ fn still_lens_calibs(
     // Kandao QooCam: the DNG IS the lens record's canvas, one 6944² half per
     // lens — the Kannala-Brandt record scaled to the preview size.
     if let Some(k) = &still.kandao {
-        let (a, b) = vr180_pipeline::kandao_imu::lens_pair_still(&k.lenses, stream_w, stream_h);
-        // `lens_pair_still` is (lens 1, lens 0); the still caller wants (left, right) = (lens 0, lens 1).
+        let (a, b) = vr180_pipeline::kandao_imu::lens_pair(&k.lenses, stream_w, stream_h);
+        // `lens_pair` is (lens 1, lens 0); the still caller wants (left, right) = (lens 0, lens 1).
         return (b, a);
     }
     let crop = still.crop.unwrap_or(vr180_fisheye::InsvWindowCrop {

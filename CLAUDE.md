@@ -912,17 +912,17 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      SBS half-equirect, frame 450 ↔ the app's 15.0 s render, dense DIS flow
      + a 6-parameter fit per eye): the model and the plain-scaled focal are
      right (f −0.05 % / +0.28 %, residual 0.8 / 1.1 px median at every
-     radius) — but Studio places the VIDEO principal point
-     (+33.6, +11.6) / (+36.4, +13.8) stream px from the record's, a real
-     convention (6.5 px residual without it; half-field subsets agree):
-     `KANDAO_VIDEO_PP_OFFSET_CANVAS` = (63.3, 23.0) canvas px, applied by
-     `lens_pair_video` only. With it, a rotation alone (Studio's own
-     stabilization, 2–3°) explains Studio's render to 0.9 px (left) / 3.3 px
-     (right — Studio uses ≈1184 px/rad for BOTH eyes, 0.28 % above lens 1's
-     record; the app keeps the per-lens record focals). The still path
-     (`lens_pair_still`) keeps the record as is until a Studio photo export
-     settles it. (The earlier gyro self-calibration, −1.3 % / −30 px, was
-     wrong — parallax/degeneracy; don't self-calibrate handheld footage.)
+     radius). Studio places the VIDEO principal point (+33.6, +11.6) /
+     (+36.4, +13.8) stream px from the record's (6.5 px residual without
+     it; half-field subsets agree) and uses ≈1184 px/rad for BOTH eyes
+     (0.28 % above lens 1's record). **Neither is followed — the user's
+     decision (2026-10-14): Studio's calibration is sometimes unreliable,
+     do not match its visual output.** Video and stills both render from
+     the lens record as is (`lens_pair` / `stream_lens_calib`, plain
+     scaling, per-lens focals); the rig alignment is the user's Auto-align
+     / stereo offset. The Studio fit stays as evidence that the model FORM
+     is right. (The gyro self-calibration, −1.3 % / −30 px, was unreliable
+     too — parallax/degeneracy; don't self-calibrate handheld footage.)
    - **Eye order (measured)**: top half = LEFT eye, bottom = RIGHT; DNG
      left half = LEFT (near-field parallax residual after a far-field
      affine fit on the sample clips/DNGs). `lens_pair` puts lens 0 (top)

@@ -160,7 +160,7 @@ pub fn still_eye_calib(still: &X6Still, half: Half) -> Result<FisheyeCalib> {
         let idx = match half { Half::Left => 0u8, Half::Right => 1u8 };
         let lens = k.lenses.iter().find(|l| l.index == idx)
             .ok_or_else(|| Error::Ffmpeg(format!("QooCam DNG: no lens record for lens {idx}")))?;
-        let c = crate::kandao_imu::stream_lens_calib(lens, half_w, half_h, [0.0, 0.0]);
+        let c = crate::kandao_imu::stream_lens_calib(lens, half_w, half_h);
         let k4 = [c.k1.unwrap_or(0.0), c.k2.unwrap_or(0.0), c.k3.unwrap_or(0.0), c.k4.unwrap_or(0.0)];
         return Ok(FisheyeCalib::new_pure_kb(
             c.fx.unwrap_or(1.0), c.fy.unwrap_or(1.0),

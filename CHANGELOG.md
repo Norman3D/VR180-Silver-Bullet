@@ -39,11 +39,11 @@ file, stills, and the camera's own colour handling.
   the app mixes to stereo with the capsule weights and polarity Studio's
   low band shows (one capsule is inverted), at a level that keeps headroom
   without a limiter. Stereo is the only audio option for this camera.
-- **Calibration.** Verified against QooCam Studio's own VR180 export of
-  the sample clip: the lens model and the focal match Studio's render to
-  0.8 px across the whole eye; Studio places the video principal point
-  about 63 × 23 canvas px from the lens record's value, and the app now
-  does the same for video (stills keep the record).
+- **Calibration.** The lens model form was checked against QooCam
+  Studio's own VR180 export of the sample clip (0.8 px across the whole
+  eye once Studio's own principal-point shift is accounted for). The app
+  renders from the camera's lens record as written, for video and stills
+  alike; it does not copy Studio's adjustments.
 
 ## 2.5.2 — 2026-10-10
 
