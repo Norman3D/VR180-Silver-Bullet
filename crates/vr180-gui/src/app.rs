@@ -371,13 +371,35 @@ impl ExportResolution {
 }
 
 /// Per-eye size of a reframed export (the side-by-side frame is twice as
-/// wide): 1080 / 1440 / 2160 lines; the width follows the view's aspect.
+/// wide): 1080 / 1440 / 2160 lines for video; a STILL may also pick 3240
+/// (16:9 → 5760×3240 per eye) or, for the 1:1 view, 4320 (4320² per eye) —
+/// a photo renders from the native lens half, so the only cost is the file.
+/// The width follows the view's aspect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReframeSize { P1080, P1440, P2160 }
+enum ReframeSize { P1080, P1440, P2160, P3240, P4320 }
 
 impl ReframeSize {
     fn height(self) -> u32 {
-        match self { Self::P1080 => 1080, Self::P1440 => 1440, Self::P2160 => 2160 }
+        match self {
+            Self::P1080 => 1080, Self::P1440 => 1440, Self::P2160 => 2160,
+            Self::P3240 => 3240, Self::P4320 => 4320,
+        }
+    }
+    /// The sizes offered for a source: video stops at 2160 lines; a still
+    /// adds 3240 for both aspects and 4320 for the 1:1 view only (16:9 at
+    /// 4320 would be 7680×4320 per eye).
+    fn choices(is_still: bool, aspect: crate::decoder::ReframeAspect) -> &'static [ReframeSize] {
+        match (is_still, aspect) {
+            (false, _) => &[Self::P1080, Self::P1440, Self::P2160],
+            (true, crate::decoder::ReframeAspect::Wide) => &[Self::P1080, Self::P1440, Self::P2160, Self::P3240],
+            (true, crate::decoder::ReframeAspect::Square) => &[Self::P1080, Self::P1440, Self::P2160, Self::P3240, Self::P4320],
+        }
+    }
+    /// The size clamped to what `choices` offers for the source — a
+    /// still-only pick remembered from a photo must not size a video.
+    fn clamped(self, is_still: bool, aspect: crate::decoder::ReframeAspect) -> Self {
+        let allowed = Self::choices(is_still, aspect);
+        if allowed.contains(&self) { self } else { *allowed.last().unwrap_or(&Self::P2160) }
     }
     fn eye_dims(self, aspect: crate::decoder::ReframeAspect) -> (u32, u32) {
         let h = self.height();
@@ -1545,8 +1567,11 @@ impl App {
                 vr180_pipeline::fisheye_export::FisheyeExportProjection::Fisheye,
             crate::decoder::FisheyeOutputMode::Reframe => {
                 // The exact viewport at the chosen per-eye size and aspect
-                // (overrides the VR180 resolution targets above).
-                let (w, h) = opts.reframe_size.eye_dims(settings.reframe_aspect);
+                // (overrides the VR180 resolution targets above); the
+                // still-only sizes never reach a video export.
+                let (w, h) = opts.reframe_size
+                    .clamped(source_kind.is_still(), settings.reframe_aspect)
+                    .eye_dims(settings.reframe_aspect);
                 eye_w = w;
                 eye_h = h;
                 vr180_pipeline::fisheye_export::FisheyeExportProjection::Reframe {
@@ -4019,11 +4044,12 @@ impl App {
         if let Some(aspect) = reframe {
             // Reframed view: the exact viewport at a per-eye size.
             ui.label(RichText::new(tr("Per-eye size")).strong());
+            opts.reframe_size = opts.reframe_size.clamped(is_still, aspect);
             egui::ComboBox::from_id_source(format!("{id_prefix}_reframe_size"))
                 .selected_text(opts.reframe_size.label(aspect))
                 .width(260.0)
                 .show_ui(ui, |ui| {
-                    for sz in [ReframeSize::P1080, ReframeSize::P1440, ReframeSize::P2160] {
+                    for &sz in ReframeSize::choices(is_still, aspect) {
                         ui.selectable_value(&mut opts.reframe_size, sz, sz.label(aspect));
                     }
                 });
