@@ -3734,8 +3734,11 @@ fn run_still(
     let t_read = std::time::Instant::now();
     let mut still = x6dng::read(&cfg.path)
         .map_err(|e| anyhow::anyhow!("DNG read {}: {e}", cfg.path.display()))?;
-    if still.lenses.len() < 2 {
-        anyhow::bail!("DNG: no Insta360 lens calibration found in {}", cfg.path.display());
+    // Two factory lens entries: Insta360's UCM strings, or the QooCam's
+    // Kannala-Brandt record (`still.kandao`).
+    let kandao_lenses = still.kandao.as_ref().map_or(0, |k| k.lenses.len());
+    if still.lenses.len() < 2 && kandao_lenses < 2 {
+        anyhow::bail!("DNG: no factory lens calibration found in {}", cfg.path.display());
     }
     let params = RawParams::from(&still);
     let gain_maps = raw_develop::gain_maps_from(&still.gain_maps);

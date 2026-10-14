@@ -487,8 +487,9 @@ fn linear_dng_meta(still: &X6Still, l_max: f32, grade: Option<&GradeMeta>) -> Li
 pub fn export_still(device: Arc<Device>, cfg: &StillExportConfig, progress: StillProgress) -> Result<()> {
     progress("Reading DNG", 0.0);
     let still = x6dng::read(&cfg.source_path).map_err(|e| Error::Ffmpeg(format!("DNG read: {e}")))?;
-    if still.lenses.len() < 2 {
-        return Err(Error::Ffmpeg("DNG: no Insta360 lens calibration found".into()));
+    let kandao_lenses = still.kandao.as_ref().map_or(0, |k| k.lenses.len());
+    if still.lenses.len() < 2 && kandao_lenses < 2 {
+        return Err(Error::Ffmpeg("DNG: no factory lens calibration found".into()));
     }
     let half_w = still.width / 2;
     let half_h = still.height;
