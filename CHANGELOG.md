@@ -34,17 +34,16 @@ file, stills, and the camera's own colour handling.
   stereo offset is shared between the QooCam's video and stills, as for
   the X6.
 - **Audio.** The 4-channel track is the camera's raw microphone capsules
-  (not a sound field); playback and export mix it to stereo through a
-  provisional symmetric matrix (first pair left, second pair right). The
-  capsule placement is not published — a QooCam Studio stereo export of a
-  clip would let the exact mix be solved, as was done for the X6.
-- **Calibration note.** The video is treated as each 6944² lens half
-  scaled to 3840² (the file's crop/scale flags are the identity, as in
-  QooCam Studio). Self-calibration from the gyro on the sample clips
-  agrees with that to about 1 % in focal length and ~30 px in the
-  principal point's height, which is within what those measurements can
-  resolve on handheld footage; Auto-align and the stereo offset absorb the
-  remainder.
+  (not a sound field). QooCam Studio's stereo is not a linear mix of them
+  above ~400 Hz (a spectral process), so it cannot be reproduced exactly;
+  the app mixes to stereo with the capsule weights and polarity Studio's
+  low band shows (one capsule is inverted), at a level that keeps headroom
+  without a limiter. Stereo is the only audio option for this camera.
+- **Calibration.** Verified against QooCam Studio's own VR180 export of
+  the sample clip: the lens model and the focal match Studio's render to
+  0.8 px across the whole eye; Studio places the video principal point
+  about 63 × 23 canvas px from the lens record's value, and the app now
+  does the same for video (stills keep the record).
 
 ## 2.5.2 — 2026-10-10
 

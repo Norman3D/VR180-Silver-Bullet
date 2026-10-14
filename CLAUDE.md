@@ -907,10 +907,22 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      with `k5 = p = 0`, so no new shader branch. The record is in the
      photo canvas (13888×6944, lens 0 left / lens 1 right); the video eye
      is the half scaled by 3840/6944 (`kandao_imu::stream_lens_calib`), the
-     still is the canvas at scale 1. Gyro self-calibration on far-field
-     points put the video focal ~1.3 % and cy ~30 px off plain scaling,
-     but parallax / f–cy degeneracy on handheld clips limited it; plain
-     scaling (Studio's identity crop/scale) is what ships — ±1 % open.
+     still is the canvas at scale 1. **Verified against QooCam Studio's
+     VR180 export** of the sample clip (`KDOutput/…_Output.mp4`, 7680×3840
+     SBS half-equirect, frame 450 ↔ the app's 15.0 s render, dense DIS flow
+     + a 6-parameter fit per eye): the model and the plain-scaled focal are
+     right (f −0.05 % / +0.28 %, residual 0.8 / 1.1 px median at every
+     radius) — but Studio places the VIDEO principal point
+     (+33.6, +11.6) / (+36.4, +13.8) stream px from the record's, a real
+     convention (6.5 px residual without it; half-field subsets agree):
+     `KANDAO_VIDEO_PP_OFFSET_CANVAS` = (63.3, 23.0) canvas px, applied by
+     `lens_pair_video` only. With it, a rotation alone (Studio's own
+     stabilization, 2–3°) explains Studio's render to 0.9 px (left) / 3.3 px
+     (right — Studio uses ≈1184 px/rad for BOTH eyes, 0.28 % above lens 1's
+     record; the app keeps the per-lens record focals). The still path
+     (`lens_pair_still`) keeps the record as is until a Studio photo export
+     settles it. (The earlier gyro self-calibration, −1.3 % / −30 px, was
+     wrong — parallax/degeneracy; don't self-calibrate handheld footage.)
    - **Eye order (measured)**: top half = LEFT eye, bottom = RIGHT; DNG
      left half = LEFT (near-field parallax residual after a far-field
      affine fit on the sample clips/DNGs). `lens_pair` puts lens 0 (top)
@@ -948,15 +960,22 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      pitch-2 `GainMap` per CFA site per half so `raw_develop` applies them
      like the X6's; `still_eye_calib` / `still_lens_calibs` take the KB
      branch. 10-bit in a 16-bit container (black 64, white 1023), RGGB.
-   - **Audio**: the 4-channel AAC is the raw microphone capsules (all four
-     positively correlated — not AmbiX; Studio encodes ambisonics from
-     `mic_positions` itself). PROVISIONAL stereo = `KANDAO_QUAD_STEREO_MATRIX`
-     (ch0+ch1 → L, ch2+ch3 → R); the player and the export use it (never
-     the raw track; the Audio section stays hidden — no Ambisonic/APAC for
-     it). To fix for real: a QooCam Studio stereo export of a clip, then
-     solve the 4→2 matrix as was done for the X6. The player now takes
-     the matrix from the caller (`AudioPlayer::open_with_mix`) — the codec
-     alone cannot tell AmbiX from a mic array.
+   - **Audio**: the 4-channel AAC is the raw microphone capsules (not
+     AmbiX). Studio's stereo AND its ambisonic export (SA3D ACN/SN3D,
+     channel map [0,2,3,1] = W,Z,X,Y) are NOT linear in the capsules above
+     ~400 Hz (per-band R² 0.92 at 150–400 Hz, < 0.35 above; the lag between
+     windows wanders ±1 ms; +15–23 dB of level-dependent gain) — a spectral
+     process, so the X6-style exact solve is impossible and no ambisonic
+     encoder can be derived (the capsule geometry is not recoverable: GCC
+     lags ≤ 12 samples at correlation ≤ 0.12). What the low band does give:
+     capsule weights and polarity — channel 2 is inverted in every Studio
+     output. `KANDAO_QUAD_STEREO_MATRIX` = 2 × the 100–250 Hz fit
+     (L [0.575, 0.954, −1, 0.734], R [0.745, 0.816, −1, 0.855]); the player
+     and the export use it (never the raw track); the Audio section stays
+     hidden — Stereo only for this camera. The player takes the matrix
+     from the caller (`AudioPlayer::open_with_mix`) — the codec alone
+     cannot tell AmbiX from a mic array. Analysis scripts:
+     `$SP/qoo/kd/{fit_audio,diag_audio,lowband}.py`.
    - **GUI**: templates `"kandao"` / `"kandao_dng"`; the shared stereo
      offset is generic now (`SourceKind::stereo_sibling`); preset "Kandao
      QooCam 3 Ultra" appended LAST in `presets.rs` (index 7 = Custom is a

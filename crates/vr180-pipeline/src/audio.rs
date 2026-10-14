@@ -131,15 +131,19 @@ pub fn foa_to_stereo_sample(wyzx: [f32; 4]) -> [f32; 2] {
 
 /// Kandao QooCam 3 Ultra "4-channel" audio → stereo. The camera records its
 /// four microphone capsules as a plain 4-channel AAC (no sound-field
-/// encoding: all four channels correlate positively, unlike AmbiX, and the
-/// container carries no layout). PROVISIONAL mix, rows `[L, R]` over the
-/// decoded channel order: the first pair to the left, the second to the
-/// right, each at −6 dB — a symmetric guess pending a QooCam Studio stereo
-/// export to solve the real capsule placement against (the X6's matrix was
-/// derived that way). Documented in CLAUDE.md.
+/// encoding; the container carries no layout). Rows `[L, R]` over the
+/// decoded channel order, derived from QooCam Studio's own stereo export of
+/// the sample clip: Studio's chain is linear only below ~400 Hz (above it a
+/// spectral process — R² collapses to < 0.35 — so no matrix can reproduce
+/// it exactly, unlike the X6's), and a per-band complex fit of that band
+/// (R² 0.87) gives these capsule weights: channel 2 enters every Studio
+/// output INVERTED (polarity), channel 1 leans left, channels 0 and 3 lean
+/// right. Scaled ×2 (Studio adds ~+15 dB and limits; the app has no
+/// limiter, and ×2 keeps the sample clip's peaks under 0.9). Documented in
+/// CLAUDE.md.
 pub const KANDAO_QUAD_STEREO_MATRIX: [[f32; 4]; 2] = [
-    [0.5, 0.5, 0.0, 0.0],
-    [0.0, 0.0, 0.5, 0.5],
+    [1.150, 1.908, -2.000, 1.468],
+    [1.490, 1.632, -2.000, 1.710],
 ];
 
 /// One sample of the QooCam's four channels → `[L, R]` through

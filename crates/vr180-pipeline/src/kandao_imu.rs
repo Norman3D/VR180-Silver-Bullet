@@ -95,10 +95,26 @@ fn orthonormalize(m: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
     [x, y, z]
 }
 
+/// Where QooCam Studio puts the VIDEO principal point relative to the lens
+/// record's `(cx, cy)`, in canvas pixels — the same for both lenses.
+/// Measured against Studio's own VR180 export of the sample clip: a dense
+/// flow fit of Studio's half-equirect eyes against the app's rendering of
+/// the same frame (15,000 points per eye, every radius) leaves 0.8 / 1.1 px
+/// median residual only with the principal point moved by (+33.6, +11.6)
+/// (lens 0) and (+36.4, +13.8) (lens 1) stream px = (+60.7, +21.0) /
+/// (+65.8, +25.0) canvas px — 6.5 / 8.0 px with the record's values, and
+/// no focal or rotation makes up for it (half-field subsets agree to
+/// ±2 px). The focal needs no change (Studio: −0.05 % / +0.28 %). Whether
+/// the stills take the same offset is unknown (no Studio photo export yet),
+/// so the still path uses the record as is.
+pub const KANDAO_VIDEO_PP_OFFSET_CANVAS: [f32; 2] = [63.3, 23.0];
+
 /// One lens's calibration for a `stream_w × stream_h` eye: the canvas half
 /// scaled uniformly (the eye is square like the half; a non-square eye
-/// scales x and y separately).
-pub fn stream_lens_calib(lens: &KandaoLens, stream_w: u32, stream_h: u32) -> DjiLensCalib {
+/// scales x and y separately). `pp_offset_canvas` moves the principal point
+/// before scaling — [`KANDAO_VIDEO_PP_OFFSET_CANVAS`] for the video, zero
+/// for a still.
+pub fn stream_lens_calib(lens: &KandaoLens, stream_w: u32, stream_h: u32, pp_offset_canvas: [f32; 2]) -> DjiLensCalib {
     let half_w = lens.half_w().max(1) as f32;
     let half_h = lens.canvas_h.max(1) as f32;
     let sx = stream_w as f32 / half_w;
@@ -107,8 +123,8 @@ pub fn stream_lens_calib(lens: &KandaoLens, stream_w: u32, stream_h: u32) -> Dji
     DjiLensCalib {
         fx: Some(lens.focal * sx),
         fy: Some(lens.focal * sy),
-        cx: Some(px * sx),
-        cy: Some(py * sy),
+        cx: Some((px + pp_offset_canvas[0]) * sx),
+        cy: Some((py + pp_offset_canvas[1]) * sy),
         k1: Some(lens.k[0]),
         k2: Some(lens.k[1]),
         k3: Some(lens.k[2]),
@@ -125,13 +141,25 @@ pub fn stream_lens_calib(lens: &KandaoLens, stream_w: u32, stream_h: u32) -> Dji
 
 /// The two lenses as the stabilizer's `(lens_a, lens_b)` pair for a stacked
 /// video: `lens_b` = lens 0 = the TOP half (the LEFT eye with the user
-/// swap off, the resolvers' default), `lens_a` = lens 1 = the bottom. A
-/// file with fewer than two lens records gets the generic QooCam preset
-/// geometry (principal point at the eye centre).
-pub fn lens_pair(lenses: &[KandaoLens], stream_w: u32, stream_h: u32) -> (DjiLensCalib, DjiLensCalib) {
+/// swap off, the resolvers' default), `lens_a` = lens 1 = the bottom, with
+/// Studio's video principal-point offset applied. A file with fewer than
+/// two lens records gets the generic QooCam preset geometry (principal
+/// point at the eye centre).
+pub fn lens_pair_video(lenses: &[KandaoLens], stream_w: u32, stream_h: u32) -> (DjiLensCalib, DjiLensCalib) {
+    lens_pair(lenses, stream_w, stream_h, KANDAO_VIDEO_PP_OFFSET_CANVAS)
+}
+
+/// [`lens_pair_video`] for a still: the DNG is the record's own canvas, no
+/// offset. Returned as `(lens 1, lens 0)` like the video pair; the still
+/// callers want `(left, right)` = `(lens 0, lens 1)`.
+pub fn lens_pair_still(lenses: &[KandaoLens], stream_w: u32, stream_h: u32) -> (DjiLensCalib, DjiLensCalib) {
+    lens_pair(lenses, stream_w, stream_h, [0.0, 0.0])
+}
+
+fn lens_pair(lenses: &[KandaoLens], stream_w: u32, stream_h: u32, pp_offset_canvas: [f32; 2]) -> (DjiLensCalib, DjiLensCalib) {
     let pick = |i: u8| lenses.iter().find(|l| l.index == i).or_else(|| lenses.get(i as usize));
     match (pick(0), pick(1)) {
-        (Some(l0), Some(l1)) => (stream_lens_calib(l1, stream_w, stream_h), stream_lens_calib(l0, stream_w, stream_h)),
+        (Some(l0), Some(l1)) => (stream_lens_calib(l1, stream_w, stream_h, pp_offset_canvas), stream_lens_calib(l0, stream_w, stream_h, pp_offset_canvas)),
         _ => {
             tracing::warn!("kandao: {} lens record(s) in the file — using the generic QooCam 3 Ultra profile", lenses.len());
             (generic_lens_calib(stream_w, stream_h), generic_lens_calib(stream_w, stream_h))
@@ -164,7 +192,7 @@ pub const KANDAO_PRESET_NAME: &str = "Kandao QooCam 3 Ultra";
 /// Calibration-only IMU (no quats): enough to dewarp and seed the Override
 /// UI; stabilization stays identity.
 pub fn kandao_calib_only(meta: &KandaoMeta, stream_w: u32, stream_h: u32) -> DjiOsvImu {
-    let (lens_a, lens_b) = lens_pair(&meta.lenses, stream_w, stream_h);
+    let (lens_a, lens_b) = lens_pair_video(&meta.lenses, stream_w, stream_h);
     DjiOsvImu {
         lens_a,
         lens_b,
@@ -267,25 +295,32 @@ mod tests {
     #[test]
     fn stream_calib_scales_the_canvas_half() {
         let l1 = lens(1, 2134.94, 10416.16, 3465.44);
-        let c = stream_lens_calib(&l1, 3840, 3840);
+        let c = stream_lens_calib(&l1, 3840, 3840, [0.0, 0.0]);
         let s = 3840.0 / 6944.0;
         assert!((c.fx.unwrap() - 2134.94 * s).abs() < 1e-3);
         assert!((c.cx.unwrap() - (10416.16 - 6944.0) * s).abs() < 1e-3);
         assert!((c.cy.unwrap() - 3465.44 * s).abs() < 1e-3);
+        let cv = stream_lens_calib(&l1, 3840, 3840, KANDAO_VIDEO_PP_OFFSET_CANVAS);
+        assert!((cv.cx.unwrap() - (10416.16 - 6944.0 + 63.3) * s).abs() < 1e-3);
+        assert!((cv.cy.unwrap() - (3465.44 + 23.0) * s).abs() < 1e-3);
+        assert_eq!(cv.fx, c.fx);
         assert_eq!(c.k1, Some(-0.011315));
         assert_eq!(c.k5, Some(0.0));
         assert!(c.omni.is_none());
         // the still: scale 1
-        let c1 = stream_lens_calib(&l1, 6944, 6944);
+        let c1 = stream_lens_calib(&l1, 6944, 6944, [0.0, 0.0]);
         assert!((c1.cx.unwrap() - 3472.16).abs() < 1e-3 && (c1.fx.unwrap() - 2134.94).abs() < 1e-3);
     }
 
     #[test]
     fn lens_pair_puts_lens0_in_lens_b() {
-        let (a, b) = lens_pair(&[lens(0, 2142.13, 3458.49, 3479.25), lens(1, 2134.94, 10416.16, 3465.44)], 3840, 3840);
+        let (a, b) = lens_pair_video(&[lens(0, 2142.13, 3458.49, 3479.25), lens(1, 2134.94, 10416.16, 3465.44)], 3840, 3840);
         assert!((b.fx.unwrap() - 2142.13 * 3840.0 / 6944.0).abs() < 1e-3);
         assert!((a.fx.unwrap() - 2134.94 * 3840.0 / 6944.0).abs() < 1e-3);
-        let (a2, _) = lens_pair(&[], 3840, 3840);
+        assert!((b.cx.unwrap() - (3458.49 + 63.3) * 3840.0 / 6944.0).abs() < 1e-3);
+        let (_, b_still) = lens_pair_still(&[lens(0, 2142.13, 3458.49, 3479.25), lens(1, 2134.94, 10416.16, 3465.44)], 6944, 6944);
+        assert!((b_still.cx.unwrap() - 3458.49).abs() < 1e-3);
+        let (a2, _) = lens_pair_video(&[], 3840, 3840);
         assert_eq!(a2.cx, Some(1920.0));
     }
 
