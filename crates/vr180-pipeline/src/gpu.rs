@@ -297,10 +297,10 @@ struct ResolveDims {
     src_h: f32,
     out_w: f32,
     out_h: f32,
-    /// X offset of that rect within the source plane; 0 unless resolving one
-    /// eye of a side-by-side frame. Padded to two vec4s.
+    /// Offset of that rect within the source plane; 0 unless resolving one
+    /// eye of a side-by-side (`src_x0`) or stacked (`src_y0`) frame.
     src_x0: f32,
-    _p1: f32,
+    src_y0: f32,
     _p2: f32,
     _p3: f32,
     /// Source sample range expansion — see `yuv_range_constants`.
@@ -308,6 +308,8 @@ struct ResolveDims {
     y_off: f32,
     c_scale: f32,
     c_off: f32,
+    /// YCbCr→RGB coefficients — see `yuv_matrix_constants`.
+    yuv_mat: [f32; 4],
 }
 
 #[derive(Debug)]
@@ -2113,6 +2115,13 @@ struct FisheyeCalibUniforms {
     // range. See `yuv_range_constants`. The RGBA16 kernels declare only the
     // rows they read; a buffer larger than the WGSL struct is fine.
     yuv_range: [f32; 4],
+    // vec4 #9 — this eye's y offset in the source plane (a stacked
+    // top/bottom frame: the bottom eye starts at `src_h`), padded.
+    src_y0: f32, _p9a: f32, _p9b: f32, _p9c: f32,
+    // vec4 #10 — YCbCr→RGB matrix coefficients (r_v, g_u, g_v, b_u), see
+    // `yuv_matrix_constants`: BT.709 for every camera file except the
+    // QooCam's HLG BT.2020 stream.
+    yuv_mat: [f32; 4],
 }
 
 /// Range expansion for 10-bit samples stored in the top 10 bits of a
@@ -2131,6 +2140,19 @@ pub const YUV_RANGE_P010_LIMITED: [f32; 4] = [
 /// stream's `color_range == JPEG` tag; VideoToolbox hands such buffers back
 /// as `420f`/`xf20` with the codes untouched, so limited-range constants on
 /// them crush blacks and clip whites.
+/// YCbCr → RGB matrix coefficients `(r_v, g_u, g_v, b_u)` for
+/// `r = y + r_v·v`, `g = y + g_u·u + g_v·v`, `b = y + b_u·u` (u, v centred).
+pub const YUV_MAT_BT709: [f32; 4] = [1.5748, -0.1873, -0.4681, 1.8556];
+/// BT.2020 non-constant-luminance coefficients (Kr 0.2627, Kb 0.0593).
+pub const YUV_MAT_BT2020: [f32; 4] = [1.4746, -0.16455, -0.57135, 1.8814];
+
+/// The YCbCr matrix for a stream's `colorspace` tag: BT.2020 (NCL or CL —
+/// the CL case is treated as NCL) → [`YUV_MAT_BT2020`], anything else →
+/// BT.709, the convention every camera file in the catalog uses.
+pub fn yuv_matrix_constants(bt2020: bool) -> [f32; 4] {
+    if bt2020 { YUV_MAT_BT2020 } else { YUV_MAT_BT709 }
+}
+
 pub fn yuv_range_constants(bits: u8, full_range: bool) -> [f32; 4] {
     match (bits, full_range) {
         (8, false) => [255.0 / 219.0, -16.0 / 219.0, 255.0 / 224.0, -128.0 / 224.0],
@@ -2187,6 +2209,10 @@ pub struct FisheyeCalib {
     /// taps to the eye rect before offsetting (see the shader comment);
     /// the RGBA16 kernels are handed per-eye textures and ignore it.
     pub src_x0: f32,
+    /// Y offset of this eye's rect within the SOURCE PLANE, in luma pixels —
+    /// the stacked (top/bottom) counterpart of `src_x0`: the bottom eye of a
+    /// Kandao QooCam frame starts at `src_h`. Zero otherwise.
+    pub src_y0: f32,
     /// How the SOURCE samples are encoded, as `(y_scale, y_off, c_scale,
     /// c_off)` — the linear expansion the P010 kernels apply before the
     /// BT.709 matrix. Defaults to 10-bit-in-16 limited range (every camera
@@ -2194,6 +2220,10 @@ pub struct FisheyeCalib {
     /// and range tag via [`yuv_range_constants`]. Ignored by the RGBA16
     /// kernels, which receive already-converted textures.
     pub yuv_range: [f32; 4],
+    /// The YCbCr→RGB matrix the P010 kernels apply after the range
+    /// expansion — [`YUV_MAT_BT709`] unless the source is tagged BT.2020
+    /// (see [`yuv_matrix_constants`]). Ignored by the RGBA16 kernels.
+    pub yuv_mat: [f32; 4],
     /// KB → cubic-Hermite extension boundary (radians).
     pub theta_trans: f32,
     /// Cubic extension upper bound (radians).
@@ -2285,7 +2315,8 @@ impl FisheyeCalib {
             r_max, src_w, src_h,
             output_hfov_rad: std::f32::consts::FRAC_PI_2,
             proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
-            src_proj: 0.0, src_x0: 0.0, yuv_range: YUV_RANGE_P010_LIMITED,
+            src_proj: 0.0, src_x0: 0.0, src_y0: 0.0,
+            yuv_range: YUV_RANGE_P010_LIMITED, yuv_mat: YUV_MAT_BT709,
         }
     }
 
@@ -2323,7 +2354,8 @@ impl FisheyeCalib {
             src_w, src_h,
             output_hfov_rad: std::f32::consts::FRAC_PI_2,
             proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
-            src_proj: 0.0, src_x0: 0.0, yuv_range: YUV_RANGE_P010_LIMITED,
+            src_proj: 0.0, src_x0: 0.0, src_y0: 0.0,
+            yuv_range: YUV_RANGE_P010_LIMITED, yuv_mat: YUV_MAT_BT709,
         }
     }
 
@@ -2370,7 +2402,8 @@ impl FisheyeCalib {
             src_w, src_h,
             output_hfov_rad: std::f32::consts::FRAC_PI_2,
             proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
-            src_proj: 0.0, src_x0: 0.0, yuv_range: YUV_RANGE_P010_LIMITED,
+            src_proj: 0.0, src_x0: 0.0, src_y0: 0.0,
+            yuv_range: YUV_RANGE_P010_LIMITED, yuv_mat: YUV_MAT_BT709,
         }
     }
 
@@ -2428,6 +2461,8 @@ impl FisheyeCalibUniforms {
             s1: c.prism[0], s2: c.prism[1], s3: c.prism[2], s4: c.prism[3],
             proj_mode: c.proj_mode, defish_k: c.defish_k, edge_x: c.edge_x, edge_y: c.edge_y,
             yuv_range: c.yuv_range,
+            src_y0: c.src_y0, _p9a: 0.0, _p9b: 0.0, _p9c: 0.0,
+            yuv_mat: c.yuv_mat,
         }
     }
 }
@@ -3184,6 +3219,20 @@ impl Device {
         eye_h: u32,
         slot: u32,
     ) -> Result<(wgpu::Texture, wgpu::Texture)> {
+        self.split_pair_texture_16(full, eye_w, eye_h, slot, crate::source_kind::EyeLayout::SideBySide)
+    }
+
+    /// [`Self::split_sbs_texture_16`] for either single-stream layout: the
+    /// two eyes are copied out of `full` from the origins `layout` gives
+    /// them (side by side at `x = 0 / eye_w`, stacked at `y = 0 / eye_h`).
+    pub fn split_pair_texture_16(
+        &self,
+        full: &wgpu::Texture,
+        eye_w: u32,
+        eye_h: u32,
+        slot: u32,
+        layout: crate::source_kind::EyeLayout,
+    ) -> Result<(wgpu::Texture, wgpu::Texture)> {
         // Reuse the halves across frames (see `sbs_split_cache`) — the live
         // preview runs this on the decoder thread every frame. Per SLOT, so a
         // concurrent preview and export never share the pair.
@@ -3213,11 +3262,11 @@ impl Device {
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("sbs_split"),
         });
-        let mut copy = |dst: &wgpu::Texture, src_x: u32| {
+        let mut copy = |dst: &wgpu::Texture, (src_x, src_y): (u32, u32)| {
             enc.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: full, mip_level: 0,
-                    origin: wgpu::Origin3d { x: src_x, y: 0, z: 0 },
+                    origin: wgpu::Origin3d { x: src_x, y: src_y, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
                 wgpu::TexelCopyTextureInfo {
@@ -3228,8 +3277,8 @@ impl Device {
                 wgpu::Extent3d { width: eye_w, height: eye_h, depth_or_array_layers: 1 },
             );
         };
-        copy(&left, 0);
-        copy(&right, eye_w);
+        copy(&left, layout.eye_origin(0, eye_w, eye_h));
+        copy(&right, layout.eye_origin(1, eye_w, eye_h));
         self.queue.submit(Some(enc.finish()));
         Ok((left, right))
     }
@@ -6006,17 +6055,21 @@ impl Device {
     /// (the side-by-side preview resolves each eye from its `src_x0` sub-rect
     /// of the whole-frame planes into these same two slots; the side-by-side
     /// export samples P010 directly and does not resolve at all).
-    /// `src_w`/`src_h` describe the rect being resolved and `src_x0` its x
-    /// offset in the plane — 0 for a whole frame or a per-eye texture.
-    /// `yuv_range` is the source's sample encoding (`yuv_range_constants`);
-    /// dual-stream callers pass `YUV_RANGE_P010_LIMITED`.
+    /// `src_w`/`src_h` describe the rect being resolved and `(src_x0,
+    /// src_y0)` its origin in the plane — 0 for a whole frame or a per-eye
+    /// texture, the eye's origin for one eye of a side-by-side / stacked
+    /// frame. `yuv_range` is the source's sample encoding
+    /// (`yuv_range_constants`) and `yuv_mat` its matrix
+    /// (`yuv_matrix_constants`); dual-stream callers pass
+    /// `YUV_RANGE_P010_LIMITED` / `YUV_MAT_BT709`.
     pub fn resolve_p010_planes_to_rgba16(
         &self,
         y_tex: &wgpu::Texture,
         uv_tex: &wgpu::Texture,
         src_w: u32, src_h: u32,
-        src_x0: u32,
+        src_x0: u32, src_y0: u32,
         yuv_range: [f32; 4],
+        yuv_mat: [f32; 4],
         out_w: u32, out_h: u32,
         slot: u32,
     ) -> Result<wgpu::Texture> {
@@ -6053,8 +6106,9 @@ impl Device {
         let dims = self.write_uniform("p010_resolve_planes_dims", &ResolveDims {
             src_w: src_w as f32, src_h: src_h as f32,
             out_w: out_w as f32, out_h: out_h as f32,
-            src_x0: src_x0 as f32, _p1: 0.0, _p2: 0.0, _p3: 0.0,
+            src_x0: src_x0 as f32, src_y0: src_y0 as f32, _p2: 0.0, _p3: 0.0,
             y_scale: yuv_range[0], y_off: yuv_range[1], c_scale: yuv_range[2], c_off: yuv_range[3],
+            yuv_mat,
         });
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("p010_resolve_planes_bg"),
@@ -9065,9 +9119,14 @@ mod reframe_tests {
         assert!((u.defish_k - 2.0).abs() < 1e-6);
         assert!((u.edge_x - 2.0 * (45.0f32.to_radians() / 2.0).tan()).abs() < 1e-5);
         assert!((u.edge_y - u.edge_x * 9.0 / 16.0).abs() < 1e-5);
-        assert_eq!(std::mem::size_of::<FisheyeCalibUniforms>(), 36 * 4);
+        // 11 vec4s: the nine the shaders always read plus the stacked
+        // y-offset row and the YCbCr matrix row (P010 kernels only).
+        assert_eq!(std::mem::size_of::<FisheyeCalibUniforms>(), 44 * 4);
         let plain = FisheyeCalibUniforms::from_public(FisheyeCalib::new(1000.0, 1000.0, 960.0, 960.0, [0.0; 4], 1920.0, 1920.0, 900.0));
         assert_eq!(plain.proj_mode, 0.0);
+        assert_eq!((plain.src_x0, plain.src_y0), (0.0, 0.0));
+        assert_eq!(plain.yuv_mat, YUV_MAT_BT709);
+        assert_eq!(yuv_matrix_constants(true), YUV_MAT_BT2020);
     }
 }
 

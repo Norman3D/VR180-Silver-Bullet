@@ -44,13 +44,18 @@ struct FisheyeCalibUniforms {
     proj_mode: f32, defish_k: f32, edge_x: f32, edge_y: f32,  // vec4 #7: reframed-view output (proj_mode 1 → k-projection; 0 → half-equirect)
     // vec4 #8 — source sample range expansion (y_scale, y_off, c_scale, c_off).
     yuv_range: vec4<f32>,
+    // vec4 #9 — this eye's y offset in the plane (stacked top/bottom frames).
+    src_y0: f32, _p9a: f32, _p9b: f32, _p9c: f32,
+    // vec4 #10 — YCbCr→RGB coefficients (r_v, g_u, g_v, b_u): BT.709 or BT.2020.
+    yuv_mat: vec4<f32>,
 }
 @group(0) @binding(5) var<uniform> cal: FisheyeCalibUniforms;
 
 const PI: f32 = 3.14159265359;
 const HALF_PI: f32 = 1.57079632679;
 
-// BT.709 YUV → RGB. The range expansion — P010 with 10 bits in the top of 16,
+// YUV → RGB with the matrix from `cal.yuv_mat` (BT.709, or BT.2020 for a
+// stream tagged so). The range expansion — P010 with 10 bits in the top of 16,
 // or NV12 in 8 bits, limited or full range — comes from `cal.yuv_range`
 // (see `yuv_range_constants` in gpu.rs); only the matrix lives here.
 fn yuv_to_rgb_bt709_p010(y: f32, u: f32, v: f32) -> vec3<f32> {
@@ -60,9 +65,9 @@ fn yuv_to_rgb_bt709_p010(y: f32, u: f32, v: f32) -> vec3<f32> {
     let y_l = y * cal.yuv_range.x + cal.yuv_range.y;
     let u_l = u * cal.yuv_range.z + cal.yuv_range.w;
     let v_l = v * cal.yuv_range.z + cal.yuv_range.w;
-    let r = y_l + 1.5748 * v_l;
-    let g = y_l - 0.1873 * u_l - 0.4681 * v_l;
-    let b = y_l + 1.8556 * u_l;
+    let r = y_l + cal.yuv_mat.x * v_l;
+    let g = y_l + cal.yuv_mat.y * u_l + cal.yuv_mat.z * v_l;
+    let b = y_l + cal.yuv_mat.w * u_l;
     return clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
@@ -238,10 +243,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let plane_uv = vec2<f32>(textureDimensions(fisheye_uv));
     let y_px  = clamp(stream_xy + vec2<f32>(0.5),
                       vec2<f32>(0.5), vec2<f32>(sw - 0.5, sh - 0.5))
-              + vec2<f32>(cal.src_x0, 0.0);
+              + vec2<f32>(cal.src_x0, cal.src_y0);
     let uv_px = clamp(stream_xy * 0.5 + vec2<f32>(0.5),
                       vec2<f32>(0.5), vec2<f32>(sw * 0.5 - 0.5, sh * 0.5 - 0.5))
-              + vec2<f32>(cal.src_x0 * 0.5, 0.0);
+              + vec2<f32>(cal.src_x0 * 0.5, cal.src_y0 * 0.5);
     let y_uv  = y_px / plane_y;
     let uv_uv = uv_px / plane_uv;
 

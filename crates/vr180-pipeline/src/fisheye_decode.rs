@@ -28,6 +28,7 @@
 //! BILINEAR scaler set to RGBA.
 
 use crate::decode::{init as ffmpeg_init, HwDecode, DecodePath};
+use crate::source_kind::EyeLayout;
 use crate::{Error, Result};
 use std::path::Path;
 
@@ -343,6 +344,12 @@ pub struct SbsFisheyeIter {
     /// Frames-per-second from the stream metadata. Used to convert
     /// PTS ticks to seconds when the packet stream lacks pts info.
     time_base_s: f64,
+    /// How the frame packs its two eyes: side by side (the generic SBS
+    /// file) or stacked top/bottom (Kandao QooCam).
+    layout: EyeLayout,
+    /// Stream `colorspace` tag is BT.2020 → swscale inverts with the 2020
+    /// matrix (the QooCam's HLG stream).
+    bt2020: bool,
 }
 
 impl std::fmt::Debug for SbsFisheyeIter {
@@ -368,6 +375,15 @@ impl SbsFisheyeIter {
     /// or 16 (RGBA64LE, what the export's 10-bit arms consume).
     pub fn new_with_bit_depth(
         path: &Path, hw: HwDecode, frame_limit: u32, output_bit_depth: u8,
+    ) -> Result<Self> {
+        Self::new_with_layout(path, hw, frame_limit, output_bit_depth, EyeLayout::SideBySide)
+    }
+
+    /// [`SbsFisheyeIter::new_with_bit_depth`] for either single-stream
+    /// layout: `TopBottom` splits each frame into its upper (left eye) and
+    /// lower (right eye) halves instead of left/right.
+    pub fn new_with_layout(
+        path: &Path, hw: HwDecode, frame_limit: u32, output_bit_depth: u8, layout: EyeLayout,
     ) -> Result<Self> {
         if output_bit_depth != 8 && output_bit_depth != 16 {
             return Err(Error::Ffmpeg(format!(
@@ -465,6 +481,10 @@ impl SbsFisheyeIter {
         // SAFETY: read-only access to a POD field of AVCodecParameters.
         let full_range = unsafe { (*video.parameters().as_ptr()).color_range }
             == ffmpeg_next::ffi::AVColorRange::AVCOL_RANGE_JPEG;
+        // SAFETY: read-only access to a POD field of AVCodecParameters.
+        let bt2020 = matches!(unsafe { (*video.parameters().as_ptr()).color_space },
+            ffmpeg_next::ffi::AVColorSpace::AVCOL_SPC_BT2020_NCL
+            | ffmpeg_next::ffi::AVColorSpace::AVCOL_SPC_BT2020_CL);
         #[cfg(target_os = "macos")]
         let vt_range_ok = {
             let par = video.parameters();
@@ -547,13 +567,12 @@ impl SbsFisheyeIter {
 
         let frame_w = decoder.width();
         let frame_h = decoder.height();
-        if frame_w % 2 != 0 {
+        if !layout.split_axis_ok(frame_w, frame_h) || frame_w == 0 || frame_h == 0 {
             return Err(Error::Ffmpeg(format!(
-                "SBS frame width {frame_w} must be even for L/R split"
+                "{layout:?} frame {frame_w}x{frame_h} not splittable (the split axis must be even)"
             )));
         }
-        let eye_w = frame_w / 2;
-        let eye_h = frame_h;
+        let (eye_w, eye_h) = layout.eye_dims(frame_w, frame_h);
 
         Ok(Self {
             ictx, video_idx, decoder, scaler: None, scaler_def: None,
@@ -563,6 +582,8 @@ impl SbsFisheyeIter {
             frame_limit, frames_yielded: 0,
             output_bit_depth,
             time_base_s,
+            layout,
+            bt2020,
         })
     }
 }
@@ -710,10 +731,14 @@ impl SbsFisheyeIter {
         // A pixel-FORMAT change is the intended rebuild (it is the hwaccel
         // falling back to software) and is safe, because the split does not
         // depend on format.
-        if frame_w != self.eye_w * 2 || frame_h != self.eye_h {
+        let (exp_w, exp_h) = match self.layout {
+            EyeLayout::SideBySide => (self.eye_w * 2, self.eye_h),
+            EyeLayout::TopBottom => (self.eye_w, self.eye_h * 2),
+        };
+        if frame_w != exp_w || frame_h != exp_h {
             return Err(Error::Ffmpeg(format!(
-                "SBS frame changed size mid-stream: expected {}x{}, got {}x{}",
-                self.eye_w * 2, self.eye_h, frame_w, frame_h
+                "{:?} frame changed size mid-stream: expected {}x{}, got {}x{}",
+                self.layout, exp_w, exp_h, frame_w, frame_h
             )));
         }
         let src_def = (decoded.format(), frame_w, frame_h);
@@ -751,7 +776,7 @@ impl SbsFisheyeIter {
                 // path sat much closer to a 601 reference (mean 0.45) than a
                 // 709 one (mean 1.51) before this line.
                 let s = self.scaler.as_mut().unwrap();
-                set_sws_colorspace_details(s, is_16bit, self.full_range);
+                set_sws_colorspace_details_mat(s, is_16bit, self.full_range, self.bt2020);
                 s
             }
         };
@@ -768,14 +793,31 @@ impl SbsFisheyeIter {
         let bpp = if is_16bit { 8 } else { 4 };
         let mut left = Vec::with_capacity(eye_w * eye_h * bpp);
         let mut right = Vec::with_capacity(eye_w * eye_h * bpp);
-        for y in 0..eye_h {
-            let row_start = y * stride;
-            // Each row is 2*eye_w pixels = 2*eye_w*bpp bytes.
-            let left_start = row_start;
-            let left_end = row_start + eye_w * bpp;
-            let right_end = row_start + 2 * eye_w * bpp;
-            left.extend_from_slice(&data[left_start..left_end]);
-            right.extend_from_slice(&data[left_end..right_end]);
+        match self.layout {
+            EyeLayout::SideBySide => {
+                for y in 0..eye_h {
+                    let row_start = y * stride;
+                    // Each row is 2*eye_w pixels = 2*eye_w*bpp bytes.
+                    let left_start = row_start;
+                    let left_end = row_start + eye_w * bpp;
+                    let right_end = row_start + 2 * eye_w * bpp;
+                    left.extend_from_slice(&data[left_start..left_end]);
+                    right.extend_from_slice(&data[left_end..right_end]);
+                }
+            }
+            EyeLayout::TopBottom => {
+                // Stacked: the top `eye_h` rows are the left eye, the next
+                // `eye_h` the right — whole rows, no horizontal split.
+                let row_bytes = eye_w * bpp;
+                for y in 0..eye_h {
+                    let s = y * stride;
+                    left.extend_from_slice(&data[s..s + row_bytes]);
+                }
+                for y in eye_h..2 * eye_h {
+                    let s = y * stride;
+                    right.extend_from_slice(&data[s..s + row_bytes]);
+                }
+            }
         }
         Ok((left, right))
     }
@@ -1652,6 +1694,20 @@ pub struct VtSharedSbsFrame {
     /// Sample range expansion for these planes — `yuv_range_constants(depth,
     /// full_range)` of the source. Consumers copy it into the calib / resolve.
     pub yuv_range: [f32; 4],
+    /// YCbCr→RGB coefficients for these planes — `yuv_matrix_constants` of
+    /// the stream's colorspace tag (BT.2020 for the QooCam's HLG stream).
+    pub yuv_mat: [f32; 4],
+    /// How the two eyes sit in the frame; `eye_origin` gives each one's
+    /// `(x0, y0)` for the kernels' `src_x0` / `src_y0`.
+    pub layout: EyeLayout,
+}
+
+#[cfg(target_os = "macos")]
+impl VtSharedSbsFrame {
+    /// Origin of eye `idx` (0 = left, 1 = right) in the wrapped planes.
+    pub fn eye_origin(&self, idx: u32) -> (u32, u32) {
+        self.layout.eye_origin(idx, self.eye_w, self.eye_h)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1705,6 +1761,10 @@ pub struct VtSharedSbsIter {
     bit_depth: u8,
     /// `yuv_range_constants(bit_depth, color_range == JPEG)`.
     yuv_range: [f32; 4],
+    /// `yuv_matrix_constants(colorspace is BT.2020)`.
+    yuv_mat: [f32; 4],
+    /// Side by side or stacked top/bottom.
+    layout: EyeLayout,
 }
 
 #[cfg(target_os = "macos")]
@@ -1805,6 +1865,14 @@ impl VtSharedSbsIter {
     /// software decode; this path has no download, so the trade does not
     /// apply. Do not remove the gate from `SbsFisheyeIter` either.
     pub fn new(path: &Path) -> Result<Self> {
+        Self::new_with_layout(path, EyeLayout::SideBySide)
+    }
+
+    /// [`VtSharedSbsIter::new`] for either single-stream layout — stacked
+    /// (top/bottom) frames are sampled in place too, the bottom eye at
+    /// `src_y0 = eye_h`. The split axis must be a multiple of four so the
+    /// seam never cuts a chroma pair (same reasoning as the width rule).
+    pub fn new_with_layout(path: &Path, layout: EyeLayout) -> Result<Self> {
         ffmpeg_init();
         if std::env::var_os("VR180_NO_HW_DECODE").is_some() {
             return Err(Error::Ffmpeg(
@@ -1853,6 +1921,11 @@ impl VtSharedSbsIter {
         let full_range = unsafe { (*par.as_ptr()).color_range }
             == ffmpeg_next::ffi::AVColorRange::AVCOL_RANGE_JPEG;
         let yuv_range = crate::gpu::yuv_range_constants(depth as u8, full_range);
+        // SAFETY: read-only access to a POD field of AVCodecParameters.
+        let bt2020 = matches!(unsafe { (*par.as_ptr()).color_space },
+            ffmpeg_next::ffi::AVColorSpace::AVCOL_SPC_BT2020_NCL
+            | ffmpeg_next::ffi::AVColorSpace::AVCOL_SPC_BT2020_CL);
+        let yuv_mat = crate::gpu::yuv_matrix_constants(bt2020);
 
         let time_base = video.time_base();
         let time_base_s = time_base.numerator() as f64 / time_base.denominator().max(1) as f64;
@@ -1877,15 +1950,20 @@ impl VtSharedSbsIter {
         // place from the shared 4:2:0 planes, so an odd eye width would put
         // the seam through the middle of a chroma pair that both eyes then
         // share — no clamp can make that column right for either eye.
-        if fw % 4 != 0 || fh % 2 != 0 || fw == 0 || fh == 0 {
+        let splittable = match layout {
+            EyeLayout::SideBySide => fw % 4 == 0 && fh % 2 == 0,
+            EyeLayout::TopBottom => fh % 4 == 0 && fw % 2 == 0,
+        };
+        if !splittable || fw == 0 || fh == 0 {
             return Err(Error::Ffmpeg(format!(
-                "SBS frame {fw}x{fh} not splittable in place (width must be a multiple of 4, height even)")));
+                "{layout:?} frame {fw}x{fh} not splittable in place (the split axis must be a multiple of 4, the other even)")));
         }
-        let (eye_w, eye_h) = (fw / 2, fh);
+        let (eye_w, eye_h) = layout.eye_dims(fw, fh);
         tracing::info!(
-            "VtSharedSbsIter: {fw}x{fh} SBS (native {eye_w}x{eye_h} per eye), \
-             {depth}-bit {} range, VideoToolbox {} IOSurface zero-copy",
+            "VtSharedSbsIter: {fw}x{fh} {layout:?} (native {eye_w}x{eye_h} per eye), \
+             {depth}-bit {} range, {} matrix, VideoToolbox {} IOSurface zero-copy",
             if full_range { "full" } else { "limited" },
+            if bt2020 { "BT.2020" } else { "BT.709" },
             if depth == 8 { "NV12" } else { "P010" });
         Ok(Self {
             ictx, video_idx, decoder,
@@ -1896,6 +1974,8 @@ impl VtSharedSbsIter {
             skip_until_s: None,
             bit_depth: depth as u8,
             yuv_range,
+            yuv_mat,
+            layout,
         })
     }
 
@@ -2022,6 +2102,8 @@ impl VtSharedSbsIter {
                 eye_w: self.eye_w, eye_h: self.eye_h,
                 pts_s,
                 yuv_range: self.yuv_range,
+                yuv_mat: self.yuv_mat,
+                layout: self.layout,
             }));
         }
     }
@@ -2233,11 +2315,14 @@ impl std::fmt::Debug for SharedEacPair {
 #[cfg(target_os = "windows")]
 pub struct SharedSbsFrame {
     pub tex: crate::interop_windows::D3d11SharedTexture,
-    /// Native PER-EYE dims (frame is `2·eye_w × eye_h`).
+    /// Native PER-EYE dims (frame is `2·eye_w × eye_h` side by side, or
+    /// `eye_w × 2·eye_h` stacked).
     pub eye_w: u32,
     pub eye_h: u32,
     /// Presentation timestamp in seconds, `0.0` if unknown.
     pub pts_s: f64,
+    /// Side by side or stacked — the consumer's split (`split_pair_texture_16`).
+    pub layout: EyeLayout,
 }
 
 // SAFETY: identical reasoning to `SharedFisheyePair` — the COM interfaces are
@@ -2287,6 +2372,8 @@ pub struct D3d11SharedSbsIter {
     skip_until_s: Option<f64>,
     /// Stream `color_range == JPEG`; selects the expansion constants.
     full_range: bool,
+    /// Side by side or stacked top/bottom.
+    layout: EyeLayout,
 }
 
 #[cfg(target_os = "windows")]
@@ -2303,7 +2390,7 @@ impl std::fmt::Debug for D3d11SharedSbsIter {
 impl D3d11SharedSbsIter {
     /// Native-resolution (no downscale) — what the export wants.
     pub fn new(path: &Path, adapter_luid: Option<[u8; 8]>) -> Result<Self> {
-        Self::new_with_work(path, u32::MAX, u32::MAX, adapter_luid)
+        Self::new_with_layout(path, u32::MAX, u32::MAX, adapter_luid, EyeLayout::SideBySide)
     }
 
     /// `work_w`/`work_h` are the PER-EYE working dims, clamped to native
@@ -2315,6 +2402,19 @@ impl D3d11SharedSbsIter {
         work_w: u32,
         work_h: u32,
         adapter_luid: Option<[u8; 8]>,
+    ) -> Result<Self> {
+        Self::new_with_layout(path, work_w, work_h, adapter_luid, EyeLayout::SideBySide)
+    }
+
+    /// [`D3d11SharedSbsIter::new_with_work`] for either single-stream
+    /// layout: a stacked frame converts to `work_w × 2·work_h` and the
+    /// consumer splits it top/bottom.
+    pub fn new_with_layout(
+        path: &Path,
+        work_w: u32,
+        work_h: u32,
+        adapter_luid: Option<[u8; 8]>,
+        layout: EyeLayout,
     ) -> Result<Self> {
         ffmpeg_init();
         let ictx = ffmpeg_next::format::input(path)
@@ -2370,11 +2470,11 @@ impl D3d11SharedSbsIter {
         let decoder = codec_ctx.decoder().video()
             .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?;
         let (fw, fh) = (decoder.width(), decoder.height());
-        if fw % 2 != 0 || fw == 0 || fh == 0 {
+        if !layout.split_axis_ok(fw, fh) || fw == 0 || fh == 0 {
             return Err(Error::Ffmpeg(format!(
-                "SBS frame {fw}x{fh} not splittable (width must be even)")));
+                "{layout:?} frame {fw}x{fh} not splittable (the split axis must be even)")));
         }
-        let (native_eye_w, native_eye_h) = (fw / 2, fh);
+        let (native_eye_w, native_eye_h) = layout.eye_dims(fw, fh);
         let eye_w = work_w.clamp(2, native_eye_w);
         let eye_h = work_h.clamp(2, native_eye_h);
         tracing::info!(
@@ -2389,6 +2489,7 @@ impl D3d11SharedSbsIter {
             time_base_s, dt_s,
             skip_until_s: None,
             full_range,
+            layout,
         })
     }
 
@@ -2445,9 +2546,13 @@ impl D3d11SharedSbsIter {
                 self.skip_until_s = None;
             }
 
+            let (full_w, full_h) = match self.layout {
+                EyeLayout::SideBySide => (self.eye_w * 2, self.eye_h),
+                EyeLayout::TopBottom => (self.eye_w, self.eye_h * 2),
+            };
             let tex = unsafe {
                 crate::interop_windows::share_eye_converted(
-                    &decoded, &mut self.converter, self.eye_w * 2, self.eye_h,
+                    &decoded, &mut self.converter, full_w, full_h,
                     self.full_range)
             }
             .ok_or_else(|| Error::Ffmpeg("zero-copy SBS: convert failed".into()))?;
@@ -2457,7 +2562,7 @@ impl D3d11SharedSbsIter {
             // GPU has not finished writing (reads as black / torn).
             unsafe { tex.wait_gpu_idle(); }
             return Ok(Some(SharedSbsFrame {
-                tex, eye_w: self.eye_w, eye_h: self.eye_h, pts_s,
+                tex, eye_w: self.eye_w, eye_h: self.eye_h, pts_s, layout: self.layout,
             }));
         }
     }
@@ -3547,13 +3652,27 @@ fn set_sws_colorspace_details(
     is_16bit: bool,
     full_range: bool,
 ) {
+    set_sws_colorspace_details_mat(scaler, is_16bit, full_range, false)
+}
+
+/// [`set_sws_colorspace_details`] with the source matrix chosen: BT.2020
+/// (NCL) for a stream tagged so (the Kandao QooCam's HLG), else Rec.709 —
+/// the same choice the zero-copy kernels make through
+/// `yuv_matrix_constants`.
+fn set_sws_colorspace_details_mat(
+    scaler: &mut ffmpeg_next::software::scaling::Context,
+    is_16bit: bool,
+    full_range: bool,
+    bt2020: bool,
+) {
     use ffmpeg_next::ffi::*;
     unsafe {
         // sws_getCoefficients returns a [4]int32 with the Y'CbCr
         // matrix coefficients for a given colorspace constant.
-        // SWS_CS_ITU709 (= 1) → Rec.709 coefficients.
+        // SWS_CS_ITU709 (= 1) → Rec.709 coefficients; SWS_CS_BT2020 (= 9).
         const SWS_CS_ITU709: std::os::raw::c_int = 1;
-        let src_coeffs = sws_getCoefficients(SWS_CS_ITU709);
+        const SWS_CS_BT2020: std::os::raw::c_int = 9;
+        let src_coeffs = sws_getCoefficients(if bt2020 { SWS_CS_BT2020 } else { SWS_CS_ITU709 });
         let dst_coeffs = sws_getCoefficients(SWS_CS_ITU709);
         // sws_setColorspaceDetails(ctx, inv_table, src_range, table,
         //                          dst_range, brightness, contrast,

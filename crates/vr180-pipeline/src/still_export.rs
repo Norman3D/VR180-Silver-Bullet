@@ -113,12 +113,13 @@ impl StillLensOverride {
     /// preset name wins, else the X6 preset — exactly as the video resolvers.
     pub fn from_export_cfg(cfg: &crate::fisheye_export::FisheyeExportConfig) -> [Option<Self>; 2] {
         use vr180_fisheye::presets;
+        let auto_name = if cfg.source_kind.is_kandao() { crate::kandao_imu::KANDAO_PRESET_NAME } else { "Insta360 X6" };
         let preset = if !cfg.fisheye_preset.is_empty() && cfg.fisheye_preset != "Auto" {
             presets::find(&cfg.fisheye_preset)
         } else {
             None
         }
-        .or_else(|| presets::find("Insta360 X6"))
+        .or_else(|| presets::find(auto_name))
         .unwrap_or(&presets::presets()[7]);
         let preset_k = [preset.calib.k[0] as f32, preset.calib.k[1] as f32,
                         preset.calib.k[2] as f32, preset.calib.k[3] as f32];
@@ -153,6 +154,20 @@ pub type StillProgress<'a> = &'a (dyn Fn(&str, f32) + Sync);
 pub fn still_eye_calib(still: &X6Still, half: Half) -> Result<FisheyeCalib> {
     let half_w = still.width / 2;
     let half_h = still.height;
+    // Kandao QooCam: the DNG is the lens record's canvas — the
+    // Kannala-Brandt entry of this half at scale 1 (`k5 = p = 0`).
+    if let Some(k) = &still.kandao {
+        let idx = match half { Half::Left => 0u8, Half::Right => 1u8 };
+        let lens = k.lenses.iter().find(|l| l.index == idx)
+            .ok_or_else(|| Error::Ffmpeg(format!("QooCam DNG: no lens record for lens {idx}")))?;
+        let c = crate::kandao_imu::stream_lens_calib(lens, half_w, half_h);
+        let k4 = [c.k1.unwrap_or(0.0), c.k2.unwrap_or(0.0), c.k3.unwrap_or(0.0), c.k4.unwrap_or(0.0)];
+        return Ok(FisheyeCalib::new_pure_kb(
+            c.fx.unwrap_or(1.0), c.fy.unwrap_or(1.0),
+            c.cx.unwrap_or(half_w as f32 * 0.5), c.cy.unwrap_or(half_h as f32 * 0.5),
+            k4, half_w as f32, half_h as f32,
+        ));
+    }
     let entry = still
         .lenses
         .get(match half { Half::Left => 0, Half::Right => 1 })

@@ -558,7 +558,9 @@ fn one_pass_audio_eligible(cfg: &FisheyeExportConfig) -> bool {
     match cfg.source_kind {
         // Sources with a 4-channel ambisonic track: SA3D / APAC need the
         // post-encode steps; their Stereo export muxes inline (the X6's
-        // from a decoded stereo temp — `stereo_audio_source`).
+        // from a decoded stereo temp — `stereo_audio_source`). The Kandao
+        // QooCam's 4-channel track is its raw microphones, not a sound
+        // field: it only ever exports the decoded stereo temp, inline.
         SourceKind::GoProEac | SourceKind::Insta360Insv =>
             matches!(cfg.audio_track, AudioTrack::Stereo),
         _ => true,
@@ -577,6 +579,21 @@ fn one_pass_audio_eligible(cfg: &FisheyeExportConfig) -> bool {
 /// the rendered temp.
 fn stereo_audio_source(cfg: &FisheyeExportConfig, t_in: f64, dur_s: f64) -> (PathBuf, Option<PathBuf>, f64) {
     let (src, tmp) = eac_audio_source(cfg);
+    if cfg.source_kind == SourceKind::KandaoQoocam {
+        // Four raw microphone channels (`audio::KANDAO_QUAD_STEREO_MATRIX`)
+        // → a stereo AAC temp for the export window, like the X6 below.
+        if let Ok(Some(_)) = crate::audio::probe_foa_aac(&src) {
+            let out = video_only_temp_path(&cfg.output_path).with_extension("quad_stereo.m4a");
+            match crate::audio::quad_to_stereo_aac(&src, &out, t_in, Some(dur_s), 192_000) {
+                Ok(_) => {
+                    if let Some(t) = tmp { std::fs::remove_file(t).ok(); }
+                    return (out.clone(), Some(out), 0.0);
+                }
+                Err(e) => tracing::warn!(
+                    "QooCam 4-channel audio → stereo decode failed ({e}); muxing the track as is"),
+            }
+        }
+    }
     if cfg.source_kind == SourceKind::Insta360Insv {
         if let Ok(Some(_)) = crate::audio::probe_foa_aac(&src) {
             let out = video_only_temp_path(&cfg.output_path).with_extension("foa_stereo.m4a");
@@ -605,6 +622,13 @@ fn finalize_fisheye_audio(
     if cfg.source_kind == SourceKind::Insta360Insv {
         return finalize_eac_audio(cfg, video_tmp, offset_s, dur_s);
     }
+    if cfg.source_kind == SourceKind::KandaoQoocam {
+        // Always the decoded stereo temp (never the raw 4-channel track).
+        let (audio_src, audio_tmp, off) = stereo_audio_source(cfg, offset_s, dur_s);
+        let r = finalize_with_audio(&audio_src, video_tmp, &cfg.output_path, off, dur_s);
+        if let Some(p) = &audio_tmp { std::fs::remove_file(p).ok(); }
+        return r;
+    }
     // Multi-segment: the audio source is an ffconcat playlist so a merged
     // recording keeps its FULL audio (source_path alone = segment 0 only).
     let (audio_src, audio_tmp) = eac_audio_source(cfg);
@@ -631,8 +655,8 @@ pub(crate) fn fisheye_export_opener(
             // arm above: the 10-bit arms project from RGBA64LE pairs, and an
             // 8-bit pair there overran `write_texture` (SBS 10-bit exports
             // failed with a wgpu validation error).
-            SourceKind::SbsFisheye => Box::new(
-                SbsFisheyeIter::new_with_bit_depth(p, crate::decode::HwDecode::Auto, 0, bd)?),
+            SourceKind::SbsFisheye | SourceKind::KandaoQoocam => Box::new(
+                SbsFisheyeIter::new_with_layout(p, crate::decode::HwDecode::Auto, 0, bd, kind.eye_layout())?),
             SourceKind::BlackmagicRaw => {
                 let info = vr180_braw::BrawInfo::probe(p)
                     .map_err(|e| Error::Ffmpeg(format!("braw probe: {e}")))?;
@@ -668,6 +692,9 @@ fn chain_segment_frames(path: &std::path::Path, fps: f32) -> usize {
 fn resolve_export_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
     if cfg.source_kind == SourceKind::Insta360Insv {
         return resolve_export_insv_imu(cfg);
+    }
+    if cfg.source_kind == SourceKind::KandaoQoocam {
+        return resolve_export_kandao_imu(cfg);
     }
     if cfg.source_kind != SourceKind::DjiOsv { return None; }
     if let Some(arc) = &cfg.preloaded_imu {
@@ -742,6 +769,33 @@ fn resolve_export_insv_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::D
     })
 }
 
+/// Kandao QooCam: the boxes after `moov` are small — reuse the GUI's cached
+/// IMU when it has what we need, else read them and fuse the gyro here.
+fn resolve_export_kandao_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
+    if let Some(arc) = &cfg.preloaded_imu {
+        if !cfg.stabilize || !arc.frame_quats.is_empty() {
+            return Some((**arc).clone());
+        }
+    }
+    let path = cfg.segments.first().unwrap_or(&cfg.source_path);
+    let meta = match vr180_fisheye::kandao::read_kandao_meta(path, cfg.stabilize) {
+        Ok(m) => m,
+        Err(e) => { tracing::warn!("kandao boxes: {e}"); return None; }
+    };
+    let probe = crate::decode::probe_video(path).ok();
+    let (w, h) = probe.as_ref()
+        .map(|p| crate::source_kind::EyeLayout::TopBottom.eye_dims(p.width, p.height))
+        .unwrap_or((3840, 3840));
+    let n_frames = probe.as_ref()
+        .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+        .unwrap_or(0);
+    Some(if cfg.stabilize {
+        crate::kandao_imu::build_kandao_imu(&meta, cfg.fps, n_frames, w, h)
+    } else {
+        crate::kandao_imu::kandao_calib_only(&meta, w, h)
+    })
+}
+
 pub fn export_fisheye(
     pipeline: Arc<Device>,
     mut cfg: FisheyeExportConfig,
@@ -804,7 +858,7 @@ fn export_fisheye_inner(
         // `DenoisingZeroCopyIter::new` takes a `ZeroCopyDualStreamFisheyeIter`
         // by value; multi-segment because `new_segmented` is dual-stream-only
         // and a merged SBS would silently export just segment 0.
-        let sbs_zero_copy_ok = cfg.source_kind == SourceKind::SbsFisheye
+        let sbs_zero_copy_ok = cfg.source_kind.is_single_stream_pair()
             && cfg.segments.len() <= 1
             && cfg.denoise_strength <= 0.0;
         let can_zero_copy_decode = (cfg.source_kind.is_dual_stream() || sbs_zero_copy_ok)
@@ -819,7 +873,8 @@ fn export_fisheye_inner(
             // so probe it HERE and fall through to the portable loop on Err —
             // never `?`, which would abort an otherwise-valid export.
             let sbs_iter = if sbs_zero_copy_ok {
-                match crate::fisheye_decode::VtSharedSbsIter::new(&cfg.source_path) {
+                match crate::fisheye_decode::VtSharedSbsIter::new_with_layout(
+                    &cfg.source_path, cfg.source_kind.eye_layout()) {
                     Ok(it) => Some(it),
                     Err(e) => {
                         tracing::info!(
@@ -944,8 +999,9 @@ fn export_fisheye_inner(
             // The d3d11va decoder must land on the SAME adapter wgpu chose.
             let luid = ctx.as_ref()
                 .and_then(crate::interop_windows::vulkan_device_luid);
-            let iter = if cfg.source_kind == SourceKind::SbsFisheye {
-                crate::fisheye_decode::D3d11SharedSbsIter::new(&cfg.source_path, luid)
+            let iter = if cfg.source_kind.is_single_stream_pair() {
+                crate::fisheye_decode::D3d11SharedSbsIter::new_with_layout(
+                    &cfg.source_path, u32::MAX, u32::MAX, luid, cfg.source_kind.eye_layout())
                     .map(crate::fisheye_decode::ZcFisheyeSource::Sbs)
             } else {
                 // OSV swap-by-default ⊕ user override (matches preview + CPU
@@ -1084,7 +1140,7 @@ fn export_fisheye_inner(
     };
     let stab_rotations: Option<Vec<EquirectRotation>> = if cfg.stabilize {
         match cfg.source_kind {
-            SourceKind::DjiOsv | SourceKind::Insta360Insv => {
+            SourceKind::DjiOsv | SourceKind::Insta360Insv | SourceKind::KandaoQoocam => {
                 dji_osv_imu.as_ref().and_then(|osv| {
                     // Slider=0 → legacy camera-lock (∞ cap, no
                     // smoothing). User-set values activate the cap /
@@ -2882,10 +2938,14 @@ fn export_fisheye_osv_zerocopy_p010(
                 // and OSV/X6 now render through identical code.
                 let (cal_l, cal_r) = {
                     let (mut l, mut r) = (calib_left, calib_right);
-                    l.src_x0 = 0.0;
-                    r.src_x0 = f.eye_w as f32;
+                    let (lx, ly) = f.eye_origin(0);
+                    let (rx, ry) = f.eye_origin(1);
+                    l.src_x0 = lx as f32; l.src_y0 = ly as f32;
+                    r.src_x0 = rx as f32; r.src_y0 = ry as f32;
                     l.yuv_range = f.yuv_range;
                     r.yuv_range = f.yuv_range;
+                    l.yuv_mat = f.yuv_mat;
+                    r.yuv_mat = f.yuv_mat;
                     (l, r)
                 };
                 let (y, uv) = (&f.frame_y.texture, &f.frame_uv.texture);
@@ -3290,7 +3350,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
                 ),
                 ZcFisheyeFrame::Sbs(f) => {
                     let full = unsafe { ctx.import_rgba16(&pipeline.device, &f.tex) };
-                    pipeline.split_sbs_texture_16(&full, f.eye_w, f.eye_h, 33)?
+                    pipeline.split_pair_texture_16(&full, f.eye_w, f.eye_h, 33, f.layout)?
                 }
             };
 
@@ -3841,6 +3901,8 @@ pub(crate) fn resolve_calib_pair(
             SourceKind::DjiOsv        => "DJI Osmo 360",
             SourceKind::Insta360Insv
             | SourceKind::Insta360Dng => "Insta360 X6",
+            SourceKind::KandaoQoocam
+            | SourceKind::KandaoDng   => crate::kandao_imu::KANDAO_PRESET_NAME,
             SourceKind::BlackmagicRaw => "Blackmagic Pyxis 12K",
             _                         => "Custom",
         };
@@ -3864,7 +3926,7 @@ pub(crate) fn resolve_calib_pair(
     // For OSV, prefer the per-lens protobuf calibration. After the DJI
     // iter's default swap: left = Lens B, right = Lens A.
     let (calib_l, calib_r) = match (cfg.source_kind, osv) {
-        (SourceKind::DjiOsv | SourceKind::Insta360Insv, Some(imu)) => {
+        (SourceKind::DjiOsv | SourceKind::Insta360Insv | SourceKind::KandaoQoocam, Some(imu)) => {
             let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
             let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
             let eye = |lens: &vr180_fisheye::DjiLensCalib,

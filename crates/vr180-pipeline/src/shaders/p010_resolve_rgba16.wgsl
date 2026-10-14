@@ -25,13 +25,16 @@
 @group(0) @binding(2) var smp: sampler;
 @group(0) @binding(3) var out_tex: texture_storage_2d<rgba16unorm, write>;
 
-// src_w/src_h = the EYE (or whole frame) being resolved; src_x0 = its x
-// offset in the plane (0 unless resolving one eye of a side-by-side frame).
+// src_w/src_h = the EYE (or whole frame) being resolved; (src_x0, src_y0) =
+// its origin in the plane (0 unless resolving one eye of a side-by-side or
+// stacked frame).
 struct Dims {
     src_w: f32, src_h: f32, out_w: f32, out_h: f32,
-    src_x0: f32, _p1: f32, _p2: f32, _p3: f32,
+    src_x0: f32, src_y0: f32, _p2: f32, _p3: f32,
     // source sample range expansion (see `yuv_range_constants` in gpu.rs)
     y_scale: f32, y_off: f32, c_scale: f32, c_off: f32,
+    // YCbCr→RGB coefficients (r_v, g_u, g_v, b_u) — see `yuv_matrix_constants`.
+    yuv_mat: vec4<f32>,
 }
 @group(0) @binding(4) var<uniform> d: Dims;
 
@@ -48,9 +51,9 @@ fn yuv_to_rgb_bt709_p010(y: f32, u: f32, v: f32) -> vec3<f32> {
     let y_l = y * d.y_scale + d.y_off;
     let u_l = u * d.c_scale + d.c_off;
     let v_l = v * d.c_scale + d.c_off;
-    let r = y_l + 1.5748 * v_l;
-    let g = y_l - 0.1873 * u_l - 0.4681 * v_l;
-    let b = y_l + 1.8556 * u_l;
+    let r = y_l + d.yuv_mat.x * v_l;
+    let g = y_l + d.yuv_mat.y * u_l + d.yuv_mat.z * v_l;
+    let b = y_l + d.yuv_mat.w * u_l;
     return clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
@@ -81,10 +84,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // side-by-side plane, ClampToEdge alone would blend the other eye.
             let y_px  = clamp(sxy + vec2<f32>(0.5),
                               vec2<f32>(0.5), vec2<f32>(d.src_w - 0.5, d.src_h - 0.5))
-                      + vec2<f32>(d.src_x0, 0.0);
+                      + vec2<f32>(d.src_x0, d.src_y0);
             let uv_px = clamp(sxy * 0.5 + vec2<f32>(0.5),
                               vec2<f32>(0.5), vec2<f32>(d.src_w * 0.5 - 0.5, d.src_h * 0.5 - 0.5))
-                      + vec2<f32>(d.src_x0 * 0.5, 0.0);
+                      + vec2<f32>(d.src_x0 * 0.5, d.src_y0 * 0.5);
             let y_uv  = y_px / vec2<f32>(textureDimensions(src_y));
             let uv_uv = uv_px / vec2<f32>(textureDimensions(src_uv));
             let yv  = textureSampleLevel(src_y,  smp, y_uv,  0.0).r;

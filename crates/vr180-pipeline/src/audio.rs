@@ -129,6 +129,35 @@ pub fn foa_to_stereo_sample(wyzx: [f32; 4]) -> [f32; 2] {
     ]
 }
 
+/// Kandao QooCam 3 Ultra "4-channel" audio → stereo. The camera records its
+/// four microphone capsules as a plain 4-channel AAC (no sound-field
+/// encoding: all four channels correlate positively, unlike AmbiX, and the
+/// container carries no layout). PROVISIONAL mix, rows `[L, R]` over the
+/// decoded channel order: the first pair to the left, the second to the
+/// right, each at −6 dB — a symmetric guess pending a QooCam Studio stereo
+/// export to solve the real capsule placement against (the X6's matrix was
+/// derived that way). Documented in CLAUDE.md.
+pub const KANDAO_QUAD_STEREO_MATRIX: [[f32; 4]; 2] = [
+    [0.5, 0.5, 0.0, 0.0],
+    [0.0, 0.0, 0.5, 0.5],
+];
+
+/// One sample of the QooCam's four channels → `[L, R]` through
+/// [`KANDAO_QUAD_STEREO_MATRIX`].
+#[inline]
+pub fn quad_to_stereo_sample(ch: [f32; 4]) -> [f32; 2] {
+    mix_sample(&KANDAO_QUAD_STEREO_MATRIX, ch)
+}
+
+/// One sample through a `[L, R] × 4` mixing matrix.
+#[inline]
+pub fn mix_sample(m: &[[f32; 4]; 2], ch: [f32; 4]) -> [f32; 2] {
+    [
+        m[0][0] * ch[0] + m[0][1] * ch[1] + m[0][2] * ch[2] + m[0][3] * ch[3],
+        m[1][0] * ch[0] + m[1][1] * ch[1] + m[1][2] * ch[2] + m[1][3] * ch[3],
+    ]
+}
+
 /// Codec-ID set we recognize as "uncompressed PCM suitable for
 /// ambisonic extraction". Extracted to its own function so the list of
 /// fallback codecs is documented in one place.
@@ -513,6 +542,24 @@ pub fn foa_to_stereo_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: 
     tracing::info!(m4a = %output_m4a.display(), samples = n, sample_rate = info.sample_rate,
         window_start_s = offset_s, window_s = dur_s.unwrap_or(f64::NAN), took_ms = t0.elapsed().as_millis() as u64,
         "X6 360° Audio: decoded first-order AmbiX to a front-facing stereo AAC");
+    Ok(n)
+}
+
+/// Decode the Kandao QooCam's 4-channel microphone track to a stereo AAC
+/// `.m4a` through [`KANDAO_QUAD_STEREO_MATRIX`] — the window
+/// `[offset_s, offset_s + dur_s)` (whole track when `None`), starting at
+/// its own 0 like [`foa_to_stereo_aac`]. Returns the samples written.
+pub fn quad_to_stereo_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Option<f64>, bit_rate: usize) -> Result<u64> {
+    let info = probe_foa_aac(input)?
+        .ok_or_else(|| Error::Ffmpeg(format!("no 4-channel AAC track in {input:?}")))?;
+    let t0 = std::time::Instant::now();
+    let n = transcode_audio_window(
+        input, info.stream_index, output_m4a, offset_s, dur_s,
+        Some(&KANDAO_QUAD_STEREO_MATRIX), AudioOut::AacStereo { bit_rate },
+    )?;
+    tracing::info!(m4a = %output_m4a.display(), samples = n, sample_rate = info.sample_rate,
+        window_start_s = offset_s, window_s = dur_s.unwrap_or(f64::NAN), took_ms = t0.elapsed().as_millis() as u64,
+        "QooCam 4-channel audio: decoded to stereo AAC");
     Ok(n)
 }
 

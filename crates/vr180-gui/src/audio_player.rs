@@ -61,6 +61,15 @@ impl AudioPlayer {
     /// `start_paused = true` keeps the cpal stream in `pause()` until
     /// `set_playing(true)` is called.
     pub fn open(path: PathBuf, start_paused: bool) -> Result<Option<Self>> {
+        Self::open_with_mix(path, start_paused, None)
+    }
+
+    /// [`AudioPlayer::open`] with a `[L, R] × 4` mixing matrix for a
+    /// 4-channel source — the X6's AmbiX (`audio::FOA_STEREO_MATRIX`) or the
+    /// QooCam's microphone array (`audio::KANDAO_QUAD_STEREO_MATRIX`); the
+    /// caller knows the source kind, the codec does not say which it is.
+    /// `None` leaves a 4-channel track to swresample's layout downmix.
+    pub fn open_with_mix(path: PathBuf, start_paused: bool, mix: Option<[[f32; 4]; 2]>) -> Result<Option<Self>> {
         vr180_pipeline::decode::init();
 
         // Probe the source for an audio stream before allocating anything.
@@ -157,6 +166,7 @@ impl AudioPlayer {
                 cap_samples_for_thread,
                 cmd_rx,
                 start_paused,
+                mix,
             ) {
                 tracing::warn!("audio_player worker: {e}");
             }
@@ -224,6 +234,7 @@ fn decoder_worker(
     cap_samples: usize,
     cmd_rx: crossbeam_channel::Receiver<AudioCmd>,
     start_paused: bool,
+    mix: Option<[[f32; 4]; 2]>,
 ) -> Result<()> {
     use ffmpeg_next as ffmpeg;
     use ffmpeg::software::resampling::Context as Resampler;
@@ -253,11 +264,12 @@ fn decoder_worker(
         src_rate, src_format, src_ch_layout
     );
 
-    // X6 "360° Audio": a 4-channel AAC that is first-order AmbiX. swresample's
-    // layout downmix cancels two of its channels (anti-phase) and plays ~9 dB
-    // left-heavy, so keep the 4 channels through the resampler and decode a
-    // front-facing stereo pair ourselves (`audio::foa_to_stereo_sample`).
-    let foa = src_ch_layout.channels() == 4 && decoder.id() == ffmpeg::codec::Id::AAC;
+    // A 4-channel source the caller gave a matrix for (the X6's AmbiX —
+    // swresample's layout downmix cancels two of its channels and plays
+    // ~9 dB left-heavy — or the QooCam's microphone array): keep the 4
+    // channels through the resampler and mix the stereo pair ourselves.
+    let mix4 = mix.filter(|_| src_ch_layout.channels() == 4);
+    let foa = mix4.is_some();
     // Resampler: source → device's stereo f32 packed (4-ch AmbiX stays 4-ch).
     let dst_ch_layout = if foa {
         src_ch_layout
@@ -266,7 +278,7 @@ fn decoder_worker(
     } else {
         ffmpeg::channel_layout::ChannelLayout::STEREO
     };
-    if foa { tracing::info!("audio_player worker: 4-ch AmbiX source — decoding a front-facing stereo pair"); }
+    if foa { tracing::info!("audio_player worker: 4-channel source — mixing a stereo pair through the caller's matrix"); }
     let mut resampler = Resampler::get(
         src_format,
         src_ch_layout,
@@ -360,9 +372,9 @@ fn decoder_worker(
             let samples: &[f32] = bytemuck::cast_slice(bytes);
 
             let mut g = buf.lock();
-            if foa {
+            if let Some(m) = mix4 {
                 for s in samples.chunks_exact(4) {
-                    let [l, r] = vr180_pipeline::audio::foa_to_stereo_sample([s[0], s[1], s[2], s[3]]);
+                    let [l, r] = vr180_pipeline::audio::mix_sample(&m, [s[0], s[1], s[2], s[3]]);
                     if device_channels == 1 { g.push_back(0.5 * (l + r)); } else { g.push_back(l); g.push_back(r); }
                 }
             } else {

@@ -204,6 +204,11 @@ pub struct X6Still {
     pub dimension: Option<(u32, u32)>,
     /// Every record id found in the still trailer chain, footer first.
     pub record_ids: Vec<u16>,
+    /// Set for a Kandao QooCam DNG: the factory lens record (Kannala-Brandt,
+    /// in the DNG's own 13888×6944 canvas) and the lens-shading grids from
+    /// the EXIF `UserComment`. `lenses` (the Insta360 UCM entries) is then
+    /// empty and `gain_maps` holds the grids re-expressed as DNG GainMaps.
+    pub kandao: Option<crate::kandao::KandaoStillMeta>,
 }
 
 // ── Public entry points ────────────────────────────────────────────
@@ -218,6 +223,16 @@ pub fn is_insta360_dng(path: &Path) -> bool {
     }
     drop(f);
     has_insv_trailer(path)
+}
+
+/// Cheap classification: a little-endian TIFF whose IFD0 `Make` is Kandao
+/// (the QooCam 3 Ultra's dual-fisheye DNG; it has no Insta360 trailer).
+pub fn is_kandao_dng(path: &Path) -> bool {
+    let Ok(mut t) = TiffFile::open(path) else { return false };
+    let Ok((ifd0, _)) = t.main_ifd() else { return false };
+    t.tag_ascii(&ifd0, TAG_MAKE).ok().flatten()
+        .map(|m| m.to_ascii_lowercase().contains("kandao"))
+        .unwrap_or(false)
 }
 
 /// Image dimensions `(width, height)` from the main image IFD; no pixel decode.
@@ -260,13 +275,31 @@ pub fn read(path: &Path) -> Result<X6Still> {
         let exif_ifd = t.read_ifd(off as u64)?;
         exif_tags(&mut t, &exif_ifd, &mut exif)?;
     }
-    let gain_maps = match t.tag_bytes(&ifd0, TAG_OPCODE_LIST2)?.or(t.tag_bytes(&main, TAG_OPCODE_LIST2)?) {
+    let mut gain_maps = match t.tag_bytes(&ifd0, TAG_OPCODE_LIST2)?.or(t.tag_bytes(&main, TAG_OPCODE_LIST2)?) {
         Some(b) => parse_opcode_list2(&b)?,
         None => Vec::new(),
     };
 
+    // ── Kandao QooCam: lens record + shading grids in the UserComment, no
+    //    trailer. The grids become one pitch-2 GainMap per CFA site per
+    //    half, so the developer applies them exactly like the X6's opcodes.
+    let kandao = if exif.make.to_ascii_lowercase().contains("kandao") {
+        let k = exif.user_comment.as_deref().and_then(crate::kandao::still_meta_from_user_comment)
+            .ok_or_else(|| bad("Kandao DNG without a lens record in its UserComment"))?;
+        if gain_maps.is_empty() {
+            gain_maps = kandao_gain_maps(&k, layout.width, layout.height, cfa);
+        }
+        Some(k)
+    } else {
+        None
+    };
+
     // ── Still trailer (small, at the end of the file) ──
-    let trailer = read_still_trailer(&mut t.file, t.len)?;
+    let trailer = if kandao.is_some() {
+        StillTrailer::default()
+    } else {
+        read_still_trailer(&mut t.file, t.len)?
+    };
     let meta = trailer.protobuf.as_deref().map(parse_still_protobuf).unwrap_or_default();
     let imu = trailer
         .record(REC_IMU)
@@ -279,7 +312,9 @@ pub fn read(path: &Path) -> Result<X6Still> {
         lenses = meta.lens_strings.iter().find_map(|s| find_lens_string(s)).map(|(_, l)| l);
     }
     let lenses = lenses.unwrap_or_default();
-    let calib_frame = lenses.first().map(|l| (l.sensor_w, l.sensor_h)).unwrap_or((0, 0));
+    let calib_frame = lenses.first().map(|l| (l.sensor_w, l.sensor_h))
+        .or_else(|| kandao.as_ref().and_then(|k| k.lenses.first()).map(|l| (l.canvas_w, l.canvas_h)))
+        .unwrap_or((0, 0));
 
     // ── Pixels (the expensive part; parallel inflate) ──
     let n = (layout.width as usize)
@@ -307,7 +342,47 @@ pub fn read(path: &Path) -> Result<X6Still> {
         firmware: meta.firmware,
         dimension: meta.dimension,
         record_ids: trailer.records.iter().map(|(id, _)| *id).collect(),
+        kandao,
     })
+}
+
+/// The QooCam's per-lens `cols × rows` shading grids as DNG GainMaps: for
+/// each canvas half and each CFA site one pitch-2 map over that half, its
+/// gains the grid's plane of the site's colour (plane 0/1/2 = R/G/B). The
+/// grid spans the whole half (node 0 at its left/top edge, the last node at
+/// the right/bottom edge), which is what makes the shading centre — gain
+/// 1.0 at the grid's middle node — land on the half's centre.
+fn kandao_gain_maps(k: &crate::kandao::KandaoStillMeta, width: u32, height: u32, cfa: [u8; 4]) -> Vec<GainMap> {
+    let half_w = width / 2;
+    let mut out = Vec::new();
+    for (h, grid) in k.gain_maps.iter().enumerate().take(2) {
+        if grid.cols < 2 || grid.rows < 2 || grid.planes == 0 { continue; }
+        let x0 = h as u32 * half_w;
+        for sr in 0..2u32 {
+            for sc in 0..2u32 {
+                let color = cfa[(sr * 2 + sc) as usize] as u32;
+                out.push(GainMap {
+                    top: sr,
+                    left: x0 + sc,
+                    bottom: height,
+                    right: x0 + half_w,
+                    plane: 0,
+                    planes: 1,
+                    row_pitch: 2,
+                    col_pitch: 2,
+                    points_v: grid.rows,
+                    points_h: grid.cols,
+                    spacing_v: 1.0 / (grid.rows - 1) as f64,
+                    spacing_h: 1.0 / (grid.cols - 1) as f64,
+                    origin_v: 0.0,
+                    origin_h: 0.0,
+                    map_planes: 1,
+                    gains: grid.plane(color).to_vec(),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Locate the `2_…` factory calibration run inside arbitrary text (the EXIF
@@ -1680,6 +1755,127 @@ mod tests {
         assert_eq!(still.imu[2].t_us, 3003);
         assert_eq!(still.imu[2].acc_g, [-1.0, 0.0, 2.0]);
         assert!((still.imu[2].gyr_dps[2] - 164.0 / 16.384).abs() < 1e-4);
+    }
+
+    /// The sample QooCam 3 Ultra's LENS record (both lenses).
+    const KANDAO_LENS_HEX: &str = "14b614e44614f43406d455261ff31330040360000201b00001ce20545cd275845f07359458d6239bcaed7f43aacc868bb40da7f390000000000000000000000000000000003d97f3f6e440d3dd1a6cc226e440dbd03d97f3f5860b925d1a6cc225860b9a50000803f000000000000000000000080f00000000000000000000000ffffffff0f24b614e44614f43406d455261ff31330140360000201b0000126f0545a7c022461c9758458d6239bcaed7f43aacc868bb40da7f3900000000000000000000000000000000fafd7fbf5a7af63b484115bb7603f73b6afc7f3f94beedbb95ab113bb74ceebb1bfe7fbf5a0530402b5552bd95e986c0f00000000000000000000000ffffffff5b";
+
+    /// A 17 × 13 × 3 shading grid, hex-encoded like the camera's
+    /// `GAINMAP` keys: plane p, row r, col c → 1 + 0.1p + 0.01r + 0.001c.
+    fn kandao_gain_hex() -> String {
+        let mut b = Vec::new();
+        for v in [17u32, 13, 3] { b.extend_from_slice(&v.to_le_bytes()); }
+        for p in 0..3u32 { for r in 0..13u32 { for c in 0..17u32 {
+            b.extend_from_slice(&(1.0 + p as f32 * 0.1 + r as f32 * 0.01 + c as f32 * 0.001).to_le_bytes());
+        }}}
+        b.iter().map(|x| format!("{x:02X}")).collect()
+    }
+
+    /// A Kandao QooCam DNG: uncompressed RGGB 10-in-16, no opcodes, no
+    /// trailer, the lens record + shading grids in the UserComment.
+    fn fixture_kandao_dng() -> (Vec<u8>, Vec<u16>) {
+        let px: Vec<u16> = fixture_pixels().iter().map(|v| v % 1024).collect();
+        let strips = encode_strips(&px, COMPRESSION_NONE, 1);
+        let mut out = b"II*\0".to_vec();
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        let mut offs = Vec::new();
+        for s in &strips {
+            while out.len() % 4 != 0 { out.push(0); }
+            offs.push(out.len() as u32);
+            out.extend_from_slice(s);
+        }
+        while out.len() % 4 != 0 { out.push(0); }
+        let gm = kandao_gain_hex();
+        let text = format!("QooCam 3 Ultra PRODUCT=QooCam+3+Ultra PROJECT=Cherry SN=QU9302313165 PR_VER=1 SW_VER=V1.1.3.8 HW_VER=qcom LENS={KANDAO_LENS_HEX} STITCHED=0 HDR=0 DNG=1 ISO=100 SHUTTER=292025 FORMAT=jpg+dng CAPTURE_MODE=image NEED_LSC=2 GAINMAP0={gm} GAINMAP1={gm}");
+        let mut uc = b"ASCII\0\0\0".to_vec();
+        uc.extend_from_slice(text.as_bytes());
+        let exif_off = out.len() as u32;
+        let exif = serialize_ifd(
+            vec![
+                t_rational(EXIF_EXPOSURE_TIME, &[(1, 3424)]),
+                t_rational(EXIF_F_NUMBER, &[(16, 10)]),
+                t_short(EXIF_ISO, &[100]),
+                t_undef(EXIF_USER_COMMENT, &uc),
+            ],
+            exif_off,
+        );
+        out.extend_from_slice(&exif);
+        while out.len() % 4 != 0 { out.push(0); }
+        let ifd0_off = out.len() as u32;
+        let tags = vec![
+            t_long(TAG_NEW_SUBFILE_TYPE, &[0]),
+            t_short(TAG_IMAGE_WIDTH, &[FW as u16]),
+            t_short(TAG_IMAGE_LENGTH, &[FH as u16]),
+            t_short(TAG_BITS_PER_SAMPLE, &[16]),
+            t_short(TAG_COMPRESSION, &[COMPRESSION_NONE as u16]),
+            t_short(TAG_PHOTOMETRIC, &[PHOTOMETRIC_CFA as u16]),
+            t_ascii(TAG_MAKE, "Kandao"),
+            t_ascii(TAG_MODEL, "QooCam 3 Ultra"),
+            t_long(TAG_STRIP_OFFSETS, &offs),
+            t_short(TAG_SAMPLES_PER_PIXEL, &[1]),
+            t_short(TAG_ROWS_PER_STRIP, &[RPS as u16]),
+            t_long(TAG_STRIP_BYTE_COUNTS, &strips.iter().map(|s| s.len() as u32).collect::<Vec<_>>()),
+            t_short(TAG_PLANAR_CONFIG, &[1]),
+            t_ascii(TAG_SOFTWARE, "v1.2"),
+            t_short(TAG_CFA_REPEAT_PATTERN_DIM, &[2, 2]),
+            t_byte(TAG_CFA_PATTERN, &[0, 1, 1, 2]),
+            t_ifd(TAG_EXIF_IFD, exif_off),
+            t_byte(TAG_DNG_VERSION, &[1, 4, 0, 0]),
+            t_ascii(TAG_UNIQUE_CAMERA_MODEL, "KanDao Digital Camera"),
+            t_byte(TAG_CFA_PLANE_COLOR, &[0, 1, 2]),
+            t_short(TAG_CFA_LAYOUT, &[1]),
+            t_short(TAG_BLACK_LEVEL_REPEAT_DIM, &[1, 1]),
+            t_rational(TAG_BLACK_LEVEL, &[(64, 1)]),
+            t_long(TAG_WHITE_LEVEL, &[1023]),
+            t_srational(TAG_COLOR_MATRIX1, &[(12788, 10000), (-6805, 10000), (241, 10000), (-4247, 10000), (12819, 10000), (5450, 10000), (-521, 10000), (1828, 10000), (6668, 10000)]),
+            t_rational(TAG_AS_SHOT_NEUTRAL, &[(4541, 10000), (1, 1), (5911, 10000)]),
+            t_short(TAG_CALIBRATION_ILLUMINANT1, &[17]),
+        ];
+        out.extend_from_slice(&serialize_ifd(tags, ifd0_off));
+        out[4..8].copy_from_slice(&ifd0_off.to_le_bytes());
+        (out, px)
+    }
+
+    #[test]
+    fn kandao_dng_reads_lens_record_and_shading_grids() {
+        let (bytes, px) = fixture_kandao_dng();
+        let p = temp_path("kandao.dng");
+        std::fs::write(&p, &bytes).unwrap();
+        assert!(is_kandao_dng(&p));
+        assert!(!is_insta360_dng(&p));
+        assert_eq!(probe(&p).unwrap(), (FW, FH));
+        let still = read(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(still.bayer, px);
+        assert_eq!(still.cfa, [0, 1, 1, 2]);
+        assert_eq!(still.color.white_level, 1023);
+        assert_eq!(still.color.black_level, [64.0; 4]);
+        assert_eq!(still.exif.make, "Kandao");
+        let k = still.kandao.as_ref().expect("kandao meta");
+        assert_eq!(k.lenses.len(), 2);
+        assert_eq!(k.product, "QooCam 3 Ultra");
+        assert_eq!(k.shutter_us, Some(292025));
+        assert!(still.lenses.is_empty());
+        assert_eq!(still.calib_frame, (13888, 6944));
+        assert!(still.crop.is_none() && still.imu.is_empty() && still.record_ids.is_empty());
+        // 2 halves × 4 CFA sites, each over its half with pitch 2.
+        assert_eq!(still.gain_maps.len(), 8);
+        let g = &still.gain_maps[0];
+        assert_eq!((g.top, g.left, g.bottom, g.right, g.row_pitch, g.col_pitch), (0, 0, FH, FW / 2, 2, 2));
+        assert_eq!((g.points_v, g.points_h, g.map_planes), (13, 17, 1));
+        assert!((g.spacing_h - 1.0 / 16.0).abs() < 1e-12 && (g.spacing_v - 1.0 / 12.0).abs() < 1e-12);
+        // Site (0,0) of RGGB is R → plane 0; (0,1) is G → plane 1; right half starts at FW/2.
+        assert!((g.gains[0] - 1.0).abs() < 1e-6 && (g.gains[1] - 1.001).abs() < 1e-6);
+        assert_eq!(still.gain_maps[1].cfa_site(), (0, 1));
+        assert!((still.gain_maps[1].gains[0] - 1.1).abs() < 1e-6);
+        assert_eq!(still.gain_maps[3].cfa_site(), (1, 1));
+        assert!((still.gain_maps[3].gains[0] - 1.2).abs() < 1e-6);
+        assert_eq!((still.gain_maps[4].left, still.gain_maps[4].right), (FW / 2, FW));
+        // Bilinear evaluation at the half's far corner pixel: v = 31/32 of 12
+        // cells (row 11.625), u = 31/32 of 16 cells (col 15.5).
+        let expect = 1.0 + 0.01 * 11.625 + 0.001 * 15.5;
+        assert!((g.gain_at(FH - 1, FW / 2 - 1, 0) - expect).abs() < 1e-4, "{}", g.gain_at(FH - 1, FW / 2 - 1, 0));
+        assert!((g.gain_at(0, 0, 0) - 1.0).abs() < 1e-6);
     }
 
     #[test]

@@ -39,12 +39,14 @@ pub mod calib;
 pub mod dji_osv;
 pub mod dng;
 pub mod insta360;
+pub mod kandao;
 pub mod presets;
 pub mod projection;
 
 pub use calib::{FisheyeCalibration, GyroflowLensProfile};
 pub use dji_osv::{DjiLensCalib, DjiOsvImu, OmniLensModel, SampleAnchor};
 pub use insta360::{Insta360Meta, InsvLensCalib, InsvWindowCrop};
+pub use kandao::{KandaoLens, KandaoMeta};
 pub use presets::{CameraPreset, presets};
 
 /// Top-level error type. Pipeline layer maps via `From`.
@@ -58,6 +60,9 @@ pub enum Error {
 
     #[error("insta360 trailer: {0}")]
     Insv(String),
+
+    #[error("kandao metadata: {0}")]
+    Kandao(String),
 
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

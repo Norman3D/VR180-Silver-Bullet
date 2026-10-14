@@ -1122,6 +1122,7 @@ pub fn readout_ms_for(kind: crate::SourceKind, fps: f32, imu: Option<&vr180_fish
     }
     match kind {
         crate::SourceKind::Insta360Insv => crate::insv_imu::INSV_X6_READOUT_MS,
+        crate::SourceKind::KandaoQoocam => crate::kandao_imu::KANDAO_READOUT_MS,
         _ => dji_osmo_readout_ms_for_fps(fps),
     }
 }

@@ -714,7 +714,7 @@ fn tr(en: &'static str) -> &'static str {
         "Restart preview" => "重启预览",
         "Recorded in 360° Audio: first-order ambisonics (AmbiX). A plain copy plays lopsided, so Stereo decodes a front-facing pair from it." => "以 360° 音频录制：一阶 Ambisonics（AmbiX）。直接拷贝播放会左右失衡，所以立体声是从它解码出的朝前声像对。",
         "Stereo AAC decoded from the ambisonics (virtual cardioids ±45°, camera front) — universal." => "由 Ambisonics 解码的立体声 AAC（±45° 虚拟心形，以相机正前为准）——通用。",
-        "Shared by X6 video and stills — one camera, one eye alignment." => "X6 视频与照片共用——同一台机器，同一个双眼错位。",
+        "Shared by this camera's video and stills — one camera, one eye alignment." => "同一台相机的视频与照片共用——同一台机器，同一个双眼错位。",
         "Still photo — use Export for the full-size file" => "静态照片——请用导出获得全尺寸文件",
         "DNG output: the 3D LUT, sharpening and automatic eye matching cannot travel as DNG metadata — hidden, and not applied to the preview." => "DNG 输出：3D LUT、锐化和自动眼间匹配无法作为 DNG 元数据保存——已隐藏，预览中也不应用。",
         "Still" => "照片",
@@ -1067,6 +1067,9 @@ struct ClipInfo {
     /// Insta360 X6 recorded in "360° Audio" mode: the source carries a
     /// 4-channel first-order AmbiX track (so the Audio section applies).
     foa_audio: bool,
+    /// Kandao QooCam with its 4-channel microphone track (mixed to stereo
+    /// for playback and export — `audio::KANDAO_QUAD_STEREO_MATRIX`).
+    quad_audio: bool,
 }
 
 /// An async clip load in flight (see `App::load_pending`). The worker
@@ -1106,6 +1109,10 @@ struct LoadedMeta {
     /// Insta360 X6 recorded in "360° Audio" mode: the source carries a
     /// 4-channel first-order AmbiX track (so the Audio section applies).
     foa_audio: bool,
+    /// Kandao QooCam 4-channel microphone track (see `ClipInfo::quad_audio`).
+    quad_audio: bool,
+    /// The stream is HLG (the QooCam's HDR mode) — auto-apply the HLG LUT.
+    hlg: bool,
 }
 
 impl App {
@@ -2122,38 +2129,43 @@ impl App {
             K::SbsFisheye     => "sbs",
             K::BlackmagicRaw  => "braw",
             K::Insta360Dng    => "dng",
+            K::KandaoQoocam   => "kandao",
+            K::KandaoDng      => "kandao_dng",
             _                 => "other",
         }
     }
 
     /// Remembered settings template for `kind` (defaults if none saved yet).
-    /// An X6 kind takes the camera's shared stereo offset (see
-    /// `x6_shared_stereo`) over whatever its own template remembers.
+    /// A kind with a video/still sibling (X6, QooCam) takes the camera's
+    /// shared stereo offset (see `shared_stereo`) over whatever its own
+    /// template remembers.
     fn kind_template(&self, kind: vr180_pipeline::SourceKind) -> Settings {
         let mut s = self.kind_settings.get(Self::settings_class_key(kind))
             .cloned().unwrap_or_default();
-        self.apply_x6_shared_stereo(kind, &mut s);
+        self.apply_shared_stereo(kind, &mut s);
         s
     }
 
-    /// The Insta360 X6 writes `.insv` video and `.dng` stills from the same
-    /// two lenses, so the stereo offset (the rig's own eye alignment) is ONE
-    /// value shared by both kinds — whichever was edited last.
-    fn x6_stereo_shared(kind: vr180_pipeline::SourceKind) -> bool {
-        matches!(kind, vr180_pipeline::SourceKind::Insta360Insv | vr180_pipeline::SourceKind::Insta360Dng)
+    /// The two template keys of a camera that writes video and stills from
+    /// the same two lenses (the X6's `.insv` + `.dng`, the QooCam's `.mp4` +
+    /// `.dng`): its stereo offset (the rig's own eye alignment) is ONE value
+    /// shared by both kinds — whichever was edited last. Video key first.
+    fn stereo_shared_keys(kind: vr180_pipeline::SourceKind) -> Option<[&'static str; 2]> {
+        let sib = kind.stereo_sibling()?;
+        let (video, still) = if kind.is_still() { (sib, kind) } else { (kind, sib) };
+        Some([Self::settings_class_key(video), Self::settings_class_key(still)])
     }
 
-    /// The shared X6 stereo offset `(yaw, pitch, roll)`: both X6 templates
+    /// The camera's shared stereo offset `(yaw, pitch, roll)`: both templates
     /// carry it (kept equal by `save_active_kind_template`), so read either —
     /// the video's first, for a user who has only ever tuned video.
-    fn x6_shared_stereo(&self) -> Option<(f32, f32, f32)> {
-        ["insv", "dng"].iter().find_map(|k| self.kind_settings.get(*k)
+    fn shared_stereo(&self, kind: vr180_pipeline::SourceKind) -> Option<(f32, f32, f32)> {
+        Self::stereo_shared_keys(kind)?.iter().find_map(|k| self.kind_settings.get(*k)
             .map(|s| (s.stereo_yaw_deg, s.stereo_pitch_deg, s.stereo_roll_deg)))
     }
 
-    fn apply_x6_shared_stereo(&self, kind: vr180_pipeline::SourceKind, s: &mut Settings) {
-        if !Self::x6_stereo_shared(kind) { return; }
-        if let Some((yaw, pitch, roll)) = self.x6_shared_stereo() {
+    fn apply_shared_stereo(&self, kind: vr180_pipeline::SourceKind, s: &mut Settings) {
+        if let Some((yaw, pitch, roll)) = self.shared_stereo(kind) {
             s.stereo_yaw_deg = yaw;
             s.stereo_pitch_deg = pitch;
             s.stereo_roll_deg = roll;
@@ -2162,15 +2174,15 @@ impl App {
 
     /// Fold the active clip's live settings into ITS kind's template, so the
     /// next same-kind clip inherits them (kept independent across kinds —
-    /// except the X6 stereo offset, written to both X6 templates).
+    /// except a camera's shared stereo offset, written to both its templates).
     fn save_active_kind_template(&mut self) {
         if let Some(kind) = self.clip.as_ref().map(|c| c.source_kind) {
             self.kind_settings.insert(
                 Self::settings_class_key(kind).to_string(), self.settings.clone());
-            if Self::x6_stereo_shared(kind) {
+            if let Some(keys) = Self::stereo_shared_keys(kind) {
                 let (yaw, pitch, roll) = (self.settings.stereo_yaw_deg,
                     self.settings.stereo_pitch_deg, self.settings.stereo_roll_deg);
-                for key in ["insv", "dng"] {
+                for key in keys {
                     let t = self.kind_settings.entry(key.to_string()).or_default();
                     t.stereo_yaw_deg = yaw;
                     t.stereo_pitch_deg = pitch;
@@ -2204,7 +2216,7 @@ impl App {
         // offset — the latest edit on either kind — over its own snapshot.
         let kind = self.batch[idx].source_kind;
         let mut restored = std::mem::take(&mut self.settings);
-        self.apply_x6_shared_stereo(kind, &mut restored);
+        self.apply_shared_stereo(kind, &mut restored);
         self.settings = restored;
         tracing::info!("RESEED-DBG select_clip {idx}: restored cx_l={:.4} cy_l={:.4} fov_l={:.2} ov_l={}",
             self.settings.fisheye_cx_norm_left, self.settings.fisheye_cy_norm_left,
@@ -2241,7 +2253,7 @@ impl App {
             let probe = if source_kind.is_still() {
                 // One Bayer frame, both eyes side by side: no video probe.
                 match vr180_fisheye::dng::probe(&path) {
-                    Ok((w, h)) => vr180_pipeline::decode::VideoProbe { width: w, height: h, fps: 1.0, duration_sec: 0.0 },
+                    Ok((w, h)) => vr180_pipeline::decode::VideoProbe { width: w, height: h, fps: 1.0, duration_sec: 0.0, hlg: false },
                     Err(e) => { tracing::warn!("batch: DNG probe failed for {}: {e}", path.display()); continue; }
                 }
             } else { match vr180_pipeline::decode::probe_video(&path) {
@@ -2253,7 +2265,9 @@ impl App {
             } };
             let (fisheye_eye_w, fisheye_eye_h) = match source_kind {
                 vr180_pipeline::SourceKind::SbsFisheye
-                | vr180_pipeline::SourceKind::Insta360Dng => (probe.width / 2, probe.height),
+                | vr180_pipeline::SourceKind::Insta360Dng
+                | vr180_pipeline::SourceKind::KandaoDng => (probe.width / 2, probe.height),
+                vr180_pipeline::SourceKind::KandaoQoocam => (probe.width, probe.height / 2),
                 vr180_pipeline::SourceKind::DjiOsv
                 | vr180_pipeline::SourceKind::Insta360Insv => (probe.width, probe.height),
                 vr180_pipeline::SourceKind::BlackmagicRaw => {
@@ -3081,7 +3095,7 @@ impl App {
 
         let probe = if source_kind.is_still() {
             let (w, h) = vr180_fisheye::dng::probe(&path).map_err(|e| format!("DNG probe failed: {e}"))?;
-            vr180_pipeline::decode::VideoProbe { width: w, height: h, fps: 1.0, duration_sec: 0.0 }
+            vr180_pipeline::decode::VideoProbe { width: w, height: h, fps: 1.0, duration_sec: 0.0, hlg: false }
         } else {
             vr180_pipeline::decode::probe_video(&path)
                 .map_err(|e| format!("probe failed: {e}"))?
@@ -3122,7 +3136,9 @@ impl App {
         // Fisheye family: compute one-eye dimensions for FOV slider hints.
         let (fisheye_eye_w, fisheye_eye_h) = match source_kind {
             vr180_pipeline::SourceKind::SbsFisheye
-            | vr180_pipeline::SourceKind::Insta360Dng => (probe.width / 2, probe.height),
+            | vr180_pipeline::SourceKind::Insta360Dng
+            | vr180_pipeline::SourceKind::KandaoDng => (probe.width / 2, probe.height),
+            vr180_pipeline::SourceKind::KandaoQoocam => (probe.width, probe.height / 2),
             vr180_pipeline::SourceKind::DjiOsv
             | vr180_pipeline::SourceKind::Insta360Insv => (probe.width, probe.height),
             vr180_pipeline::SourceKind::BlackmagicRaw => {
@@ -3198,13 +3214,19 @@ impl App {
         let foa_audio = source_kind == vr180_pipeline::SourceKind::Insta360Insv
             && vr180_pipeline::audio::probe_foa_aac(&path).ok().flatten().is_some();
         if foa_audio { tracing::info!("load: X6 360° Audio track (4-ch AmbiX) detected"); }
+        // Kandao QooCam: a 4-channel AAC of its microphone capsules (not a
+        // sound field) — mixed to stereo by the player and the export.
+        let quad_audio = source_kind == vr180_pipeline::SourceKind::KandaoQoocam
+            && vr180_pipeline::audio::probe_foa_aac(&path).ok().flatten().is_some();
+        if quad_audio { tracing::info!("load: QooCam 4-channel microphone track detected"); }
+        if probe.hlg { tracing::info!("load: HLG (ARIB STD-B67) transfer — HDR clip"); }
         Ok(LoadedMeta {
             token, path, preserve_clip_settings, source_kind,
             width: probe.width, height: probe.height, fps: probe.fps,
             duration_sec, frame_count, segments,
             cori_count, grav_count, srot_ms,
             detected_rs_mode, fisheye_eye_w, fisheye_eye_h,
-            eac_cal_dim, foa_audio,
+            eac_cal_dim, foa_audio, quad_audio, hlg: probe.hlg,
         })
     }
 
@@ -3240,6 +3262,8 @@ impl App {
                 vr180_pipeline::SourceKind::DjiOsv        => "DJI Osmo 360",
                 vr180_pipeline::SourceKind::Insta360Insv
                 | vr180_pipeline::SourceKind::Insta360Dng => "Insta360 X6",
+                vr180_pipeline::SourceKind::KandaoQoocam
+                | vr180_pipeline::SourceKind::KandaoDng   => vr180_pipeline::kandao_imu::KANDAO_PRESET_NAME,
                 vr180_pipeline::SourceKind::BlackmagicRaw => "Blackmagic Pyxis 12K",
                 _                                         => "Custom",
             };
@@ -3251,16 +3275,20 @@ impl App {
         // choice); swap the OTHER source's builtin on a clip switch since the
         // log curves are camera-specific.
         {
-            use crate::decoder::{BUILTIN_OSMO_LUT_PATH, BUILTIN_GPLOG_LUT_PATH, BUILTIN_X6_LUT_PATH};
+            use crate::decoder::{BUILTIN_OSMO_LUT_PATH, BUILTIN_GPLOG_LUT_PATH, BUILTIN_X6_LUT_PATH, BUILTIN_HLG_LUT_PATH};
             let wanted = match source_kind {
                 vr180_pipeline::SourceKind::DjiOsv        => Some(BUILTIN_OSMO_LUT_PATH),
                 vr180_pipeline::SourceKind::GoProEac      => Some(BUILTIN_GPLOG_LUT_PATH),
                 vr180_pipeline::SourceKind::Insta360Insv  => Some(BUILTIN_X6_LUT_PATH),
+                // The QooCam's HDR mode records HLG; its SDR mode is plain
+                // Rec.709 and needs nothing.
+                vr180_pipeline::SourceKind::KandaoQoocam if meta.hlg => Some(BUILTIN_HLG_LUT_PATH),
                 _ => None,
             };
             let cur_is_builtin = self.settings.lut_path == BUILTIN_OSMO_LUT_PATH
                 || self.settings.lut_path == BUILTIN_GPLOG_LUT_PATH
-                || self.settings.lut_path == BUILTIN_X6_LUT_PATH;
+                || self.settings.lut_path == BUILTIN_X6_LUT_PATH
+                || self.settings.lut_path == BUILTIN_HLG_LUT_PATH;
             match wanted {
                 Some(w) if self.settings.lut_path.is_empty() || cur_is_builtin => {
                     if self.settings.lut_path != w {
@@ -3300,6 +3328,7 @@ impl App {
             fisheye_eye_w: meta.fisheye_eye_w, fisheye_eye_h: meta.fisheye_eye_h,
             eac_cal_dim: meta.eac_cal_dim,
             foa_audio: meta.foa_audio,
+            quad_audio: meta.quad_audio,
         });
         self.loaded_path = Some(meta.path);
 
@@ -3479,8 +3508,15 @@ impl App {
                 .and_then(|c| vr180_pipeline::audio::build_segment_playlist(&c.segments, "preview"))
                 .unwrap_or(audio_path);
             let t_audio = std::time::Instant::now();
-            self.audio_player = match crate::audio_player::AudioPlayer::open(
-                audio_path, start_paused,
+            // 4-channel sources need the caller's mixing matrix: the codec
+            // alone cannot tell the X6's AmbiX from the QooCam's microphones.
+            let mix = self.clip.as_ref().and_then(|c| {
+                if c.foa_audio { Some(vr180_pipeline::audio::FOA_STEREO_MATRIX) }
+                else if c.quad_audio { Some(vr180_pipeline::audio::KANDAO_QUAD_STEREO_MATRIX) }
+                else { None }
+            });
+            self.audio_player = match crate::audio_player::AudioPlayer::open_with_mix(
+                audio_path, start_paused, mix,
             ) {
                 Ok(Some(player)) => Some(player),
                 Ok(None) => None,
@@ -3955,6 +3991,7 @@ impl App {
             let mut open = true;
             let clip_fps = self.clip.as_ref().map(|c| c.fps).unwrap_or(30.0);
             let is_still = self.clip.as_ref().map(|c| c.source_kind.is_still()).unwrap_or(false);
+            let still_dims = self.clip.as_ref().filter(|c| c.source_kind.is_still()).map(|c| (c.width, c.height));
             egui::Window::new(tr("Export format"))
                 .collapsible(false)
                 .resizable(false)
@@ -3963,7 +4000,7 @@ impl App {
                 .show(ctx, |ui| {
                     ui.set_min_width(360.0);
                     Self::export_options_ui(ui, &mut self.export_opts, "export",
-                        self.settings.reframe_aspect_if_active(), clip_fps, is_still);
+                        self.settings.reframe_aspect_if_active(), clip_fps, is_still, still_dims);
                 });
             self.show_export_settings = open;
         }
@@ -3977,6 +4014,7 @@ impl App {
         reframe: Option<crate::decoder::ReframeAspect>,
         fps: f32,
         is_still: bool,
+        still_dims: Option<(u32, u32)>,
     ) {
         if let Some(aspect) = reframe {
             // Reframed view: the exact viewport at a per-eye size.
@@ -3993,14 +4031,16 @@ impl App {
                 .small().color(Color32::GRAY));
         } else {
             ui.label(RichText::new(tr("Resolution")).strong());
-            let native_label = if is_still { "15520 × 7760 (full)" } else { ExportResolution::Native.label() };
-            let sel_label = if opts.resolution == ExportResolution::Native { native_label } else { ExportResolution::R8k.label() };
+            let native_label: String = if is_still {
+                still_dims.map(|(w, h)| format!("{w} × {h} (full)")).unwrap_or_else(|| "native (full)".to_string())
+            } else { ExportResolution::Native.label().to_string() };
+            let sel_label: &str = if opts.resolution == ExportResolution::Native { &native_label } else { ExportResolution::R8k.label() };
             egui::ComboBox::from_id_source(format!("{id_prefix}_resolution"))
                 .selected_text(sel_label)
                 .width(220.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut opts.resolution,
-                        ExportResolution::Native, native_label);
+                        ExportResolution::Native, native_label.clone());
                     ui.selectable_value(&mut opts.resolution,
                         ExportResolution::R8k, ExportResolution::R8k.label());
                 });
@@ -5495,9 +5535,10 @@ impl App {
                 &["360", "osv", "OSV", "insv", "INSV", "braw", "BRAW",
                   "mp4", "MP4", "mov", "MOV", "dng", "DNG"],
             )
-            .add_filter("Insta360 X6 still (.dng)", &["dng", "DNG"])
+            .add_filter("Camera still (.dng: Insta360 X6, Kandao QooCam 3 Ultra)", &["dng", "DNG"])
             .add_filter("DJI Osmo 360 (.osv)", &["osv", "OSV"])
             .add_filter("Insta360 (.insv)", &["insv", "INSV"])
+            .add_filter("Kandao QooCam 3 Ultra (.mp4)", &["mp4", "MP4"])
             .add_filter("Blackmagic RAW (.braw)", &["braw", "BRAW"])
             .add_filter("Side-by-side fisheye (.mp4 / .mov)",
                 &["mp4", "MP4", "mov", "MOV"])
@@ -5528,7 +5569,7 @@ impl App {
                 if c.source_kind.is_still() {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(tr("Still")).color(Color32::GRAY).small());
-                        ui.label(tr("single photo, 14-bit raw"));
+                        ui.label(if c.source_kind.is_kandao() { tr("single photo, 10-bit raw") } else { tr("single photo, 14-bit raw") });
                     });
                 } else {
                     ui.horizontal(|ui| {
@@ -5846,6 +5887,8 @@ impl App {
                     crate::decoder::BUILTIN_GPLOG_LUT_NAME.to_string()
                 } else if s.lut_path == crate::decoder::BUILTIN_X6_LUT_PATH {
                     crate::decoder::BUILTIN_X6_LUT_NAME.to_string()
+                } else if s.lut_path == crate::decoder::BUILTIN_HLG_LUT_PATH {
+                    crate::decoder::BUILTIN_HLG_LUT_NAME.to_string()
                 } else {
                     std::path::Path::new(&s.lut_path)
                         .file_name().and_then(|f| f.to_str()).unwrap_or("(invalid)")
@@ -5885,6 +5928,14 @@ impl App {
                 {
                     if ui.button(tr("Use built-in Insta360 X6 I-Log→709")).clicked() {
                         s.lut_path = crate::decoder::BUILTIN_X6_LUT_PATH.to_string();
+                        s.lut_intensity = 1.0;
+                    }
+                }
+                Some(vr180_pipeline::SourceKind::KandaoQoocam)
+                    if s.lut_path != crate::decoder::BUILTIN_HLG_LUT_PATH =>
+                {
+                    if ui.button(tr("Use built-in HLG→709 (QooCam HDR)")).clicked() {
+                        s.lut_path = crate::decoder::BUILTIN_HLG_LUT_PATH.to_string();
                         s.lut_intensity = 1.0;
                     }
                 }
@@ -5958,6 +6009,7 @@ impl App {
             self.clip.as_ref().map(|c| c.source_kind),
             Some(vr180_pipeline::SourceKind::DjiOsv)
                 | Some(vr180_pipeline::SourceKind::Insta360Insv)
+                | Some(vr180_pipeline::SourceKind::KandaoQoocam)
                 | Some(vr180_pipeline::SourceKind::SbsFisheye)
                 | Some(vr180_pipeline::SourceKind::BlackmagicRaw)
                 | Some(vr180_pipeline::SourceKind::GoProEac)
@@ -5965,7 +6017,7 @@ impl App {
         let align_running = self.align_rx.is_some();
         let align_status = self.align_status.clone();
         let is_still = self.clip.as_ref().map_or(false, |c| c.source_kind.is_still());
-        let x6_shared = self.clip.as_ref().map_or(false, |c| Self::x6_stereo_shared(c.source_kind));
+        let stereo_shared = self.clip.as_ref().map_or(false, |c| c.source_kind.stereo_sibling().is_some());
         let s = &mut self.settings;
         ui.label(RichText::new(tr("Global (both eyes)")).small().color(Color32::GRAY));
         if matches!(s.fisheye_output_mode, crate::decoder::FisheyeOutputMode::Reframe) {
@@ -5984,8 +6036,8 @@ impl App {
         ui.add_space(4.0);
         ui.label(RichText::new(tr("Stereo offset (right = +, left = −)"))
             .small().color(Color32::GRAY));
-        if x6_shared {
-            ui.label(RichText::new(tr("Shared by X6 video and stills — one camera, one eye alignment."))
+        if stereo_shared {
+            ui.label(RichText::new(tr("Shared by this camera's video and stills — one camera, one eye alignment."))
                 .small().color(Color32::from_rgb(130, 150, 175)));
         }
         // Stereo offset: Up/Down arrows step 0.01° per press.
@@ -6110,6 +6162,8 @@ impl App {
         // Insta360: raw gyro fused at load (VQF) — same stab controls as OSV,
         // no background quat load to gate on.
         let is_insv = matches!(kind, Some(vr180_pipeline::SourceKind::Insta360Insv));
+        // Kandao QooCam: same raw-gyro fusion as the X6.
+        let is_kandao = matches!(kind, Some(vr180_pipeline::SourceKind::KandaoQoocam));
         // DJI OSV loads the lens calib first (instant preview) and streams the
         // per-frame quaternions — needed for stabilization — in the background.
         // While they load, gray the controls; the decoder auto-applies stab the
@@ -6139,7 +6193,7 @@ impl App {
         } else { 0 };
         let s = &mut self.settings;
 
-        if !(is_braw || is_osv || is_insv) {
+        if !(is_braw || is_osv || is_insv || is_kandao) {
             ui.label(RichText::new(
                 tr("No gyro stabilization available for this source yet.")
             ).small().color(Color32::GRAY));
@@ -6149,6 +6203,8 @@ impl App {
             tr("Stabilization (VQF 6D, BRAW)")
         } else if is_insv {
             tr("Stabilization (Insta360 gyro)")
+        } else if is_kandao {
+            tr("Stabilization (Kandao gyro)")
         } else {
             tr("Stabilization (DJI camera quats)")
         };
@@ -6157,7 +6213,7 @@ impl App {
         ui.checkbox(&mut s.stabilize, stab_label);
         // Stab sliders need the loaded quats — enabled only once ready.
         ui.add_enabled_ui(s.stabilize && quats_ready, |ui| {
-            if is_osv || is_insv {
+            if is_osv || is_insv || is_kandao {
                 // Camera lock owns the sharp frame-0 lock; the smoothing
                 // sliders are the soft-stab controls and gray out under it.
                 ui.checkbox(&mut s.dji_camera_lock, tr("Camera lock"))
@@ -6211,6 +6267,8 @@ impl App {
             Some(vr180_pipeline::SourceKind::DjiOsv)
                 | Some(vr180_pipeline::SourceKind::Insta360Insv)
                 | Some(vr180_pipeline::SourceKind::Insta360Dng)
+                | Some(vr180_pipeline::SourceKind::KandaoQoocam)
+                | Some(vr180_pipeline::SourceKind::KandaoDng)
         );
         let s = &mut self.settings;
 

@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased
+
+### Kandao QooCam 3 Ultra: video and stills
+
+The QooCam 3 Ultra joins the Osmo 360, the X6 and the Max 2 as a VR180-mod
+camera, with the same coverage as the X6: the factory lens model, gyro
+stabilization with per-scanline rolling-shutter correction timed from the
+file, stills, and the camera's own colour handling.
+
+- **Video (`.mp4`).** The camera writes one HEVC stream with both eyes
+  stacked top/bottom (3840×7680 at 30 fps) and two proprietary boxes after
+  `moov` — the factory lens record, the 1 kHz gyro, the per-frame timestamps
+  and exposures. The app reads all of it. The lens model is the one QooCam
+  Studio's own stitcher runs (a 4-coefficient Kannala-Brandt lens per eye
+  from the record, scaled to the stream); the top half is the left eye
+  after the mod (measured on near-field parallax). Stabilization fuses the
+  gyro exactly as the X6 path does; the readout (24.4 ms, top row first)
+  and the frame content time (`PTS + readout/2 + shutter/2`) were measured
+  from image motion against the gyro on two clips, both sensors. Decoding
+  takes the zero-copy VideoToolbox path (each eye sampled in place from the
+  stacked frame).
+- **HDR (HLG) clips.** The camera's HDR mode records HLG BT.2020, full
+  range. The decode path now carries the stream's YCbCr matrix (BT.2020
+  instead of the fixed BT.709) and a built-in HLG → Rec.709 conversion
+  (BT.2100 inverse OETF, 1000 nit OOTF, BT.2408 reference-white scaling
+  with a soft highlight shoulder) is applied on load like the other
+  cameras' log LUTs; SDR clips need nothing.
+- **Stills (`.dng`).** The 13888×6944 RGGB dual-fisheye DNG opens like the
+  X6's: the lens record (the DNG is its own calibration canvas) and the
+  per-lens 17×13 shading grids come from the EXIF `UserComment` and feed
+  the same raw stage, preview tiers and PNG / JPEG / linear DNG export. The
+  stereo offset is shared between the QooCam's video and stills, as for
+  the X6.
+- **Audio.** The 4-channel track is the camera's raw microphone capsules
+  (not a sound field); playback and export mix it to stereo through a
+  provisional symmetric matrix (first pair left, second pair right). The
+  capsule placement is not published — a QooCam Studio stereo export of a
+  clip would let the exact mix be solved, as was done for the X6.
+- **Calibration note.** The video is treated as each 6944² lens half
+  scaled to 3840² (the file's crop/scale flags are the identity, as in
+  QooCam Studio). Self-calibration from the gyro on the sample clips
+  agrees with that to about 1 % in focal length and ~30 px in the
+  principal point's height, which is within what those measurements can
+  resolve on handheld footage; Auto-align and the stereo offset absorb the
+  remainder.
+
 ## 2.5.2 — 2026-10-10
 
 ### Windows: APAC is no longer offered

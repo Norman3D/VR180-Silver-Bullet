@@ -361,10 +361,17 @@ fn tilt_toward_up(from: [f64; 3], gain: f64) -> Q64 {
 /// inclination trim (`tau_s`) that keeps long takes level. Body → earth
 /// quaternions in the same convention as the VQF output.
 pub fn integrate_orientation(meta: &Insta360Meta, bias_rad_s: [f32; 3], tau_s: f64) -> Vec<Quat> {
+    integrate_orientation_samples(&meta.imu, bias_rad_s, tau_s)
+}
+
+/// [`integrate_orientation`] over raw samples — shared with every other
+/// raw-gyro source (the Kandao QooCam hands its 1 kHz stream in as
+/// [`InsvImuSample`]s).
+pub fn integrate_orientation_samples(imu: &[vr180_fisheye::insta360::InsvImuSample], bias_rad_s: [f32; 3], tau_s: f64) -> Vec<Quat> {
     const DEG: f64 = std::f64::consts::PI / 180.0;
-    let n = meta.imu.len();
-    let t: Vec<f64> = meta.imu.iter().map(|s| s.t_us as f64 * 1e-6).collect();
-    let w: Vec<[f64; 3]> = meta.imu.iter()
+    let n = imu.len();
+    let t: Vec<f64> = imu.iter().map(|s| s.t_us as f64 * 1e-6).collect();
+    let w: Vec<[f64; 3]> = imu.iter()
         .map(|s| [s.gyr_dps[0] as f64 * DEG - bias_rad_s[0] as f64,
                   s.gyr_dps[1] as f64 * DEG - bias_rad_s[1] as f64,
                   s.gyr_dps[2] as f64 * DEG - bias_rad_s[2] as f64])
@@ -379,7 +386,7 @@ pub fn integrate_orientation(meta: &Insta360Meta, bias_rad_s: [f32; 3], tau_s: f
     let mut q = Q64::IDENTITY;
     let mut g_sum = [0f64; 3];
     for k in 0..n {
-        let a = meta.imu[k].acc_g;
+        let a = imu[k].acc_g;
         let ae = q.rotate([a[0] as f64, a[1] as f64, a[2] as f64]);
         g_sum[0] += ae[0]; g_sum[1] += ae[1]; g_sum[2] += ae[2];
         if k + 1 < n { q = q.mul(step(k)).normalize(); }
@@ -395,7 +402,7 @@ pub fn integrate_orientation(meta: &Insta360Meta, bias_rad_s: [f32; 3], tau_s: f
         let dt = (t[k + 1] - t[k]).clamp(0.0, 0.05);
         q = q.mul(step(k)).normalize();
         if tau_s > 0.0 {
-            let a = meta.imu[k + 1].acc_g;
+            let a = imu[k + 1].acc_g;
             let ae = q.rotate([a[0] as f64, a[1] as f64, a[2] as f64]);
             let kf = (dt / INSV_TRIM_LP_S).min(1.0);
             for i in 0..3 { lp[i] += (ae[i] - lp[i]) * kf; }
@@ -407,13 +414,13 @@ pub fn integrate_orientation(meta: &Insta360Meta, bias_rad_s: [f32; 3], tau_s: f
 
 /// Orientation lookup by time over the VQF output (slerp between the two
 /// bracketing samples; clamps outside the stream).
-struct QuatTimeline<'a> {
-    t_s: Vec<f64>,
-    quats: &'a [Quat],
+pub(crate) struct QuatTimeline<'a> {
+    pub(crate) t_s: Vec<f64>,
+    pub(crate) quats: &'a [Quat],
 }
 
 impl<'a> QuatTimeline<'a> {
-    fn at(&self, t: f64) -> Quat {
+    pub(crate) fn at(&self, t: f64) -> Quat {
         let n = self.t_s.len();
         if n == 0 {
             return Quat::IDENTITY;

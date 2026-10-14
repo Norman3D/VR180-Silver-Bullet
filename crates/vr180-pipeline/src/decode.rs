@@ -741,6 +741,10 @@ pub struct VideoProbe {
     pub height: u32,
     pub fps: f32,
     pub duration_sec: f64,
+    /// The stream's transfer characteristic is HLG (ARIB STD-B67) — the
+    /// Kandao QooCam's HDR mode; the GUI then auto-applies the HLG → Rec.709
+    /// LUT. `false` for every SDR / log-encoded camera file.
+    pub hlg: bool,
 }
 
 /// FAST clip duration (seconds) via the MP4 `moov`/`mvhd`, WITHOUT ffmpeg's
@@ -931,11 +935,13 @@ pub fn probe_video(path: &Path) -> Result<VideoProbe> {
     // SAFETY: AVCodecParameters is exposed by ffmpeg-next via as_ptr;
     // we read width/height which are POD fields.
     let raw = unsafe { &*params.as_ptr() };
+    let hlg = raw.color_trc == ffmpeg_next::ffi::AVColorTransferCharacteristic::AVCOL_TRC_ARIB_STD_B67;
     Ok(VideoProbe {
         width: raw.width as u32,
         height: raw.height as u32,
         fps,
         duration_sec,
+        hlg,
     })
 }
 

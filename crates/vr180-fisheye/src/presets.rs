@@ -55,6 +55,9 @@ pub enum InputLayout {
     /// Two-stream dual fisheye (DJI `.osv`, custom dual-cam rigs).
     /// `-map 0:0` + `-map 0:1` parallel decoders.
     DualStream,
+    /// Single-stream fisheye with the eyes stacked top/bottom (Kandao
+    /// QooCam 3 Ultra). Split vertically into top/bottom halves.
+    Stacked,
     /// Blackmagic RAW (`.braw`). Wrap braw_helper subprocess.
     /// Multi-track files (URSA Cine Immersive stereo, Pyxis 12K) are
     /// emitted as a SBS BGRA stream by the helper.
@@ -80,7 +83,7 @@ pub fn for_extension(ext: &str) -> Option<&'static CameraPreset> {
 
 // ---- Catalog ------------------------------------------------------
 
-static PRESETS: [CameraPreset; 9] = [
+static PRESETS: [CameraPreset; 10] = [
     // ============================================================
     // DJI Osmo 360
     // ============================================================
@@ -288,6 +291,32 @@ static PRESETS: [CameraPreset; 9] = [
         default_fov_deg: 204.5,
         file_hints: &["insv"],
         input_layout: InputLayout::DualStream,
+    },
+
+    // ============================================================
+    // Kandao QooCam 3 Ultra (stacked single-stream .mp4, VR180-modded)
+    // ============================================================
+    // FALLBACK only — the files carry a per-lens factory Kannala-Brandt
+    // record (focal, principal point, k1..k4 in the 13888×6944 photo
+    // canvas) that `vr180-pipeline::kandao_imu::stream_lens_calib` scales to
+    // the eye size per file. These are the sample camera's values at the
+    // 3840² video eye: focal 2142.13 px/rad × 3840/6944, principal point
+    // at the centre, rim ≈ 106° → ≈212° FOV.
+    CameraPreset {
+        name: "Kandao QooCam 3 Ultra",
+        lens: Some("2× Kandao ~210° fisheye"),
+        calib: FisheyeCalibration {
+            fx: 1184.59,
+            fy: 1184.59,
+            cx: 1920.0,
+            cy: 1920.0,
+            k: [-0.011315, 0.001868, -0.003552, 0.000244],
+            calib_w: 3840,
+            calib_h: 3840,
+        },
+        default_fov_deg: 212.0,
+        file_hints: &[],
+        input_layout: InputLayout::Stacked,
     },
 ];
 
