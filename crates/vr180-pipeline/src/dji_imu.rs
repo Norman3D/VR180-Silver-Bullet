@@ -437,6 +437,11 @@ pub fn compute_dji_stabilization(
         let r_final = apply_basis(&r_eis, &basis);
         per_frame.push(EquirectRotation(r_final));
     }
+    // Probe knob: raw camera motion, per-row RS term only (see `fisheye_no_stab`).
+    let per_frame = if fisheye_no_stab() {
+        tracing::warn!("VR180_FISHEYE_NO_STAB=1: stabilization poses forced to identity (probe)");
+        vec![EquirectRotation::IDENTITY; per_frame.len()]
+    } else { per_frame };
 
     Ok(DjiStabResult {
         per_frame,
@@ -793,6 +798,21 @@ fn smooth_quats_velocity_dampened(
 /// Returns `None` if the OSV doesn't have enough high-rate samples
 /// for the current frame (need ≥ 2). The caller should fall back to a
 /// no-RS path in that case.
+/// `VR180_RS_SCALE` (probe knob, default 1.0) — see
+/// [`compute_per_row_quaternions_for_frame`].
+fn rs_probe_scale() -> f32 {
+    std::env::var("VR180_RS_SCALE").ok().and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite()).unwrap_or(1.0)
+}
+
+/// `VR180_FISHEYE_NO_STAB=1` (probe knob): keep the per-row rolling-shutter
+/// correction but make every frame's stabilization pose the identity, so an
+/// export shows the raw camera motion with only the RS term applied — the
+/// input the RS sign/magnitude probe regresses against the gyro.
+fn fisheye_no_stab() -> bool {
+    std::env::var("VR180_FISHEYE_NO_STAB").map_or(false, |v| v == "1")
+}
+
 pub fn compute_per_row_quaternions_for_frame(
     osv: &DjiOsvImu,
     frame_idx: usize,
@@ -874,12 +894,18 @@ pub fn compute_per_row_quaternions_for_frame(
     // per-frame stabilization pose — the centre row's mid-exposure
     // (`frame_sample_time_s`); DJI anchors both to one point.
     let t_mid = frame_sample_time_s(osv, frame_idx, readout_s, fps) + dji_rs_window_shift_s();
-    let readout_start = t_mid - readout_s * 0.5;
+    // Measurement knob (never set in normal use): VR180_RS_SCALE scales the
+    // signed readout window — 0 = no per-row correction, -1 = sweep bottom
+    // row first, 2 = doubled — for the rolling-shutter sign/magnitude probe.
+    let rs_scale = rs_probe_scale();
+    if rs_scale == 0.0 { return None; }
+    let signed_readout = readout_s * rs_scale;
+    let readout_start = t_mid - signed_readout * 0.5;
     let mut query_times: Vec<f32> = Vec::with_capacity(fish_h as usize + 1);
     let inv_h = 1.0_f32 / (fish_h as f32);
     for y in 0..fish_h {
         let frac = (y as f32) * inv_h;
-        query_times.push(readout_start + frac * readout_s);
+        query_times.push(readout_start + frac * signed_readout);
     }
     query_times.push(t_mid);
 

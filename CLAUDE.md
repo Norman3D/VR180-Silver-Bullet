@@ -871,6 +871,17 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    Open: the audio is NOT rotated to follow our stabilisation (Studio does);
    `.insv` recorded in Auto/Stereo modes are untouched.
 
+22. **X6 readout direction measured (2026-10-14).** Probe knobs in `dji_imu.rs`
+   (never set in normal use): `VR180_FISHEYE_NO_STAB=1` forces identity
+   stabilization poses but keeps the per-row RS term; `VR180_RS_SCALE`
+   scales the signed readout window (0 off, −1 bottom-row-first, 2 doubled).
+   Harness `examples/rs_probe_export.rs` (gitignored) + a DIS-flow affine
+   regression against the trailer gyro on clip 058 frames 3375–3525: the
+   ω-correlated residual (vertical stretch vs pitch rate) is 4.6 off, 0.95
+   normal, 8.3 negated, −2.7 doubled (ms·k) — normal is right, readout
+   ≈ 14.5 ms vs the file's 15.36 ms, both eyes. The raw DNG mosaic is
+   upright, so the sweep is physically top→bottom of the scene.
+
 20. **X6 360° Audio on Windows (2026-10-10, Windows box)** — the mac
    side's ambisonic work pulled, built clean first try (the new `build.rs`
    helper rebuild is gated on `CARGO_CFG_TARGET_OS`, a no-op here); export
