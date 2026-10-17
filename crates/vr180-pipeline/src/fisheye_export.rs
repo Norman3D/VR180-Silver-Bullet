@@ -494,6 +494,77 @@ fn finalize_eac_audio(
     Ok(())
 }
 
+/// Kandao QooCam: the raw capsules never reach the output — Stereo and the
+/// spatial formats are all encoded from them (`audio::KANDAO_QUAD_*`):
+/// Stereo = the decoded stereo temp; Ambisonic = a first-order AmbiX AAC
+/// temp muxed and tagged SA3D; APAC = the same AmbiX as a WAV through the
+/// macOS helper. Any failure falls back to stereo.
+fn finalize_kandao_audio(
+    cfg: &FisheyeExportConfig,
+    video_tmp: &std::path::Path,
+    offset_s: f64,
+    dur_s: f64,
+) -> Result<()> {
+    let _phase = FinalizePhaseNote::new();
+    let out = &cfg.output_path;
+    let (src, src_tmp) = eac_audio_source(cfg);
+    let drop_tmp = |t: &Option<PathBuf>| { if let Some(p) = t { std::fs::remove_file(p).ok(); } };
+    let stereo = || -> Result<()> {
+        let (s_src, s_tmp, s_off) = stereo_audio_source(cfg, offset_s, dur_s);
+        let r = finalize_with_audio(&s_src, video_tmp, out, s_off, dur_s);
+        if let Some(t) = s_tmp { std::fs::remove_file(t).ok(); }
+        r
+    };
+    let result = match cfg.audio_track {
+        AudioTrack::Stereo => stereo(),
+        AudioTrack::Ambisonic => {
+            let foa = video_only_temp_path(out).with_extension("quad_foa.m4a");
+            match crate::audio::quad_to_foa_aac(&src, &foa, offset_s, Some(dur_s), 256_000) {
+                Ok(_) => {
+                    let r = crate::audio::mux_video_with_audio_stream(&foa, video_tmp, out, 0.0, Some(dur_s), None);
+                    std::fs::remove_file(&foa).ok();
+                    match r {
+                        Ok(n) if n > 0 => {
+                            std::fs::remove_file(video_tmp).ok();
+                            if let Err(e) = crate::spherical_inject::inject_sa3d_ambix(out, 4) {
+                                tracing::warn!("SA3D inject failed (audio still present): {e}");
+                            }
+                            Ok(())
+                        }
+                        Ok(_) => move_file(video_tmp, out),
+                        Err(e) => { tracing::warn!("QooCam ambisonic mux failed ({e}) — stereo fallback"); stereo() }
+                    }
+                }
+                Err(e) => { tracing::warn!("QooCam ambisonic encode failed ({e}) — stereo fallback"); stereo() }
+            }
+        }
+        AudioTrack::Apac => {
+            #[cfg(target_os = "macos")]
+            {
+                let wav = video_tmp.with_extension("quad_ambi.wav");
+                match crate::audio::quad_to_foa_wav(&src, &wav, offset_s, Some(dur_s)) {
+                    Ok(_) => {
+                        let r = crate::helpers::spawn_apac_encode(&wav, Some(video_tmp), out, 256_000);
+                        std::fs::remove_file(&wav).ok();
+                        match r {
+                            Ok(()) => { std::fs::remove_file(video_tmp).ok(); Ok(()) }
+                            Err(e) => { tracing::warn!("apac_encode failed ({e}) — stereo fallback"); stereo() }
+                        }
+                    }
+                    Err(e) => { tracing::warn!("APAC: QooCam ambisonic encode failed ({e}) — stereo fallback"); stereo() }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                tracing::warn!("APAC is macOS-only — stereo fallback");
+                stereo()
+            }
+        }
+    };
+    drop_tmp(&src_tmp);
+    result
+}
+
 fn finalize_with_audio(
     audio_src: &std::path::Path,
     video_tmp: &std::path::Path,
@@ -556,12 +627,11 @@ fn finalize_with_audio(
 /// steps (SA3D atom / APAC re-encode) so they keep the temp+finalize path.
 fn one_pass_audio_eligible(cfg: &FisheyeExportConfig) -> bool {
     match cfg.source_kind {
-        // Sources with a 4-channel ambisonic track: SA3D / APAC need the
+        // Sources with a 4-channel spatial track: SA3D / APAC need the
         // post-encode steps; their Stereo export muxes inline (the X6's
-        // from a decoded stereo temp — `stereo_audio_source`). The Kandao
-        // QooCam's 4-channel track is its raw microphones, not a sound
-        // field: it only ever exports the decoded stereo temp, inline.
-        SourceKind::GoProEac | SourceKind::Insta360Insv =>
+        // from a decoded stereo temp, the QooCam's from its capsules —
+        // `stereo_audio_source`).
+        SourceKind::GoProEac | SourceKind::Insta360Insv | SourceKind::KandaoQoocam =>
             matches!(cfg.audio_track, AudioTrack::Stereo),
         _ => true,
     }
@@ -623,11 +693,7 @@ fn finalize_fisheye_audio(
         return finalize_eac_audio(cfg, video_tmp, offset_s, dur_s);
     }
     if cfg.source_kind == SourceKind::KandaoQoocam {
-        // Always the decoded stereo temp (never the raw 4-channel track).
-        let (audio_src, audio_tmp, off) = stereo_audio_source(cfg, offset_s, dur_s);
-        let r = finalize_with_audio(&audio_src, video_tmp, &cfg.output_path, off, dur_s);
-        if let Some(p) = &audio_tmp { std::fs::remove_file(p).ok(); }
-        return r;
+        return finalize_kandao_audio(cfg, video_tmp, offset_s, dur_s);
     }
     // Multi-segment: the audio source is an ffconcat playlist so a merged
     // recording keeps its FULL audio (source_path alone = segment 0 only).

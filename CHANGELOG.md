@@ -41,12 +41,16 @@ file, stills, and the camera's own colour handling.
   the same raw stage, preview tiers and PNG / JPEG / linear DNG export. The
   stereo offset is shared between the QooCam's video and stills, as for
   the X6.
-- **Audio.** The 4-channel track is the camera's raw microphone capsules
-  (not a sound field). QooCam Studio's stereo is not a linear mix of them
-  above ~400 Hz (a spectral process), so it cannot be reproduced exactly;
-  the app mixes to stereo with the capsule weights and polarity Studio's
-  low band shows (one capsule is inverted), at a level that keeps headroom
-  without a limiter. Stereo is the only audio option for this camera.
+- **Audio.** The 4-channel track is the camera's four microphone capsules
+  (not a sound field; Kandao's spatial audio is Fraunhofer upHear, a
+  parametric process the app cannot replicate). The capsule layout was
+  measured from the recordings — front-right, back-right, back-left,
+  front-left, all in phase — and the app encodes the array to first-order
+  ambisonics itself, so this camera gets the same **Audio** choices as the
+  X6: **Stereo** (a front-facing pair from the sound field), **Ambisonic**
+  (AmbiX + SA3D) and **APAC** (macOS). Each export window is normalized to
+  a safe peak (the capsules are recorded low and vary between clips).
+  Playback uses the same stereo pair.
 - **Calibration.** The lens model form was checked against QooCam
   Studio's own VR180 export of the sample clip (0.8 px across the whole
   eye once Studio's own principal-point shift is accounted for). The app

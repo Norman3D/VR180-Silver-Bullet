@@ -985,21 +985,38 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      like the X6's; `still_eye_calib` / `still_lens_calibs` take the KB
      branch. 10-bit in a 16-bit container (black 64, white 1023), RGGB.
    - **Audio**: the 4-channel AAC is the raw microphone capsules (not
-     AmbiX). Studio's stereo AND its ambisonic export (SA3D ACN/SN3D,
-     channel map [0,2,3,1] = W,Z,X,Y) are NOT linear in the capsules above
-     ~400 Hz (per-band R² 0.92 at 150–400 Hz, < 0.35 above; the lag between
-     windows wanders ±1 ms; +15–23 dB of level-dependent gain) — a spectral
-     process, so the X6-style exact solve is impossible and no ambisonic
-     encoder can be derived (the capsule geometry is not recoverable: GCC
-     lags ≤ 12 samples at correlation ≤ 0.12). What the low band does give:
-     capsule weights and polarity — channel 2 is inverted in every Studio
-     output. `KANDAO_QUAD_STEREO_MATRIX` = 2 × the 100–250 Hz fit
-     (L [0.575, 0.954, −1, 0.734], R [0.745, 0.816, −1, 0.855]); the player
-     and the export use it (never the raw track); the Audio section stays
-     hidden — Stereo only for this camera. The player takes the matrix
-     from the caller (`AudioPlayer::open_with_mix`) — the codec alone
-     cannot tell AmbiX from a mic array. Analysis scripts:
-     `$SP/qoo/kd/{fit_audio,diag_audio,lowband}.py`.
+     AmbiX). Kandao's "Audio SuperSteady 360°" is **Fraunhofer upHear** — a
+     parametric spatial process — so Studio's stereo and ambisonic exports
+     (SA3D ACN/SN3D, channel map [0,2,3,1] = W,Z,X,Y) are not linear in the
+     capsules above ~400 Hz (per-band R² 0.92 at 150–400 Hz, < 0.35 above)
+     and cannot be matched by any matrix. The app encodes the ARRAY itself.
+     **Capsule layout, measured** (`$SP/zoe/mic/{tdoa,geom}.py`: pairwise
+     arrival times on 1,180 coherent directional windows of five clips /
+     two cameras, regressed on the direction Studio's ambisonic export
+     reports, de-rotated by the gyro yaw; plus the earliest capsule per
+     direction bin): all four in phase (peak sign positive 96–100 %, pair
+     offsets within ±1.6 samples — the earlier "channel 2 inverted" and a
+     "13-sample channel-0 latency" were artefacts of upHear's phase and of
+     the source-direction distribution), at the four CORNERS of the
+     viewing frame: **ch0 front-right, ch1 back-right, ch2 back-left, ch3
+     front-left** (fitted −63° / −175° / +138° / +41°; apparent spacing
+     55–80 mm with body diffraction). `KANDAO_QUAD_FOA_MATRIX` (AmbiX W Y Z
+     X: W = mean, X = front pair − back pair, Y = left pair − right pair,
+     Z = 0, dipole gain 0.34 = SN3D level at ~1.5 kHz, ×3 built in) and
+     `KANDAO_QUAD_STEREO_MATRIX` = `FOA_STEREO_MATRIX` ∘ that (L/R
+     correlation 0.5–0.7 on the clips). Export: Stereo (one-pass temp),
+     Ambisonic (`quad_to_foa_aac` → mux + SA3D), APAC (`quad_to_foa_wav` →
+     helper) in `finalize_kandao_audio`; the Audio section shows for
+     `quad_audio`. Level: the capsules sit 15–20 dB low and vary by that
+     between clips, and there is no limiter, so every export window is
+     decoded once through the AmbiX matrix first and the mix scaled to a
+     0.7 peak (`kandao_window_gain`, 0.5×…8× on top of the ×3; the same
+     gain for Stereo / Ambisonic / APAC of a window; the live player keeps
+     the fixed ×3). Known limits: a spaced pair's dipoles roll off below
+     ~1 kHz and alias above ~3 kHz (no per-band EQ in the static mix); the
+     field is not rotated with the stabilization (same as the X6). The
+     player takes the matrix from the caller (`AudioPlayer::open_with_mix`)
+     — the codec alone cannot tell AmbiX from a mic array.
    - **GUI**: templates `"kandao"` / `"kandao_dng"`; the shared stereo
      offset is generic now (`SourceKind::stereo_sibling`); preset "Kandao
      QooCam 3 Ultra" appended LAST in `presets.rs` (index 7 = Custom is a

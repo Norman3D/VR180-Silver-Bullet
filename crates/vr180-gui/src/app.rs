@@ -4618,7 +4618,7 @@ impl eframe::App for App {
 
                     // X6 recorded in 360° Audio: its 4-channel AmbiX track
                     // serves the same Stereo / Ambisonic / APAC choice as .360.
-                    if self.clip.as_ref().map_or(false, |c| c.foa_audio) {
+                    if self.clip.as_ref().map_or(false, |c| c.foa_audio || c.quad_audio) {
                         ui.add_space(4.0);
                         egui::CollapsingHeader::new(
                             RichText::new(tr("Audio")).strong()
@@ -5691,10 +5691,16 @@ impl App {
     fn draw_audio_panel(&mut self, ui: &mut egui::Ui) {
         use crate::decoder::AudioFormat as AF;
         let x6 = self.clip.as_ref().map_or(false, |c| c.foa_audio);
+        let quad = self.clip.as_ref().map_or(false, |c| c.quad_audio);
         if x6 {
             ui.label(RichText::new(tr(
                 "Recorded in 360° Audio: first-order ambisonics (AmbiX). A plain copy plays \
                  lopsided, so Stereo decodes a front-facing pair from it."
+            )).small().color(Color32::GRAY));
+        } else if quad {
+            ui.label(RichText::new(tr(
+                "Four microphone capsules (front-right, back-right, back-left, front-left). \
+                 The app encodes them to first-order ambisonics; Stereo is a front-facing pair from that."
             )).small().color(Color32::GRAY));
         }
         let s = &mut self.settings;
@@ -5721,6 +5727,7 @@ impl App {
         });
         let hint = match s.audio_format {
             AF::Stereo if x6 => tr("Stereo AAC decoded from the ambisonics (virtual cardioids ±45°, camera front) — universal."),
+            AF::Stereo if quad => tr("Stereo AAC from the capsule array (virtual cardioids ±45°, camera front) — universal."),
             AF::Stereo    => tr("Stereo AAC — universal compatibility."),
             AF::Ambisonic => tr("4-channel 1st-order ambisonic (AmbiX) + SA3D — \
                               YouTube VR / Quest head-track it."),
