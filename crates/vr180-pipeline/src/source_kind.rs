@@ -242,7 +242,17 @@ pub fn detect(path: &Path) -> Result<SourceKind> {
             // stream + `kfix` box), or plain SBS fisheye. The Kandao box
             // walk is a handful of header reads, so it goes first.
             if vr180_fisheye::kandao::has_kandao_boxes(path) {
-                return Ok(SourceKind::KandaoQoocam);
+                // The same boxes ride the camera's single-lens modes (a `Q180_`
+                // clip: ONE 3840x3840 circle at 60 fps), which hold one eye and
+                // are no stereo pair; only the stacked 1:2 frame is a source.
+                return Ok(if kandao_frame_is_stacked(path) {
+                    SourceKind::KandaoQoocam
+                } else {
+                    tracing::warn!(
+                        "{}: Kandao boxes but the frame is not a stacked 1:2 pair (a single-lens recording) - unsupported",
+                        path.display());
+                    SourceKind::Unknown
+                });
             }
             let kind = probe_container_layout(path);
             if kind == SourceKind::DjiOsv && vr180_fisheye::insta360::has_insv_trailer(path) {
@@ -254,6 +264,23 @@ pub fn detect(path: &Path) -> Result<SourceKind> {
     }
 
     Ok(SourceKind::Unknown)
+}
+
+/// The largest video stream is `w x 2w`: the QooCam's stacked dual-fisheye
+/// frame (3840x7680, 3472x6944, 2880x5760 ...). The camera's single-lens
+/// recordings (`Q180_...`, 3840x3840) carry the same `kfix` boxes but one eye.
+/// A file ffmpeg cannot open is left to the Kandao kind (nothing else would
+/// take it either).
+fn kandao_frame_is_stacked(path: &Path) -> bool {
+    crate::decode::init();
+    let Ok(ictx) = ffmpeg_next::format::input(path) else { return true };
+    ictx.streams()
+        .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+        // SAFETY: `AVCodecParameters` is exposed as a raw pointer; only the
+        // POD width/height fields are read.
+        .map(|s| unsafe { let p = &*s.parameters().as_ptr(); (p.width, p.height) })
+        .max_by_key(|(w, h)| (*w as i64) * (*h as i64))
+        .map_or(true, |(w, h)| w > 0 && h == 2 * w)
 }
 
 /// Open the container with ffmpeg-next and decide between GoPro /

@@ -1047,7 +1047,7 @@ fn export_fisheye_inner(
         // projection/color/encode tails. Single-segment only (generic
         // files don't chain).
         let src_ok = cfg.source_kind.is_dual_stream()
-            || (cfg.source_kind == SourceKind::SbsFisheye && cfg.segments.len() <= 1);
+            || (cfg.source_kind.is_single_stream_pair() && cfg.segments.len() <= 1);
         let can_try = std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none()
             && src_ok
             && matches!(cfg.encoder,
@@ -1108,11 +1108,11 @@ fn export_fisheye_inner(
             // Landed on the portable serial loop — say WHY (the user-visible
             // symptom is just "export is slow with the GPU idle").
             let reason = if !cfg.source_kind.is_dual_stream()
-                && cfg.source_kind != SourceKind::SbsFisheye
+                && !cfg.source_kind.is_single_stream_pair()
             {
                 "no GPU fast path for this source type"
-            } else if cfg.source_kind == SourceKind::SbsFisheye && cfg.segments.len() > 1 {
-                "multi-segment SBS has no GPU fast path"
+            } else if cfg.source_kind.is_single_stream_pair() && cfg.segments.len() > 1 {
+                "multi-segment single-stream (SBS / stacked) source has no GPU fast path"
             } else if !crate::interop_windows::is_vulkan_backend(&pipeline.device) {
                 "DX12 backend (Vulkan unavailable)"
             } else if !pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010) {

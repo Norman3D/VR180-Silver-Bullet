@@ -63,6 +63,14 @@ file, stills, and the camera's own colour handling.
   eye once Studio's own principal-point shift is accounted for). The app
   renders from the camera's lens record as written, for video and stills
   alike; it does not copy Studio's adjustments.
+- **Windows.** The QooCam takes the Windows zero-copy preview and export
+  arms (NVDEC → D3D11 → Vulkan) like the other cameras: the stacked frame
+  is converted whole and split on the GPU, HEVC exports run at the NVENC
+  rate, and the D3D11 converter now applies the stream's own YCbCr matrix
+  (HLG clips were slightly desaturated on the Windows fast path, which
+  had BT.709 built in). A single-lens QooCam recording (`Q180_…`, one
+  3840×3840 circle) is reported as an unsupported format instead of being
+  split into two half-eyes.
 
 ## 2.5.2 — 2026-10-10
 

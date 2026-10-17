@@ -397,8 +397,10 @@ pub unsafe fn share_d3d11_texture_slice(
 /// cleanly. SRVs (unlike `CopySubresourceRegion`) DO work on NV12/P010 planes.
 ///
 /// The plane SRV formats and the range-expansion constants both depend on the
-/// source's bit depth (NV12 vs P010) — see [`hw_plane_layout`]. The constants
-/// ride the cbuffer so ONE compiled shader serves both; the output is RGBA16
+/// source's bit depth (NV12 vs P010) — see [`hw_plane_layout`]; the YCbCr→RGB
+/// matrix follows the stream's colorspace tag (`gpu::yuv_matrix_constants`:
+/// BT.709, or BT.2020 for the QooCam's HLG stream). Range AND matrix ride the
+/// cbuffer so ONE compiled shader serves every source; the output is RGBA16
 /// either way, so everything downstream is depth-agnostic.
 const YCBCR_TO_RGBA16_HLSL: &str = r#"
 Texture2D<float>  Ytex  : register(t0);
@@ -408,6 +410,7 @@ RWTexture2D<unorm float4> Outp : register(u0);
 cbuffer CB : register(b0) {
     uint src_w; uint src_h; uint out_w; uint out_h;
     float y_scale; float y_off; float c_scale; float c_off;
+    float r_v; float g_u; float g_v; float b_u;
 };
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -430,9 +433,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             float ul = c.x * c_scale + c_off;
             float vl = c.y * c_scale + c_off;
             acc += float3(
-                saturate(yl + 1.5748 * vl),
-                saturate(yl - 0.1873 * ul - 0.4681 * vl),
-                saturate(yl + 1.8556 * ul));
+                saturate(yl + r_v * vl),
+                saturate(yl + g_u * ul + g_v * vl),
+                saturate(yl + b_u * ul));
         }
     }
     acc /= (float)(kx * ky);
@@ -447,11 +450,17 @@ struct ConvDims {
     src_h: u32,
     out_w: u32,
     out_h: u32,
-    /// BT.709 limited-range expansion, per source bit depth (`hw_plane_layout`).
+    /// Range expansion `(y_scale, y_off, c_scale, c_off)` for the source bit
+    /// depth + range tag — `gpu::yuv_range_constants`.
     y_scale: f32,
     y_off: f32,
     c_scale: f32,
     c_off: f32,
+    /// YCbCr→RGB coefficients `(r_v, g_u, g_v, b_u)` — `gpu::yuv_matrix_constants`.
+    r_v: f32,
+    g_u: f32,
+    g_v: f32,
+    b_u: f32,
 }
 
 /// Plane SRV formats + SOURCE bit depth for a d3d11va decoder output format.
@@ -600,7 +609,8 @@ impl P010Converter {
     /// into Vulkan. The plane SRV formats and bit depth come from the source
     /// texture's own format; `full_range` is the stream's `color_range == JPEG`
     /// tag, and together they select the expansion constants via
-    /// [`crate::gpu::yuv_range_constants`].
+    /// [`crate::gpu::yuv_range_constants`]; `bt2020` is its `colorspace ==
+    /// BT.2020` tag and selects the matrix via [`crate::gpu::yuv_matrix_constants`].
     ///
     /// # Safety
     /// `device`/`context` must own `src_yuv`; `src_yuv` must be a live
@@ -615,6 +625,7 @@ impl P010Converter {
         out_w: u32,
         out_h: u32,
         full_range: bool,
+        bt2020: bool,
     ) -> windows::core::Result<D3d11SharedTexture> {
         use windows::Win32::Graphics::Direct3D::D3D11_SRV_DIMENSION_TEXTURE2D;
         use windows::Win32::Graphics::Direct3D11::{
@@ -643,6 +654,7 @@ impl P010Converter {
         // ONE source of truth for the expansion constants, shared with the
         // macOS P010 kernels: depth from the texture, range from the stream tag.
         let range = crate::gpu::yuv_range_constants(bits, full_range);
+        let mat = crate::gpu::yuv_matrix_constants(bt2020);
 
         // Output RGBA16 texture: UAV (compute writes) + SRV (Vulkan import
         // samples) + shareable NT handle.
@@ -692,6 +704,7 @@ impl P010Converter {
         let dims = ConvDims {
             src_w, src_h, out_w, out_h,
             y_scale: range[0], y_off: range[1], c_scale: range[2], c_off: range[3],
+            r_v: mat[0], g_u: mat[1], g_v: mat[2], b_u: mat[3],
         };
         context.UpdateSubresource(
             &self.cbuffer, 0, None,
@@ -872,7 +885,9 @@ unsafe fn copy_slice_to_shader_texture(
 /// fallback expand a full-range clip identically. Iterators that can be handed
 /// an arbitrary file should still gate on [`hw_convert_supports_pix_fmt`] at
 /// construction: reaching a refusal HERE is mid-stream, where no fallback is
-/// left.
+/// left. `bt2020` is the stream's `colorspace == BT.2020` tag (the QooCam's
+/// HLG stream); every other camera file is BT.709 — the CPU path makes the
+/// same choice through swscale (`set_sws_colorspace_details_mat`).
 ///
 /// # Safety
 /// `frame` must be a live `AV_PIX_FMT_D3D11` frame from a d3d11va decoder.
@@ -882,6 +897,7 @@ pub unsafe fn share_eye_converted(
     work_w: u32,
     work_h: u32,
     full_range: bool,
+    bt2020: bool,
 ) -> Option<D3d11SharedTexture> {
     let (tex, slice, dev, dctx) = extract_d3d11_from_frame(frame)?;
     if converter.is_none() {
@@ -907,7 +923,7 @@ pub unsafe fn share_eye_converted(
         frame.height().min(desc.Height).max(2) & !1,
     );
     let planar = copy_slice_to_shader_texture(&dev, &dctx, &tex, slice, nw, nh)?;
-    match conv.convert(&dev, &dctx, &planar, nw, nh, work_w, work_h, full_range) {
+    match conv.convert(&dev, &dctx, &planar, nw, nh, work_w, work_h, full_range, bt2020) {
         Ok(shared) => Some(shared),
         Err(e) => {
             tracing::warn!("share_eye_converted: convert failed: {e}");

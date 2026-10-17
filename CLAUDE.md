@@ -3,7 +3,7 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ Status: **Unreleased on `main`: X6 automatic per-frame eye-exposure matching (2026-09-27, item 15) + GoPro per-frame exposure timing from SHUT (2026-10-07, item 16).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
+## ⚡ Status: **Unreleased on `main`: X6 automatic per-frame eye-exposure matching (2026-09-27, item 15) + GoPro per-frame exposure timing from SHUT (2026-10-07, item 16) + Kandao QooCam 3 Ultra video/stills/audio (2026-10-14, item 23; Windows arms verified + matrix/gate fixes 2026-10-17, item 24).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
 
 VR180 Silver Bullet **2.0** is feature-complete and building/running on both
 **macOS (Apple Silicon)** and **Windows (NVIDIA)**. The Windows GPU-resident
@@ -1093,6 +1093,60 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      hard-coded fallback — never insert before it); eye-exposure matching
      stays X6-only (I-Log tuning).
 
+24. **QooCam on Windows (2026-10-17, Windows box).** Pulled the Kandao
+   batch, built clean first try, lib tests 57 / 38 / 81 green (the pipeline
+   test exe needs the FFmpeg DLL dir on PATH — `STATUS_DLL_NOT_FOUND`
+   otherwise). Test material on the NAS: the 2024 QooCam 3 Ultra clips under
+   `W:/Qi Siyang/20241101sandiskpro q3u/0617 q3 ultra/` are **STOCK-360
+   recordings (pre-mod: the two circles face opposite ways)**, so they prove
+   the Windows mechanics, not a stereo result; the only post-mod material
+   here is the Jan-2025 Interval DNG set (`W:/2026 2t nvme backup/250112
+   mod time/100QooCam/`, fw V1.1.0.10). Older firmwares V1.0.0.33b /
+   V1.0.1.6b / V1.0.2.6 all parse (same 13888×6944 lens record, 832.6 Hz
+   IMU on this unit — not 1 kHz; `imu_period_s` carries it; frame_quats ==
+   frame count; the `HDR` flag is 1 on the two 2024 HLG clips and 0 on the
+   60p one while every clip is tagged HLG — matches the mac reading).
+   `examples/kandao_probe.rs` (gitignored) prints all of it. The stacked
+   `D3d11SharedSbsIter` (edited blind) PASSES `sbs_zc_check` (now layout-
+   aware, with a per-channel readout) on 3472×6944 and 3840×7680: GPU-left
+   vs CPU-left 21 / 15 per 65535 against 6572 / 7751 cross-eye, work-res
+   exact, sustained 108 / 96 fps. THREE things fixed here:
+   (a) **the Windows export arm still declined the QooCam** — its `src_ok`
+   gate keyed on `SbsFisheye` (the iterator construction below it had been
+   updated, the gate had not), so every QooCam export took the portable
+   loop at 1.75 fps with the note "no GPU fast path for this source type".
+   Now `is_single_stream_pair()` (gate + the path-note ladder): ZERO-COPY
+   ENGAGED, libx265 5.2 fps, **NVENC 32.7 fps at 3840²/eye**, cpu-vs-zc
+   parity 0.775/255 max 23 (the OSV arm's class).
+   (b) **the D3D11 converter had BT.709 built in** (the mac side flagged it):
+   `ConvDims` now carries `(r_v, g_u, g_v, b_u)` from
+   `gpu::yuv_matrix_constants`, `P010Converter::convert` and
+   `share_eye_converted` take `bt2020` — the stream's `colorspace` tag read
+   at `D3d11SharedSbsIter` construction next to `full_range`; the dual-
+   stream and EAC iterators pass `false` (BT.709, as before). On the HLG
+   clips the GPU-vs-CPU per-channel error went R 106 / G 131 / B 44 → R 28
+   / G 18 / B 39 per 65535 (R and G both carry the 0.10·V term of the 709↔2020
+   difference, B only 0.026·U — the signature of a matrix mismatch, now gone).
+   (c) **single-lens recordings**: the camera's `Q180_…` mode writes ONE
+   3840×3840 circle at 60 fps with the same `kfix` boxes; `detect` returned
+   `KandaoQoocam` and the stacked split would have made two half-circle
+   "eyes" (the lens calib scaled to 3840×1920, fy halved). `detect` now
+   requires the stacked 1:2 frame (`kandao_frame_is_stacked`, largest video
+   stream `h == 2w`; an unopenable file keeps the Kandao kind) and returns
+   `Unknown` + a warn otherwise. Audio on Windows: Stereo export = 2-ch AAC
+   from `quad_to_stereo_aac` (the explicit-muxer open from item 20 carries
+   it — the `.m4a` temp would otherwise hit the gpl-lite `ipod` gap again),
+   Ambisonic = 4-ch AAC + SA3D injected; the channel-delay probe found no
+   coherent windows on these clips (nothing applied, logged). Stills: the
+   2025 Interval DNG (13888×6944, GAINMAP0/1) and a 2024 6944×3472 half-res
+   DNG (no gain maps) export in all five shapes incl. the native 6944² /
+   3472² tier on the 4090 (`dng_still_check_win` takes the native tier from
+   the file now). NO REGRESSION: a stash-build-run before/after sweep on
+   the OSV (cpu / zc readback / GPU-resident NVENC) and the `.360`
+   (GPU-resident NVENC) is **md5-identical** on every output — the cbuffer
+   matrix is a provable no-op for BT.709 sources (`scratchpad/gen/regress.ps1`).
+   GUI not driven headless; launched on a clip for the user.
+
 20. **X6 360° Audio on Windows (2026-10-10, Windows box)** — the mac
    side's ambisonic work pulled, built clean first try (the new `build.rs`
    helper rebuild is gated on `CARGO_CFG_TARGET_OS`, a no-op here); export
@@ -1151,11 +1205,6 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
 
 21. **2.5.2 release (2026-10-10) — macOS PUBLISHED (tag `v2.5.2` @ `fe41028`,
    marked Latest; live `releases/latest/download/latest.json` serves 2.5.2
-   — NOTE: the standalone `.minisig` files uploaded to v2.5.2 (mac first,
-   Windows mirrored it) are REDUNDANT: the updater verifies the artifact
-   against the base64 `signature` field inside `latest.json`, which IS the
-   `.minisig` content; 2.5.0/2.5.1 never shipped the file. Release assets =
-   DMG + app zip + setup.exe + portable zip + latest.json, nothing else
    darwin-aarch64); **Windows RELEASED 2026-10-10** (Windows box).** macOS side cut with
    `scripts/release_mac.sh` at `8dfa2d8`: bundle 2.5.2, helpers hash-current,
    app + DMG notarized (Accepted) and stapled, `spctl` "Notarized Developer
@@ -1180,6 +1229,11 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    and installer sha256 identical to local; the live installer verifies
    against the signature IN the live manifest with the updater.rs pubkey;
    darwin entry present. Feed serves 2.5.2 to BOTH platforms.
+   — NOTE: the standalone `.minisig` files uploaded to v2.5.2 (mac first,
+   Windows mirrored it) are REDUNDANT: the updater verifies the artifact
+   against the base64 `signature` field inside `latest.json`, which IS the
+   `.minisig` content; 2.5.0/2.5.1 never shipped the file. Release assets =
+   DMG + app zip + setup.exe + portable zip + latest.json, nothing else
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
