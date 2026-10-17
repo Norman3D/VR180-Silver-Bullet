@@ -12,10 +12,23 @@ Pipeline per cube node (input = the decoded full-range HLG signal R'G'B'):
      the pixel's luminance, then clipped.
   5. BT.1886 inverse EOTF (γ 2.4) → the same display-referred Rec.709 the
      other built-in camera LUTs produce.
+  0. (before all of that) the input signal is scaled by INPUT_GAIN = 0.77.
+     The camera does not keep the BT.2100 headroom: measured over five clips
+     of both units, 90 % of pixels sit below HLG 0.72–0.81 but 1 % are above
+     0.94–1.0 and 2–4 % above 0.9 (skies, specular) — ordinary scene content
+     runs to full scale. With reference white at 75 % (step 3) everything
+     above HLG ~0.65 landed in the shoulder and read as blown. The user
+     found the picture right with the app's pre-LUT CDL gain at 0.77
+     (2026-10-17); that scaling is baked in here so gain 1.0 is the default
+     look: full scale now reaches SDR 0.977 through the shoulder, HLG 0.75
+     → 0.635, 0.5 → 0.43 (Kandao Studio's own SDR export maps 0.68 → 0.77,
+     0.5 → ~0.6, 1.0 → 1.0 — brighter mids; not copied, the user's
+     judgement is the reference for tone).
 Writes crates/vr180-gui/assets/kandao_hlg_bt2020_to_rec709.cube (33³).
 """
 import numpy as np, os
 N = 33
+INPUT_GAIN = 0.77
 out = os.path.join(os.path.dirname(__file__), '..', 'crates', 'vr180-gui', 'assets', 'kandao_hlg_bt2020_to_rec709.cube')
 g = np.linspace(0.0, 1.0, N)
 # .cube order: red fastest, then green, then blue.
@@ -25,7 +38,7 @@ rgb = np.stack([r, gg, b], -1).reshape(-1, 3)
 a, bb, c = 0.17883277, 0.28466892, 0.55991073
 def hlg_inv_oetf(e):
     return np.where(e <= 0.5, e * e / 3.0, (np.exp((e - c) / a) + bb) / 12.0)
-scene = hlg_inv_oetf(np.clip(rgb, 0.0, 1.0))
+scene = hlg_inv_oetf(np.clip(rgb * INPUT_GAIN, 0.0, 1.0))
 ys = scene @ np.array([0.2627, 0.6780, 0.0593])
 disp = scene * (np.maximum(ys, 1e-12) ** 0.2)[:, None]          # OOTF, γ = 1.2
 x = disp * (1000.0 / 203.0)                                       # 203 nit → SDR white
@@ -52,5 +65,5 @@ with open(out, 'w') as f:
         f.write(f'{v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n')
 print('wrote', out, outv.shape)
 # sanity: 75% grey HLG → ~1.0 SDR; 50% → ?
-for e in (0.25, 0.5, 0.75, 1.0):
-    s = hlg_inv_oetf(np.array([e])); d = s * s ** 0.2; v = shoulder(d * 1000 / 203); print(f'HLG {e:.2f} -> scene {s[0]:.4f} disp {d[0]:.4f} ({d[0]*1000:.0f} nit) sdr lin {v[0]:.3f} code {v[0]**(1/2.4):.3f}')
+for e in (0.25, 0.5, 0.75, 0.9, 1.0):
+    s = hlg_inv_oetf(np.array([e * INPUT_GAIN])); d = s * s ** 0.2; v = shoulder(d * 1000 / 203); print(f'HLG {e:.2f} (x{INPUT_GAIN} = {e*INPUT_GAIN:.3f}) -> scene {s[0]:.4f} disp {d[0]:.4f} ({d[0]*1000:.0f} nit) sdr lin {v[0]:.3f} code {v[0]**(1/2.4):.3f}')

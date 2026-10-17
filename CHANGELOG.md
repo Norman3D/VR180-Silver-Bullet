@@ -30,7 +30,10 @@ file, stills, and the camera's own colour handling.
   built-in HLG → Rec.709 conversion (BT.2100 inverse OETF, 1000 nit OOTF,
   BT.2408 reference-white scaling with a soft highlight shoulder) is
   applied on load like the other cameras' log LUTs, keyed on the stream's
-  transfer tag; a Rec.709-tagged clip needs nothing.
+  transfer tag; a Rec.709-tagged clip needs nothing. The conversion is
+  scaled for the way this camera uses the HLG range (ordinary scenes run
+  to full scale rather than stopping at the HDR reference white), so
+  skies and bright surfaces keep their detail instead of clipping.
 - **HDR readout mode.** The camera's HDR setting is a slower sensor scan
   for more dynamic range; the app reads the flag from the file and uses
   that mode's measured readout time and frame-stamp timing for the
