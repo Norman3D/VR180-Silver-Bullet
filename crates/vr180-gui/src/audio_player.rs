@@ -277,10 +277,10 @@ fn decoder_worker(
         Some(StereoMix::Quad) => {
             // The file's own channel misalignment (measured at the source
             // rate, applied after the resampler → scaled to the device rate).
-            let d = vr180_pipeline::audio::measure_quad_channel_delays(&path, audio_idx, 0.0, None);
+            let mut cal = vr180_pipeline::audio::measure_quad_calibration(&path, audio_idx, 0.0, None);
             let scale = device_sample_rate as f64 / src_rate.max(1) as f64;
-            let delays: vr180_pipeline::audio::QuadDelays = std::array::from_fn(|k| (d[k] as f64 * scale).round() as usize);
-            Some(vr180_pipeline::audio::QuadEncoder::new(device_sample_rate, 1.0).with_delays(delays))
+            cal.delays = std::array::from_fn(|k| (cal.delays[k] as f64 * scale).round() as usize);
+            Some(vr180_pipeline::audio::QuadEncoder::new(device_sample_rate, 1.0).with_calibration(cal))
         }
         _ => None,
     };

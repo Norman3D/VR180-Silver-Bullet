@@ -178,8 +178,25 @@ pub fn foa_to_stereo_sample(wyzx: [f32; 4]) -> [f32; 2] {
 /// over coherent windows is shifted by a latency and only widened by
 /// acoustics, so the range midpoints give the per-channel delay; applied
 /// when the four fit the six pairs within 3.5 samples and the largest is
-/// ≥ 3) and [`QuadEncoder::with_delays`] re-aligns the channels before
-/// anything else.
+/// ≥ 3) and [`QuadEncoder::with_calibration`] re-aligns the channels
+/// before anything else.
+///
+/// Channel response. The capsules are not matched either. Quiet-window
+/// band levels relative to the four-channel mean, the same in every clip
+/// of a unit: unit 2 below ~500 Hz ch0 +5 dB, ch1 −8, ch2 −4, ch3 −5, and
+/// from 600 Hz up ch0 +2, ch1 −3, ch2/ch3 0 (a low-cut on three of the
+/// four, apparently); unit 1 a flatter ±3 dB spread (ch0 +2…+3, ch1/ch3
+/// −2…−4). Unmatched, the front − back difference below 500 Hz is mostly
+/// `(g0 − g2)·p` — pressure leaking into the dipole, larger than the
+/// gradient itself — so the same probe measures each channel's level in
+/// a low band (150–500 Hz) and a mid band (600–4000 Hz) over the quieter
+/// half of the windows and the encoder balances each OPPOSITE PAIR
+/// (ch0/ch2, ch1/ch3) about its geometric mean with a first-order low
+/// shelf at 500 Hz: the pressure leak is gone, and no pair as a whole is
+/// boosted or cut (matching all four to one mean instead scaled the X
+/// and Y dipoles differently — ×0.84 vs ×1.5 in the mid band on unit 2 —
+/// and pulled every direction ~20° sideways on both units' clips). ±12 dB
+/// at most, nothing below 1 dB.
 ///
 /// Encoding. A spaced pair's difference is the pressure GRADIENT: for a
 /// plane wave it is `j·k·d·cos θ` times the pressure — 90° out of phase
@@ -309,17 +326,49 @@ impl Delay {
 /// [`measure_quad_channel_delays`]; all zero when nothing is needed.
 pub type QuadDelays = [usize; 4];
 
+/// Per-channel level trims `[low band, mid band]` as linear gains (1.0 =
+/// none) — see [`quad_trims_from_pcm`].
+pub type QuadTrims = [[f32; 2]; 4];
+
+/// Everything the encoder needs to undo a file's channel mismatch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuadCalibration { pub delays: QuadDelays, pub trims: QuadTrims }
+
+impl Default for QuadCalibration {
+    fn default() -> Self { Self { delays: [0; 4], trims: [[1.0; 2]; 4] } }
+}
+
+/// Corner between the two trim bands (Hz).
+pub const KANDAO_TRIM_SHELF_HZ: f32 = 500.0;
+
+/// A per-channel first-order low shelf: `g_mid·x + (g_low − g_mid)·LP(x)`.
+#[derive(Clone, Debug)]
+struct Shelf { alpha: f32, g_low: f32, g_mid: f32, lp: f32 }
+
+impl Shelf {
+    fn new(rate: f32, trims: [f32; 2]) -> Self {
+        Self { alpha: 1.0 - (-std::f32::consts::TAU * KANDAO_TRIM_SHELF_HZ / rate).exp(), g_low: trims[0], g_mid: trims[1], lp: 0.0 }
+    }
+    fn reset(&mut self) { self.lp = 0.0; }
+    #[inline]
+    fn run(&mut self, x: f32) -> f32 {
+        self.lp += self.alpha * (x - self.lp);
+        self.g_mid * x + (self.g_low - self.g_mid) * self.lp
+    }
+}
+
 /// The QooCam capsule array → first-order AmbiX `[W, Y, Z, X]` (and the
 /// stereo pair of it), carrying the filters' state — one per decoded
 /// stream. `gain` multiplies the built-in ×[`KANDAO_QUAD_GAIN`].
 #[derive(Clone, Debug)]
-pub struct QuadEncoder { gain: f32, align: [Delay; 4], hp_w: Hp2, ap_w: Ap1, eq_x: GradEq, eq_y: GradEq }
+pub struct QuadEncoder { gain: f32, rate: f32, align: [Delay; 4], trim: [Shelf; 4], hp_w: Hp2, ap_w: Ap1, eq_x: GradEq, eq_y: GradEq }
 
 impl QuadEncoder {
     pub fn new(sample_rate: u32, gain: f32) -> Self {
         let r = sample_rate.max(1) as f32;
         Self {
-            gain: gain * KANDAO_QUAD_GAIN, align: Default::default(),
+            gain: gain * KANDAO_QUAD_GAIN, rate: r, align: Default::default(),
+            trim: std::array::from_fn(|_| Shelf::new(r, [1.0, 1.0])),
             hp_w: Hp2::new(r, KANDAO_GRAD_HP_HZ), ap_w: Ap1::new(r, KANDAO_GRAD_WIND_HZ),
             eq_x: GradEq::new(r), eq_y: GradEq::new(r),
         }
@@ -330,15 +379,24 @@ impl QuadEncoder {
         for (k, d) in delays.iter().enumerate() { self.align[k] = Delay::new(*d); }
         self
     }
+    /// Trim each channel's low and mid band to the array mean.
+    pub fn with_trims(mut self, trims: QuadTrims) -> Self {
+        for (k, t) in trims.iter().enumerate() { self.trim[k] = Shelf::new(self.rate, *t); }
+        self
+    }
+    /// Both of the above from one [`QuadCalibration`] (delays already at
+    /// this encoder's rate).
+    pub fn with_calibration(self, cal: QuadCalibration) -> Self { self.with_delays(cal.delays).with_trims(cal.trims) }
     /// Forget the filter history (after a seek).
     pub fn reset(&mut self) {
         self.align.iter_mut().for_each(Delay::reset);
+        self.trim.iter_mut().for_each(Shelf::reset);
         self.hp_w.reset(); self.ap_w.reset(); self.eq_x.reset(); self.eq_y.reset();
     }
     /// One sample of the four capsules (decoded channel order) → `[W, Y, Z, X]`.
     #[inline]
     pub fn foa(&mut self, c: [f32; 4]) -> [f32; 4] {
-        let c = [self.align[0].run(c[0]), self.align[1].run(c[1]), self.align[2].run(c[2]), self.align[3].run(c[3])];
+        let c: [f32; 4] = std::array::from_fn(|k| self.trim[k].run(self.align[k].run(c[k])));
         let w = self.ap_w.run(self.hp_w.run(0.25 * (c[0] + c[1] + c[2] + c[3])));
         let x = self.eq_x.run(c[KANDAO_CAPSULE_FRONT] - c[KANDAO_CAPSULE_BACK]);
         let y = self.eq_y.run(c[KANDAO_CAPSULE_LEFT] - c[KANDAO_CAPSULE_RIGHT]);
@@ -365,9 +423,9 @@ pub enum Mix<'a> {
     /// A fixed matrix, one row per output channel (the X6's AmbiX → stereo).
     Matrix(&'a [[f32; 4]]),
     /// The QooCam capsules → AmbiX `[W, Y, Z, X]` through [`QuadEncoder`].
-    QuadFoa { gain: f32, delays: QuadDelays },
+    QuadFoa { gain: f32, cal: QuadCalibration },
     /// The QooCam capsules → the stereo pair through [`QuadEncoder`].
-    QuadStereo { gain: f32, delays: QuadDelays },
+    QuadStereo { gain: f32, cal: QuadCalibration },
 }
 
 impl Mix<'_> {
@@ -383,8 +441,8 @@ impl<'a> MixState<'a> {
     fn new(mix: Mix<'a>, rate: u32) -> Self {
         match mix {
             Mix::Matrix(m) => MixState::Matrix(m),
-            Mix::QuadFoa { gain, delays } => MixState::QuadFoa(QuadEncoder::new(rate, gain).with_delays(delays)),
-            Mix::QuadStereo { gain, delays } => MixState::QuadStereo(QuadEncoder::new(rate, gain).with_delays(delays)),
+            Mix::QuadFoa { gain, cal } => MixState::QuadFoa(QuadEncoder::new(rate, gain).with_calibration(cal)),
+            Mix::QuadStereo { gain, cal } => MixState::QuadStereo(QuadEncoder::new(rate, gain).with_calibration(cal)),
         }
     }
     #[inline]
@@ -813,17 +871,97 @@ pub fn foa_to_stereo_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: 
 pub const KANDAO_PEAK_TARGET: f32 = 0.7;
 
 /// What a Kandao export window needs before encoding: the channel
-/// re-alignment read off the file ([`measure_quad_channel_delays`]) and the
+/// calibration read off the file ([`measure_quad_calibration`]) and the
 /// gain on top of the encoder's ×3 (see [`KANDAO_PEAK_TARGET`]; 1.0 when the
 /// window is silent or cannot be read).
-pub fn kandao_window_prep(input: &Path, stream_index: usize, offset_s: f64, dur_s: Option<f64>) -> (f32, QuadDelays) {
-    let delays = measure_quad_channel_delays(input, stream_index, offset_s, dur_s);
-    let gain = match mixed_window_peak(input, stream_index, offset_s, dur_s, Mix::QuadFoa { gain: 1.0, delays }) {
+pub fn kandao_window_prep(input: &Path, stream_index: usize, offset_s: f64, dur_s: Option<f64>) -> (f32, QuadCalibration) {
+    let cal = measure_quad_calibration(input, stream_index, offset_s, dur_s);
+    let gain = match mixed_window_peak(input, stream_index, offset_s, dur_s, Mix::QuadFoa { gain: 1.0, cal }) {
         Ok(peak) if peak > 1e-5 => (KANDAO_PEAK_TARGET / peak).clamp(0.5, 16.0),
         Ok(_) => 1.0,
         Err(e) => { tracing::warn!("kandao audio: peak pre-pass failed ({e}) — unity gain"); 1.0 }
     };
-    (gain, delays)
+    (gain, cal)
+}
+
+/// [`measure_quad_channel_delays`] and [`quad_trims_from_pcm`] from one
+/// decode of the first [`QUAD_DELAY_PROBE_S`] of the window.
+pub fn measure_quad_calibration(input: &Path, stream_index: usize, offset_s: f64, dur_s: Option<f64>) -> QuadCalibration {
+    let probe = Some(dur_s.map_or(QUAD_DELAY_PROBE_S, |d| d.min(QUAD_DELAY_PROBE_S)));
+    let mut pcm: Vec<f32> = Vec::new();
+    let rate = match decode_quad_window(input, stream_index, offset_s, probe, &mut |chunk| pcm.extend_from_slice(chunk)) {
+        Ok(r) => r as f32,
+        Err(e) => { tracing::warn!("kandao audio: calibration probe failed ({e}) — none applied"); return QuadCalibration::default(); }
+    };
+    QuadCalibration { delays: quad_channel_delays_from_pcm(&pcm, rate), trims: quad_trims_from_pcm(&pcm, rate) }
+}
+
+/// Per-channel level trims of a QooCam capsule track (see the
+/// channel-response notes above [`KANDAO_QUAD_GAIN`]): each channel's
+/// energy in a low band (150–500 Hz) and a mid band (600–4000 Hz) per
+/// 2048-sample window; over the quieter half of the windows (by mid-band
+/// total — the ambient, not the talker in front of one capsule) the
+/// median of the channel's level relative to the four-channel mean; each
+/// opposite pair is then balanced about its own geometric mean (half the
+/// pair's difference up on one, down on the other), clamped to ±12 dB,
+/// unity when every pair is within 1 dB.
+pub fn quad_trims_from_pcm(pcm: &[f32], rate: f32) -> QuadTrims {
+    const WIN: usize = 2048;
+    let n = pcm.len() / 4;
+    if n < WIN * 8 { return [[1.0; 2]; 4]; }
+    let band = |lo: f32, hi: f32| -> Vec<Vec<f32>> {
+        let bh = 1.0 / (1.0 + std::f32::consts::TAU * lo / rate);
+        let al = 1.0 - (-std::f32::consts::TAU * hi / rate).exp();
+        (0..4).map(|k| {
+            let mut v: Vec<f32> = pcm.iter().skip(k).step_by(4).copied().collect();
+            for _ in 0..2 {
+                let (mut xp, mut yp) = (0.0f32, 0.0f32);
+                for x in v.iter_mut() { let y = bh * (yp + *x - xp); xp = *x; yp = y; *x = y; }
+                let mut lp = 0.0f32;
+                for x in v.iter_mut() { lp += al * (*x - lp); *x = lp; }
+            }
+            v
+        }).collect()
+    };
+    let bands = [band(150.0, 500.0), band(600.0, 4000.0)];
+    let nw = n / WIN;
+    // per window: [band][channel] energy
+    let mut e = vec![[[0f32; 4]; 2]; nw];
+    for (w, ew) in e.iter_mut().enumerate() {
+        for b in 0..2 { for k in 0..4 {
+            ew[b][k] = bands[b][k][w * WIN..(w + 1) * WIN].iter().map(|v| v * v).sum::<f32>() / WIN as f32;
+        } }
+    }
+    let mut total: Vec<f32> = e.iter().map(|ew| ew[1].iter().sum::<f32>()).collect();
+    total.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = total[total.len() / 2];
+    let mut level = [[0f32; 2]; 4];   // dB relative to the four-channel mean, per band
+    for b in 0..2 {
+        for k in 0..4 {
+            let mut rel: Vec<f32> = e.iter()
+                .filter(|ew| ew[1].iter().sum::<f32>() <= median)
+                .filter_map(|ew| {
+                    let mean = ew[b].iter().sum::<f32>() / 4.0;
+                    (mean > 1e-12 && ew[b][k] > 1e-12).then(|| 10.0 * (ew[b][k] / mean).log10())
+                }).collect();
+            if rel.len() < 20 { return [[1.0; 2]; 4]; }
+            rel.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            level[k][b] = rel[rel.len() / 2];
+        }
+    }
+    let mut trims = [[1.0f32; 2]; 4];
+    let mut largest_db = 0f32;
+    for (i, j) in [(KANDAO_CAPSULE_FRONT, KANDAO_CAPSULE_BACK), (KANDAO_CAPSULE_LEFT, KANDAO_CAPSULE_RIGHT)] {
+        for b in 0..2 {
+            let half = (0.5 * (level[i][b] - level[j][b])).clamp(-12.0, 12.0);
+            largest_db = largest_db.max(half.abs() * 2.0);
+            trims[i][b] = 10f32.powf(-half / 20.0);
+            trims[j][b] = 10f32.powf(half / 20.0);
+        }
+    }
+    if largest_db < 1.0 { return [[1.0; 2]; 4]; }
+    tracing::info!(?level, ?trims, "kandao audio: balancing the capsule pairs (low / mid band)");
+    trims
 }
 
 /// Seconds of a track the channel-delay measurement looks at.
@@ -1001,12 +1139,12 @@ pub fn quad_to_foa_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Op
     let info = probe_foa_aac(input)?
         .ok_or_else(|| Error::Ffmpeg(format!("no 4-channel AAC track in {input:?}")))?;
     let t0 = std::time::Instant::now();
-    let (g, delays) = kandao_window_prep(input, info.stream_index, offset_s, dur_s);
+    let (g, cal) = kandao_window_prep(input, info.stream_index, offset_s, dur_s);
     let n = transcode_audio_window(
         input, info.stream_index, output_m4a, offset_s, dur_s,
-        Some(Mix::QuadFoa { gain: g, delays }), AudioOut::Aac4 { bit_rate },
+        Some(Mix::QuadFoa { gain: g, cal }), AudioOut::Aac4 { bit_rate },
     )?;
-    tracing::info!(m4a = %output_m4a.display(), samples = n, gain = g, ?delays, took_ms = t0.elapsed().as_millis() as u64,
+    tracing::info!(m4a = %output_m4a.display(), samples = n, gain = g, ?cal, took_ms = t0.elapsed().as_millis() as u64,
         "QooCam 4-channel audio: encoded first-order AmbiX AAC");
     Ok(n)
 }
@@ -1016,10 +1154,10 @@ pub fn quad_to_foa_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Op
 pub fn quad_to_foa_wav(input: &Path, output_wav: &Path, offset_s: f64, dur_s: Option<f64>) -> Result<u64> {
     let info = probe_foa_aac(input)?
         .ok_or_else(|| Error::Ffmpeg(format!("no 4-channel AAC track in {input:?}")))?;
-    let (g, delays) = kandao_window_prep(input, info.stream_index, offset_s, dur_s);
+    let (g, cal) = kandao_window_prep(input, info.stream_index, offset_s, dur_s);
     transcode_audio_window(
         input, info.stream_index, output_wav, offset_s, dur_s,
-        Some(Mix::QuadFoa { gain: g, delays }), AudioOut::Pcm24 { channels: 4 },
+        Some(Mix::QuadFoa { gain: g, cal }), AudioOut::Pcm24 { channels: 4 },
     )
 }
 
@@ -1033,10 +1171,10 @@ pub fn quad_to_stereo_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s:
     let t0 = std::time::Instant::now();
     // The same gain the ambisonic export of this window would get, so the
     // formats agree in level.
-    let (g, delays) = kandao_window_prep(input, info.stream_index, offset_s, dur_s);
+    let (g, cal) = kandao_window_prep(input, info.stream_index, offset_s, dur_s);
     let n = transcode_audio_window(
         input, info.stream_index, output_m4a, offset_s, dur_s,
-        Some(Mix::QuadStereo { gain: g, delays }), AudioOut::AacStereo { bit_rate },
+        Some(Mix::QuadStereo { gain: g, cal }), AudioOut::AacStereo { bit_rate },
     )?;
     tracing::info!(m4a = %output_m4a.display(), samples = n, sample_rate = info.sample_rate, gain = g,
         window_start_s = offset_s, window_s = dur_s.unwrap_or(f64::NAN), took_ms = t0.elapsed().as_millis() as u64,
@@ -1417,6 +1555,33 @@ mod foa_tests {
         let d = quad_channel_delays_from_pcm(&late, 48_000.0);
         assert!(d[0] == 0 && (1..4).all(|k| (d[k] as i32 - 14).abs() <= 1), "measured delays {d:?}");
         assert_eq!(quad_channel_delays_from_pcm(&aligned, 48_000.0), [0; 4]);
+        // Level trims: channel 1 recorded 8 dB low below 500 Hz and 3 dB low
+        // above (the second unit's pattern) on a two-band noise field;
+        // the trims bring it back to the mean within 1 dB, and a matched
+        // track gets none.
+        let mut lo = 0f32; let mut hi_prev = 0f32;
+        let (a_lo, a_hi) = (1.0 - (-std::f32::consts::TAU * 300.0 / 48_000.0).exp(), 1.0 / (1.0 + std::f32::consts::TAU * 1000.0 / 48_000.0));
+        let mut mismatched = Vec::with_capacity(len * 4);
+        let mut matched = Vec::with_capacity(len * 4);
+        let (g_lo, g_hi) = (10f32.powf(-8.0 / 20.0), 10f32.powf(-3.0 / 20.0));
+        let mut xp = 0f32;
+        for _ in 0..len {
+            let x = rnd();
+            lo += a_lo * (x - lo);                         // low-band noise (< ~300 Hz)
+            let hi = a_hi * (hi_prev + x - xp); xp = x; hi_prev = hi;   // high-band noise (> ~1 kHz)
+            let base = lo + 0.3 * hi;
+            matched.extend_from_slice(&[base, base, base, base]);
+            mismatched.extend_from_slice(&[base, g_lo * lo + g_hi * 0.3 * hi, base, base]);
+        }
+        assert_eq!(quad_trims_from_pcm(&matched, 48_000.0), [[1.0; 2]; 4]);
+        let t = quad_trims_from_pcm(&mismatched, 48_000.0);
+        let db = |g: f32| 20.0 * g.log10();
+        // expected: the 1/3 pair balanced about its mean — channel 1 up by
+        // half the gap (4 dB / 1.5 dB), channel 3 down by the same; the 0/2
+        // pair untouched.
+        assert!((db(t[1][0]) - 4.0).abs() < 1.0 && (db(t[3][0]) + 4.0).abs() < 1.0, "low trims ch1 {} ch3 {} dB", db(t[1][0]), db(t[3][0]));
+        assert!((db(t[1][1]) - 1.5).abs() < 1.0 && (db(t[3][1]) + 1.5).abs() < 1.0, "mid trims ch1 {} ch3 {} dB", db(t[1][1]), db(t[3][1]));
+        assert!(db(t[0][0]).abs() < 0.5 && db(t[2][1]).abs() < 0.5, "pair 0/2 should stay at unity: {:?} {:?}", t[0], t[2]);
         // A static capsule offset (mismatch, wind) does not reach the dipoles.
         let mut enc = QuadEncoder::new(48_000, 1.0);
         let mut last = [0f32; 4];

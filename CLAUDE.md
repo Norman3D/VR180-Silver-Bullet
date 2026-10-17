@@ -1051,7 +1051,29 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      the right): measured [0, 8, 7, 12]; before: loud windows piled at
      −60…−30° and −180…−120°; after: loudest 5 % → 177°, the children at
      −30…0° / −60…−30°, nothing on the left; the park clip (unit 1) measures
-     [2,2,2,0] → untouched. `$SP/zoe/mic/kids/{kids,offsets,offset2..4}.py`.
+     [2,2,2,0] → untouched. `$SP/zoe/mic/kids/{kids,offsets,offset2..5}.py`.
+     The estimate is good to ~±4 samples (independent quiet-window NCC
+     put the kids clip at 13–15 where the midpoint method says 8–12; the
+     range midpoint is biased when one side's sources sit nearer) — that
+     is ~±15° of azimuth, not a face flip; 300–4000 Hz with p3/p97 was the
+     only stable variant (narrower bands lose the windows). **Channel
+     response (2026-10-17)**: capsule levels differ too, the same in every
+     clip of a unit (`gains.py`): unit 2 below ~500 Hz ch0 +5 dB, ch1 −8,
+     ch2 −4, ch3 −5 (a low-cut on three of four), 600 Hz up ch0 +2, ch1
+     −3, ch2/3 0; unit 1 a flat ±3 dB spread. Below 500 Hz the F–B
+     difference is then mostly `(g0 − g2)·p` (1.07 p vs a 0.47 p
+     gradient at 300 Hz). `quad_trims_from_pcm` (same probe decode, quiet
+     half of the windows by mid-band total, 150–500 and 600–4000 Hz
+     medians) → `QuadEncoder::with_trims`: a first-order low shelf at
+     500 Hz per channel that balances each OPPOSITE PAIR about its own
+     geometric mean (ch0/ch2, ch1/ch3). TRAP: matching all four to one
+     mean scaled X by ×0.84 and Y by ×1.5 (mid band, unit 2) and pulled
+     every direction ~20° sideways on BOTH units' clips — pair balancing
+     keeps each dipole's gain and only removes the leak. `QuadCalibration
+     { delays, trims }` travels in `Mix::Quad*` / `kandao_window_prep` /
+     the player (`measure_quad_calibration`). Verified: kids clip loudest
+     5 % → 174°, children at −30…0° (91 windows) / −60…−30° (28), nothing
+     left; park 178°, front cluster −60…+30°.
      Level: the capsules sit 15–20 dB low
      and vary by that between clips, and there is no limiter, so every
      export window is decoded once through the encoder first and scaled to
