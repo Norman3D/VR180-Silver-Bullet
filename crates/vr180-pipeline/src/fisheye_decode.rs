@@ -32,6 +32,32 @@ use crate::source_kind::EyeLayout;
 use crate::{Error, Result};
 use std::path::Path;
 
+/// Tell a demuxer's genuine end of stream apart from a READ ERROR. ffmpeg's
+/// `av_read_frame` answers `AVERROR_EOF` for both: a failed read on the
+/// `file` protocol (a network share that stalls or drops mid-read) sets the
+/// avio context's `eof_reached` AND its `error`, and the mov demuxer then
+/// reports EOF. `packets().next()` folds that into `None`, which every
+/// iterator read as a clean end of stream — a preview decoder exited
+/// "cleanly" after ZERO frames and the GUI sat on "Click ▶ Play" (a QooCam
+/// clip on an SMB share, 2026-10-17: the thread ended 240 ms after
+/// construction, no frame, no error). `Ok(())` for a true EOF; `Err` naming
+/// the errno when the avio context carries one, so the caller fails loudly
+/// and the GUI can respawn instead of believing the clip ended.
+fn demux_eof_or_error(ictx: &ffmpeg_next::format::context::Input, what: &str) -> Result<()> {
+    // SAFETY: read-only access to the AVFormatContext's `pb` pointer and the
+    // AVIOContext's POD `error` field; both are owned by `ictx`, which the
+    // shared borrow keeps alive.
+    let err = unsafe {
+        let pb = (*ictx.as_ptr()).pb;
+        if pb.is_null() { 0 } else { (*pb).error }
+    };
+    if err == 0 { return Ok(()); }
+    Err(Error::Ffmpeg(format!(
+        "{what}: demuxer read error {} (not the end of the stream)",
+        ffmpeg_next::Error::from(err)
+    )))
+}
+
 /// Per-stream packet staging for dual-stream files.
 ///
 /// DJI OSV interleaves its two video streams frame by frame; Insta360 INSV
@@ -88,7 +114,14 @@ impl DualPacketPump {
                         self.queues[slot].push_back(packet);
                     }
                 }
-                None => self.eof = true,
+                None => {
+                    self.eof = true;
+                    // The pump's callers read `None` as the end of the stream;
+                    // at least say so when it was a read error instead.
+                    if let Err(e) = demux_eof_or_error(ictx, "dual-stream demux") {
+                        tracing::warn!("{e} — treated as end of stream");
+                    }
+                }
             }
         }
     }
@@ -611,12 +644,18 @@ impl FisheyePairIter for SbsFisheyeIter {
             }
 
             // Need more packets.
-            match self.ictx.packets().next() {
+            let eof = match self.ictx.packets().next() {
                 Some((stream, packet)) => {
                     if stream.index() != self.video_idx { continue; }
                     let _ = self.decoder.send_packet(&packet);
+                    false
                 }
-                None => {
+                None => true,
+            };
+            if eof {
+                    // A read ERROR reports as EOF too — never end the stream
+                    // "cleanly" on one (see `demux_eof_or_error`).
+                    demux_eof_or_error(&self.ictx, "SBS decode")?;
                     // Drain.
                     let _ = self.decoder.send_eof();
                     if self.decoder.receive_frame(&mut decoded).is_ok() {
@@ -632,7 +671,6 @@ impl FisheyePairIter for SbsFisheyeIter {
                         }));
                     }
                     return Ok(None);
-                }
             }
         }
     }
@@ -2056,7 +2094,7 @@ impl VtSharedSbsIter {
                 // Need more packets; drain at EOF.
                 let mut got = false;
                 loop {
-                    match self.ictx.packets().next() {
+                    let eof = match self.ictx.packets().next() {
                         Some((stream, packet)) => {
                             if stream.index() != self.video_idx { continue; }
                             let _ = self.decoder.send_packet(&packet);
@@ -2064,12 +2102,17 @@ impl VtSharedSbsIter {
                                 got = true;
                                 break;
                             }
+                            false
                         }
-                        None => {
-                            let _ = self.decoder.send_eof();
-                            got = self.decoder.receive_frame(&mut decoded).is_ok();
-                            break;
-                        }
+                        None => true,
+                    };
+                    if eof {
+                        // A read ERROR reports as EOF too — never end the
+                        // stream "cleanly" on one (see `demux_eof_or_error`).
+                        demux_eof_or_error(&self.ictx, "zero-copy single-stream")?;
+                        let _ = self.decoder.send_eof();
+                        got = self.decoder.receive_frame(&mut decoded).is_ok();
+                        break;
                     }
                 }
                 got
@@ -2529,7 +2572,7 @@ impl D3d11SharedSbsIter {
                 // Need more packets; drain at EOF.
                 let mut got = false;
                 loop {
-                    match self.ictx.packets().next() {
+                    let eof = match self.ictx.packets().next() {
                         Some((stream, packet)) => {
                             if stream.index() != self.video_idx { continue; }
                             let _ = self.decoder.send_packet(&packet);
@@ -2537,12 +2580,17 @@ impl D3d11SharedSbsIter {
                                 got = true;
                                 break;
                             }
+                            false
                         }
-                        None => {
-                            let _ = self.decoder.send_eof();
-                            got = self.decoder.receive_frame(&mut decoded).is_ok();
-                            break;
-                        }
+                        None => true,
+                    };
+                    if eof {
+                        // A read ERROR reports as EOF too — never end the
+                        // stream "cleanly" on one (see `demux_eof_or_error`).
+                        demux_eof_or_error(&self.ictx, "zero-copy single-stream")?;
+                        let _ = self.decoder.send_eof();
+                        got = self.decoder.receive_frame(&mut decoded).is_ok();
+                        break;
                     }
                 }
                 got
@@ -2819,6 +2867,11 @@ impl D3d11SharedStreamPairIter {
                 }
             }
 
+            if frames.iter().any(|f| f.is_none()) {
+                // The demuxer ran out before both eyes arrived — a read ERROR
+                // reports as EOF too (see `demux_eof_or_error`).
+                demux_eof_or_error(&self.ictx, "zero-copy EAC")?;
+            }
             let (Some((f0, pts0)), Some((f4, _pts4))) = (frames[0].take(), frames[1].take()) else {
                 return Ok(None);
             };

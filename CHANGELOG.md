@@ -71,6 +71,12 @@ file, stills, and the camera's own colour handling.
   had BT.709 built in). A single-lens QooCam recording (`Q180_…`, one
   3840×3840 circle) is reported as an unsupported format instead of being
   split into two half-eyes.
+- **Preview no longer dies silently on a network read error.** A stalled
+  read from a network share reported as end-of-stream, so the preview
+  decoder could exit after zero frames and leave the window on "Click ▶
+  Play" with Play doing nothing. The decoders now tell a read error from
+  the end of the clip (the error is logged), and the app restarts a
+  decoder once by itself when it stops before its first frame.
 
 ## 2.5.2 — 2026-10-10
 

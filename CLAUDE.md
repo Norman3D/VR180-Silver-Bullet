@@ -1160,6 +1160,25 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    previous one to `vr180-gui.prev.log` first (`main.rs`). Also seen there:
    QooCam Studio's `KDOutput/*_Output.mp4` KEEPS the `kfix` box, so without
    the 1:2 guard a Studio export would have been split into two half-eyes.
+   **THE REPORT, CAUGHT (same day, `vr180-gui.prev.log`):** load OK, Play OK,
+   then a Stop→Play respawn at 50 s: the new decoder thread stalled 3 s
+   (two ffmpeg opens of the SMB file while the old decoder was still winding
+   down), built its iterator, and 240 ms later logged "decoder thread exited
+   cleanly" — ZERO frames, no error — so the panel showed "Click ▶ Play".
+   ROOT CAUSE: ffmpeg's `av_read_frame` answers `AVERROR_EOF` for a failed
+   READ as well as for the end of the stream (a short/failed read on the
+   `file` protocol sets the avio context's `eof_reached` + `error`), and
+   ffmpeg-next's `packets().next()` folds that into `None`, which every
+   iterator took as a clean EOF. FIX (pipeline, all platforms):
+   `fisheye_decode::demux_eof_or_error` reads the avio `error` field at
+   every EOF branch — the single-stream iterators (`SbsFisheyeIter`,
+   `D3d11SharedSbsIter`, `VtSharedSbsIter`) and the EAC pair iterator now
+   return `Err("demuxer read error …")` instead of `Ok(None)`; the
+   dual-stream `DualPacketPump` logs it at WARN (its callers keep the EOF
+   contract). FIX (GUI): `poll_load` respawns ONCE automatically when a
+   decoder exits before its first frame (`decoder_retried`, cleared when a
+   first frame lands; stills excluded), logging a WARN — the user never
+   sees the dead "Click ▶ Play" state for a transient network read.
 
 20. **X6 360° Audio on Windows (2026-10-10, Windows box)** — the mac
    side's ambisonic work pulled, built clean first try (the new `build.rs`

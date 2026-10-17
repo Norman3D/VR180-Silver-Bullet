@@ -80,6 +80,9 @@ pub struct App {
     /// during a slow load would otherwise pile up detached decoder threads
     /// all contending for the same file (the "click play too fast" freeze).
     decoder_starting: bool,
+    /// A decoder that exited BEFORE delivering its first frame has already
+    /// been respawned once (see `poll_load`); cleared when a first frame lands.
+    decoder_retried: bool,
     /// In-flight async clip load. The blocking metadata reads (probe, format
     /// detect, GoPro GPMF, segment scan, per-segment probes) run on a worker
     /// thread instead of the UI thread, so a cold/slow source — notably a
@@ -1224,6 +1227,7 @@ impl App {
             no_decoder_warned: false,
             still_native_wanted: false,
             decoder_starting: false,
+            decoder_retried: false,
             current_display: None,
             frame_rx: None,
             detail_frame_rx: None,
@@ -2778,6 +2782,7 @@ impl App {
         if let Some(f) = newest {
             self.replace_display(f);
             self.decoder_starting = false; // first frame in → load done, ungate respawns
+            self.decoder_retried = false;  // a later start failure gets its one retry again
             ctx.request_repaint();
         }
         // FPS aggregation.
@@ -3405,14 +3410,26 @@ impl App {
         // nothing). `control` is set to None by `stop_playback` on an explicit
         // stop, so a normal teardown doesn't trip this; the stale channels of a
         // self-exited decoder are released on the next `spawn_decoder`.
-        if self.decoder_alive {
-            if let Some(ctl) = &self.control {
-                if ctl.finished.load(Ordering::SeqCst) {
-                    tracing::info!("decoder thread exited — resetting playback flags so Play respawns");
-                    self.decoder_starting = false;
-                    self.decoder_alive = false;
-                    self.playing = false;
-                }
+        let exited = self.decoder_alive
+            && self.control.as_ref().map_or(false, |ctl| ctl.finished.load(Ordering::SeqCst));
+        if exited {
+            tracing::info!("decoder thread exited — resetting playback flags so Play respawns");
+            let before_first_frame = self.decoder_starting;
+            let was_playing = self.playing;
+            self.decoder_starting = false;
+            self.decoder_alive = false;
+            self.playing = false;
+            // A decoder that dies BEFORE its first frame leaves the panel on
+            // "Click ▶ Play" with nothing to show for the load. Seen on a
+            // network share (QooCam clip over SMB, 2026-10-17): a stalled read
+            // reported as end-of-stream and the thread "exited cleanly" 240 ms
+            // after construction with zero frames. Respawn ONCE on our own; a
+            // second failure is left to the user, with the reason in the log.
+            let is_still = self.clip.as_ref().map_or(false, |c| c.source_kind.is_still());
+            if before_first_frame && !self.decoder_retried && !is_still {
+                self.decoder_retried = true;
+                tracing::warn!("decoder exited before its first frame — respawning once (paused={})", !was_playing);
+                self.spawn_decoder(!was_playing);
             }
         }
     }
