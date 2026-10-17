@@ -1146,6 +1146,20 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    (GPU-resident NVENC) is **md5-identical** on every output — the cbuffer
    matrix is a provable no-op for BT.709 sources (`scratchpad/gen/regress.ps1`).
    GUI not driven headless; launched on a clip for the user.
+   GUI (same day, on the post-mod `//SYSTEM/Silver/zoeqoo` material, fw
+   V1.1.6.6, 788 Hz bmi260, lens record canvas 3840×1920 scaled to the
+   3840² eye): a "load shows Click ▶ Play, Play does nothing" report could
+   NOT be reproduced — command-line open, three dialog loads by the user
+   and a scripted dialog load of `Q360_20260412_082220` (SetCursorPos +
+   SendKeys into the native dialog; NB this display is 200 %, so a
+   DPI-unaware script sees VIRTUAL coordinates = screenshot px / 2) all put
+   the first frame up within 0.3 s and play at 30 fps; all 19 clips pass
+   `examples/kandao_sweep.rs` (gitignored: detect → boxes/IMU → zc iterator
+   3 frames → audio calibration). The report's own log was lost because the
+   app truncated `vr180-gui.log` on every launch — it now renames the
+   previous one to `vr180-gui.prev.log` first (`main.rs`). Also seen there:
+   QooCam Studio's `KDOutput/*_Output.mp4` KEEPS the `kfix` box, so without
+   the 1:2 guard a Studio export would have been split into two half-eyes.
 
 20. **X6 360° Audio on Windows (2026-10-10, Windows box)** — the mac
    side's ambisonic work pulled, built clean first try (the new `build.rs`

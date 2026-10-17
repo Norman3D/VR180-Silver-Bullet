@@ -44,7 +44,8 @@ fn load_app_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> anyhow::Result<()> {
-    // Logs go to `<data dir>/vr180-gui.log` (truncated each launch) so the
+    // Logs go to `<data dir>/vr180-gui.log` (the previous launch's copy is
+    // kept as `vr180-gui.prev.log`) so the
     // release GUI-subsystem build — which has no console — still leaves a
     // troubleshooting trail. Falls back to stderr (debug `cargo run`) if the
     // file can't be opened. Set RUST_LOG to override the filter.
@@ -55,6 +56,10 @@ fn main() -> anyhow::Result<()> {
         .and_then(|p| p.parent().map(|d| d.join("vr180-gui.log")));
     let log_file = log_path.as_ref().and_then(|p| {
         if let Some(dir) = p.parent() { std::fs::create_dir_all(dir).ok()?; }
+        // Keep the previous launch's log as `vr180-gui.prev.log`: a report
+        // that arrives after a relaunch (or a crash + restart) would otherwise
+        // have no trail left to read.
+        let _ = std::fs::rename(p, p.with_file_name("vr180-gui.prev.log"));
         std::fs::File::create(p).ok()
     });
     match log_file {
