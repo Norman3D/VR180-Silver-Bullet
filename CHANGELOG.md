@@ -24,12 +24,17 @@ file, stills, and the camera's own colour handling.
   10 ms shutter, depend on getting the shutter term right. Decoding
   takes the zero-copy VideoToolbox path (each eye sampled in place from the
   stacked frame).
-- **HDR (HLG) clips.** The camera's HDR mode records HLG BT.2020, full
-  range. The decode path now carries the stream's YCbCr matrix (BT.2020
-  instead of the fixed BT.709) and a built-in HLG → Rec.709 conversion
-  (BT.2100 inverse OETF, 1000 nit OOTF, BT.2408 reference-white scaling
-  with a soft highlight shoulder) is applied on load like the other
-  cameras' log LUTs; SDR clips need nothing.
+- **HLG clips.** The camera records HLG BT.2020, full range (whether or
+  not its HDR readout mode is on). The decode path now carries the
+  stream's YCbCr matrix (BT.2020 instead of the fixed BT.709) and a
+  built-in HLG → Rec.709 conversion (BT.2100 inverse OETF, 1000 nit OOTF,
+  BT.2408 reference-white scaling with a soft highlight shoulder) is
+  applied on load like the other cameras' log LUTs, keyed on the stream's
+  transfer tag; a Rec.709-tagged clip needs nothing.
+- **HDR readout mode.** The camera's HDR setting is a slower sensor scan
+  for more dynamic range; the app reads the flag from the file and uses
+  that mode's measured readout time and frame-stamp timing for the
+  rolling-shutter correction and stabilization.
 - **Stills (`.dng`).** The 13888×6944 RGGB dual-fisheye DNG opens like the
   X6's: the lens record (the DNG is its own calibration canvas) and the
   per-lens 17×13 shading grids come from the EXIF `UserComment` and feed
