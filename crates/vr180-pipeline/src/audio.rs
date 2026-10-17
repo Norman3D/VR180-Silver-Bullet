@@ -885,11 +885,18 @@ pub fn kandao_window_prep(input: &Path, stream_index: usize, offset_s: f64, dur_
 }
 
 /// [`measure_quad_channel_delays`] and [`quad_trims_from_pcm`] from one
-/// decode of the first [`QUAD_DELAY_PROBE_S`] of the window.
+/// decode of the first [`QUAD_DELAY_PROBE_S`] of the TRACK — not of the
+/// export window: the latency and the capsule mismatch are properties of
+/// the recording, a 10 s window gave the delay fit too few coherent windows
+/// to pass its gate (64, residual 8.4 on the kids clip, where 24 s gives
+/// 187 / 2.0), and reading the same stretch for every window of a file and
+/// for the player keeps them all on one calibration. `offset_s` / `dur_s`
+/// are kept for the call shape; they do not move the probe.
 pub fn measure_quad_calibration(input: &Path, stream_index: usize, offset_s: f64, dur_s: Option<f64>) -> QuadCalibration {
-    let probe = Some(dur_s.map_or(QUAD_DELAY_PROBE_S, |d| d.min(QUAD_DELAY_PROBE_S)));
+    let _ = (offset_s, dur_s);
+    let probe = Some(QUAD_DELAY_PROBE_S);
     let mut pcm: Vec<f32> = Vec::new();
-    let rate = match decode_quad_window(input, stream_index, offset_s, probe, &mut |chunk| pcm.extend_from_slice(chunk)) {
+    let rate = match decode_quad_window(input, stream_index, 0.0, probe, &mut |chunk| pcm.extend_from_slice(chunk)) {
         Ok(r) => r as f32,
         Err(e) => { tracing::warn!("kandao audio: calibration probe failed ({e}) — none applied"); return QuadCalibration::default(); }
     };
@@ -979,9 +986,10 @@ const QUAD_DELAY_PROBE_S: f64 = 24.0;
 /// qualify, the fit residual is ≤ 3.5 samples and the largest delay is
 /// ≥ 3 — a unit that is simply fine measures 0–2.
 pub fn measure_quad_channel_delays(input: &Path, stream_index: usize, offset_s: f64, dur_s: Option<f64>) -> QuadDelays {
-    let probe = Some(dur_s.map_or(QUAD_DELAY_PROBE_S, |d| d.min(QUAD_DELAY_PROBE_S)));
+    let _ = (offset_s, dur_s);   // see `measure_quad_calibration`: the probe is the track's first stretch
+    let probe = Some(QUAD_DELAY_PROBE_S);
     let mut pcm: Vec<f32> = Vec::new();
-    let rate = match decode_quad_window(input, stream_index, offset_s, probe, &mut |chunk| pcm.extend_from_slice(chunk)) {
+    let rate = match decode_quad_window(input, stream_index, 0.0, probe, &mut |chunk| pcm.extend_from_slice(chunk)) {
         Ok(r) => r as f32,
         Err(e) => { tracing::warn!("kandao audio: channel-delay probe failed ({e}) — no re-alignment"); return [0; 4]; }
     };
