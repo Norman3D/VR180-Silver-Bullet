@@ -166,6 +166,21 @@ pub fn foa_to_stereo_sample(wyzx: [f32; 4]) -> [f32; 2] {
 /// The apparent acoustic spacing of an opposite pair, body diffraction
 /// included, is ~12 samples ≈ 85 mm ([`KANDAO_CAPSULE_SPACING_M`]).
 ///
+/// Channel timing. The second unit (firmware 1.1.6.6) records channel 0
+/// 12–21 samples (0.25–0.45 ms) LATE in every one of its nine clips,
+/// indoors and out, January to April — the lag of channel 0 against each of
+/// the other three is the same in the diffuse windows, where acoustics
+/// would give zero — and the amount differs between recordings; the first
+/// unit (1.1.3.8) shows none. Left as is, the front capsule hears
+/// everything after the back one, so the front/back dipole put a child
+/// standing in front of that camera behind it. [`measure_quad_channel_delays`]
+/// reads the offset off each file (the lag range of every capsule pair
+/// over coherent windows is shifted by a latency and only widened by
+/// acoustics, so the range midpoints give the per-channel delay; applied
+/// when the four fit the six pairs within 3.5 samples and the largest is
+/// ≥ 3) and [`QuadEncoder::with_delays`] re-aligns the channels before
+/// anything else.
+///
 /// Encoding. A spaced pair's difference is the pressure GRADIENT: for a
 /// plane wave it is `j·k·d·cos θ` times the pressure — 90° out of phase
 /// with it and rising 6 dB/octave. Fed straight to an AmbiX decoder (whose
@@ -272,25 +287,58 @@ impl GradEq {
     }
 }
 
+/// An integer sample delay (a ring buffer; zero-length = pass-through).
+#[derive(Clone, Debug, Default)]
+struct Delay { buf: Vec<f32>, pos: usize }
+
+impl Delay {
+    fn new(samples: usize) -> Self { Self { buf: vec![0.0; samples], pos: 0 } }
+    fn reset(&mut self) { self.buf.iter_mut().for_each(|v| *v = 0.0); self.pos = 0; }
+    #[inline]
+    fn run(&mut self, x: f32) -> f32 {
+        if self.buf.is_empty() { return x; }
+        let y = self.buf[self.pos];
+        self.buf[self.pos] = x;
+        self.pos += 1;
+        if self.pos == self.buf.len() { self.pos = 0; }
+        y
+    }
+}
+
+/// Per-channel delays (samples) that re-align a QooCam capsule track — see
+/// [`measure_quad_channel_delays`]; all zero when nothing is needed.
+pub type QuadDelays = [usize; 4];
+
 /// The QooCam capsule array → first-order AmbiX `[W, Y, Z, X]` (and the
 /// stereo pair of it), carrying the filters' state — one per decoded
 /// stream. `gain` multiplies the built-in ×[`KANDAO_QUAD_GAIN`].
 #[derive(Clone, Debug)]
-pub struct QuadEncoder { gain: f32, hp_w: Hp2, ap_w: Ap1, eq_x: GradEq, eq_y: GradEq }
+pub struct QuadEncoder { gain: f32, align: [Delay; 4], hp_w: Hp2, ap_w: Ap1, eq_x: GradEq, eq_y: GradEq }
 
 impl QuadEncoder {
     pub fn new(sample_rate: u32, gain: f32) -> Self {
         let r = sample_rate.max(1) as f32;
         Self {
-            gain: gain * KANDAO_QUAD_GAIN, hp_w: Hp2::new(r, KANDAO_GRAD_HP_HZ), ap_w: Ap1::new(r, KANDAO_GRAD_WIND_HZ),
+            gain: gain * KANDAO_QUAD_GAIN, align: Default::default(),
+            hp_w: Hp2::new(r, KANDAO_GRAD_HP_HZ), ap_w: Ap1::new(r, KANDAO_GRAD_WIND_HZ),
             eq_x: GradEq::new(r), eq_y: GradEq::new(r),
         }
     }
+    /// Delay each channel by `delays[k]` samples (at this encoder's rate)
+    /// before encoding — the file's own channel misalignment undone.
+    pub fn with_delays(mut self, delays: QuadDelays) -> Self {
+        for (k, d) in delays.iter().enumerate() { self.align[k] = Delay::new(*d); }
+        self
+    }
     /// Forget the filter history (after a seek).
-    pub fn reset(&mut self) { self.hp_w.reset(); self.ap_w.reset(); self.eq_x.reset(); self.eq_y.reset(); }
+    pub fn reset(&mut self) {
+        self.align.iter_mut().for_each(Delay::reset);
+        self.hp_w.reset(); self.ap_w.reset(); self.eq_x.reset(); self.eq_y.reset();
+    }
     /// One sample of the four capsules (decoded channel order) → `[W, Y, Z, X]`.
     #[inline]
     pub fn foa(&mut self, c: [f32; 4]) -> [f32; 4] {
+        let c = [self.align[0].run(c[0]), self.align[1].run(c[1]), self.align[2].run(c[2]), self.align[3].run(c[3])];
         let w = self.ap_w.run(self.hp_w.run(0.25 * (c[0] + c[1] + c[2] + c[3])));
         let x = self.eq_x.run(c[KANDAO_CAPSULE_FRONT] - c[KANDAO_CAPSULE_BACK]);
         let y = self.eq_y.run(c[KANDAO_CAPSULE_LEFT] - c[KANDAO_CAPSULE_RIGHT]);
@@ -317,9 +365,9 @@ pub enum Mix<'a> {
     /// A fixed matrix, one row per output channel (the X6's AmbiX → stereo).
     Matrix(&'a [[f32; 4]]),
     /// The QooCam capsules → AmbiX `[W, Y, Z, X]` through [`QuadEncoder`].
-    QuadFoa { gain: f32 },
+    QuadFoa { gain: f32, delays: QuadDelays },
     /// The QooCam capsules → the stereo pair through [`QuadEncoder`].
-    QuadStereo { gain: f32 },
+    QuadStereo { gain: f32, delays: QuadDelays },
 }
 
 impl Mix<'_> {
@@ -335,8 +383,8 @@ impl<'a> MixState<'a> {
     fn new(mix: Mix<'a>, rate: u32) -> Self {
         match mix {
             Mix::Matrix(m) => MixState::Matrix(m),
-            Mix::QuadFoa { gain } => MixState::QuadFoa(QuadEncoder::new(rate, gain)),
-            Mix::QuadStereo { gain } => MixState::QuadStereo(QuadEncoder::new(rate, gain)),
+            Mix::QuadFoa { gain, delays } => MixState::QuadFoa(QuadEncoder::new(rate, gain).with_delays(delays)),
+            Mix::QuadStereo { gain, delays } => MixState::QuadStereo(QuadEncoder::new(rate, gain).with_delays(delays)),
         }
     }
     #[inline]
@@ -764,20 +812,121 @@ pub fn foa_to_stereo_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: 
 /// (the park clip needs ~12× to reach Studio's own output level).
 pub const KANDAO_PEAK_TARGET: f32 = 0.7;
 
-/// Gain the Kandao window gets on top of the matrices (see
-/// [`KANDAO_PEAK_TARGET`]); 1.0 when the window is silent or cannot be read.
-pub fn kandao_window_gain(input: &Path, stream_index: usize, offset_s: f64, dur_s: Option<f64>) -> f32 {
-    match mixed_window_peak(input, stream_index, offset_s, dur_s, Mix::QuadFoa { gain: 1.0 }) {
+/// What a Kandao export window needs before encoding: the channel
+/// re-alignment read off the file ([`measure_quad_channel_delays`]) and the
+/// gain on top of the encoder's ×3 (see [`KANDAO_PEAK_TARGET`]; 1.0 when the
+/// window is silent or cannot be read).
+pub fn kandao_window_prep(input: &Path, stream_index: usize, offset_s: f64, dur_s: Option<f64>) -> (f32, QuadDelays) {
+    let delays = measure_quad_channel_delays(input, stream_index, offset_s, dur_s);
+    let gain = match mixed_window_peak(input, stream_index, offset_s, dur_s, Mix::QuadFoa { gain: 1.0, delays }) {
         Ok(peak) if peak > 1e-5 => (KANDAO_PEAK_TARGET / peak).clamp(0.5, 16.0),
         Ok(_) => 1.0,
         Err(e) => { tracing::warn!("kandao audio: peak pre-pass failed ({e}) — unity gain"); 1.0 }
-    }
+    };
+    (gain, delays)
 }
 
-/// Largest |sample| of the window `[offset_s, offset_s + dur_s)` of stream
-/// `stream_index` after the mix (same window rule as
-/// [`transcode_audio_window`], decode only).
-fn mixed_window_peak(input: &Path, stream_index: usize, offset_s: f64, dur_s: Option<f64>, mix: Mix<'_>) -> Result<f32> {
+/// Seconds of a track the channel-delay measurement looks at.
+const QUAD_DELAY_PROBE_S: f64 = 24.0;
+
+/// Per-channel recording delay of a QooCam capsule track, measured from
+/// the file (see the channel-timing notes above [`KANDAO_QUAD_GAIN`]):
+/// the first [`QUAD_DELAY_PROBE_S`] of the window `[offset_s, …)`, 300–4000
+/// Hz, 2048-sample windows; in every window where all six capsule pairs
+/// correlate above 0.5 within ±40 samples, the pair lags are kept; the
+/// 3rd–97th percentile midpoint of each pair's lags is its latency
+/// difference, the four per-channel latencies follow by least squares
+/// (complete graph: `t_k = ¼·Σ_j lag(k, j)`), and the delay to apply is
+/// `max(t) − t_k`. All zero (nothing applied) unless at least 40 windows
+/// qualify, the fit residual is ≤ 3.5 samples and the largest delay is
+/// ≥ 3 — a unit that is simply fine measures 0–2.
+pub fn measure_quad_channel_delays(input: &Path, stream_index: usize, offset_s: f64, dur_s: Option<f64>) -> QuadDelays {
+    let probe = Some(dur_s.map_or(QUAD_DELAY_PROBE_S, |d| d.min(QUAD_DELAY_PROBE_S)));
+    let mut pcm: Vec<f32> = Vec::new();
+    let rate = match decode_quad_window(input, stream_index, offset_s, probe, &mut |chunk| pcm.extend_from_slice(chunk)) {
+        Ok(r) => r as f32,
+        Err(e) => { tracing::warn!("kandao audio: channel-delay probe failed ({e}) — no re-alignment"); return [0; 4]; }
+    };
+    quad_channel_delays_from_pcm(&pcm, rate)
+}
+
+/// [`measure_quad_channel_delays`] on decoded packed 4-channel f32 samples.
+pub fn quad_channel_delays_from_pcm(pcm: &[f32], rate: f32) -> QuadDelays {
+    const WIN: usize = 2048;
+    const MAX_LAG: i32 = 40;
+    let n = pcm.len() / 4;
+    if n < WIN * 4 { return [0; 4]; }
+    // Band-pass 300–4000 Hz: two first-order high-passes and two low-passes.
+    let mut ch: Vec<Vec<f32>> = (0..4).map(|k| pcm.iter().skip(k).step_by(4).copied().collect()).collect();
+    let bh = 1.0 / (1.0 + std::f32::consts::TAU * 300.0 / rate);
+    let al = 1.0 - (-std::f32::consts::TAU * 4000.0 / rate).exp();
+    for v in ch.iter_mut() {
+        for _ in 0..2 {
+            let (mut xp, mut yp) = (0.0f32, 0.0f32);
+            for x in v.iter_mut() { let y = bh * (yp + *x - xp); xp = *x; yp = y; *x = y; }
+            let mut lp = 0.0f32;
+            for x in v.iter_mut() { lp += al * (*x - lp); *x = lp; }
+        }
+    }
+    let hann: Vec<f32> = (0..WIN).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / WIN as f32).cos()).collect();
+    const PAIRS: [(usize, usize); 6] = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+    let mut lags: [Vec<i32>; 6] = Default::default();
+    let mut w = [[0f32; WIN]; 4];
+    let mut start = 0;
+    while start + WIN <= n {
+        for k in 0..4 { for i in 0..WIN { w[k][i] = ch[k][start + i] * hann[i]; } }
+        let energy: [f32; 4] = std::array::from_fn(|k| w[k].iter().map(|v| v * v).sum::<f32>());
+        let mut cur = [0i32; 6];
+        let mut ok = energy.iter().all(|e| *e > 1e-12);
+        if ok {
+            for (p, (i, j)) in PAIRS.iter().enumerate() {
+                let (mut best, mut best_lag) = (f32::MIN, 0i32);
+                for lag in -MAX_LAG..=MAX_LAG {
+                    // c[lag] = Σ_t w_i[t]·w_j[t − lag]: if channel i is a
+                    // delayed copy of j (i LATER by τ), the peak sits at lag = +τ.
+                    let mut acc = 0f32;
+                    let (lo, hi) = (lag.max(0) as usize, (WIN as i32 + lag.min(0)) as usize);
+                    for t in lo..hi { acc += w[*i][t] * w[*j][(t as i32 - lag) as usize]; }
+                    if acc > best { best = acc; best_lag = lag; }
+                }
+                if best / (energy[*i] * energy[*j]).sqrt() < 0.5 { ok = false; break; }
+                cur[p] = best_lag;
+            }
+        }
+        if ok { for p in 0..6 { lags[p].push(cur[p]); } }
+        start += WIN;
+    }
+    let count = lags[0].len();
+    if count < 40 {
+        tracing::info!(windows = count, "kandao audio: too few coherent windows to measure channel delays — none applied");
+        return [0; 4];
+    }
+    let mut mid = [0f32; 6];
+    for p in 0..6 {
+        let mut v = lags[p].clone();
+        v.sort_unstable();
+        let pct = |q: f32| v[((v.len() - 1) as f32 * q).round() as usize] as f32;
+        mid[p] = 0.5 * (pct(0.03) + pct(0.97));
+    }
+    // t_k = ¼ Σ_j lag(k, j), lag(k, j) = −lag(j, k)
+    let mut t = [0f32; 4];
+    for (p, (i, j)) in PAIRS.iter().enumerate() { t[*i] += 0.25 * mid[p]; t[*j] -= 0.25 * mid[p]; }
+    let residual = PAIRS.iter().enumerate().map(|(p, (i, j))| ((t[*i] - t[*j]) - mid[p]).abs()).fold(0f32, f32::max);
+    let t_max = t.iter().cloned().fold(f32::MIN, f32::max);
+    let delays: QuadDelays = std::array::from_fn(|k| (t_max - t[k]).round().max(0.0) as usize);
+    let largest = *delays.iter().max().unwrap();
+    if residual > 3.5 || largest < 3 || largest > MAX_LAG as usize {
+        tracing::info!(windows = count, ?delays, residual, "kandao audio: channel delays not applied (inconsistent or negligible)");
+        return [0; 4];
+    }
+    tracing::info!(windows = count, ?delays, residual, "kandao audio: re-aligning capsule channels");
+    delays
+}
+
+/// Decode the `[offset_s, offset_s + dur_s)` window of 4-channel audio
+/// stream `stream_index` as packed f32 and hand each decoded chunk to
+/// `f`. Returns the sample rate.
+fn decode_quad_window(input: &Path, stream_index: usize, offset_s: f64, dur_s: Option<f64>, f: &mut dyn FnMut(&[f32])) -> Result<u32> {
     use ffmpeg::format::sample::{Sample, Type};
     crate::decode::init();
     let mut ictx = open_input_concat_aware(input)
@@ -799,7 +948,7 @@ fn mixed_window_peak(input: &Path, stream_index: usize, offset_s: f64, dur_s: Op
     let src_layout = decoder.channel_layout();
     let in_ch = src_layout.channels().max(1) as usize;
     if in_ch != 4 {
-        return Err(Error::Ffmpeg(format!("peak pre-pass needs 4 input channels, stream has {in_ch}")));
+        return Err(Error::Ffmpeg(format!("the 4-channel pre-pass needs 4 input channels, stream has {in_ch}")));
     }
     let mut to_f32 = ffmpeg::software::resampling::Context::get(
         decoder.format(), src_layout, rate,
@@ -809,18 +958,6 @@ fn mixed_window_peak(input: &Path, stream_index: usize, offset_s: f64, dur_s: Op
     let win_end = dur_s.map(|d| offset_s + d);
     let mut decoded = ffmpeg::frame::Audio::empty();
     let mut f32_frame = ffmpeg::frame::Audio::empty();
-    let mut peak = 0f32;
-    let mut state = MixState::new(mix, rate);
-    let mut tmp: Vec<f32> = Vec::with_capacity(4);
-    let mut scan = |f: &ffmpeg::frame::Audio, peak: &mut f32| {
-        let n = f.samples();
-        let src: &[f32] = bytemuck::cast_slice(&f.data(0)[..n * in_ch * 4]);
-        for s4 in src.chunks_exact(4) {
-            tmp.clear();
-            state.apply([s4[0], s4[1], s4[2], s4[3]], &mut tmp);
-            for v in &tmp { let v = v.abs(); if v > *peak { *peak = v; } }
-        }
-    };
     for (stream, pkt) in ictx.packets() {
         if stream.index() != stream_index { continue; }
         let t = pkt.pts().or(pkt.dts()).unwrap_or(0) as f64 * tb_s;
@@ -829,9 +966,29 @@ fn mixed_window_peak(input: &Path, stream_index: usize, offset_s: f64, dur_s: Op
         if decoder.send_packet(&pkt).is_err() { continue; }
         while decoder.receive_frame(&mut decoded).is_ok() {
             if to_f32.run(&decoded, &mut f32_frame).is_ok() && f32_frame.samples() > 0 {
-                scan(&f32_frame, &mut peak);
+                let n = f32_frame.samples();
+                f(bytemuck::cast_slice(&f32_frame.data(0)[..n * in_ch * 4]));
             }
         }
+    }
+    Ok(rate)
+}
+
+/// Largest |sample| of the window `[offset_s, offset_s + dur_s)` of stream
+/// `stream_index` after the mix (same window rule as
+/// [`transcode_audio_window`], decode only).
+fn mixed_window_peak(input: &Path, stream_index: usize, offset_s: f64, dur_s: Option<f64>, mix: Mix<'_>) -> Result<f32> {
+    let mut peak = 0f32;
+    let mut state: Option<MixState> = None;
+    let mut tmp: Vec<f32> = Vec::with_capacity(4);
+    // The encoder needs the rate, known only once the stream is open: build it on the first chunk.
+    let mut pending: Vec<f32> = Vec::new();
+    let rate = decode_quad_window(input, stream_index, offset_s, dur_s, &mut |chunk| pending.extend_from_slice(chunk))?;
+    let st = state.get_or_insert_with(|| MixState::new(mix, rate));
+    for s4 in pending.chunks_exact(4) {
+        tmp.clear();
+        st.apply([s4[0], s4[1], s4[2], s4[3]], &mut tmp);
+        for v in &tmp { let v = v.abs(); if v > peak { peak = v; } }
     }
     Ok(peak)
 }
@@ -844,12 +1001,12 @@ pub fn quad_to_foa_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Op
     let info = probe_foa_aac(input)?
         .ok_or_else(|| Error::Ffmpeg(format!("no 4-channel AAC track in {input:?}")))?;
     let t0 = std::time::Instant::now();
-    let g = kandao_window_gain(input, info.stream_index, offset_s, dur_s);
+    let (g, delays) = kandao_window_prep(input, info.stream_index, offset_s, dur_s);
     let n = transcode_audio_window(
         input, info.stream_index, output_m4a, offset_s, dur_s,
-        Some(Mix::QuadFoa { gain: g }), AudioOut::Aac4 { bit_rate },
+        Some(Mix::QuadFoa { gain: g, delays }), AudioOut::Aac4 { bit_rate },
     )?;
-    tracing::info!(m4a = %output_m4a.display(), samples = n, gain = g, took_ms = t0.elapsed().as_millis() as u64,
+    tracing::info!(m4a = %output_m4a.display(), samples = n, gain = g, ?delays, took_ms = t0.elapsed().as_millis() as u64,
         "QooCam 4-channel audio: encoded first-order AmbiX AAC");
     Ok(n)
 }
@@ -859,10 +1016,10 @@ pub fn quad_to_foa_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Op
 pub fn quad_to_foa_wav(input: &Path, output_wav: &Path, offset_s: f64, dur_s: Option<f64>) -> Result<u64> {
     let info = probe_foa_aac(input)?
         .ok_or_else(|| Error::Ffmpeg(format!("no 4-channel AAC track in {input:?}")))?;
-    let g = kandao_window_gain(input, info.stream_index, offset_s, dur_s);
+    let (g, delays) = kandao_window_prep(input, info.stream_index, offset_s, dur_s);
     transcode_audio_window(
         input, info.stream_index, output_wav, offset_s, dur_s,
-        Some(Mix::QuadFoa { gain: g }), AudioOut::Pcm24 { channels: 4 },
+        Some(Mix::QuadFoa { gain: g, delays }), AudioOut::Pcm24 { channels: 4 },
     )
 }
 
@@ -876,10 +1033,10 @@ pub fn quad_to_stereo_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s:
     let t0 = std::time::Instant::now();
     // The same gain the ambisonic export of this window would get, so the
     // formats agree in level.
-    let g = kandao_window_gain(input, info.stream_index, offset_s, dur_s);
+    let (g, delays) = kandao_window_prep(input, info.stream_index, offset_s, dur_s);
     let n = transcode_audio_window(
         input, info.stream_index, output_m4a, offset_s, dur_s,
-        Some(Mix::QuadStereo { gain: g }), AudioOut::AacStereo { bit_rate },
+        Some(Mix::QuadStereo { gain: g, delays }), AudioOut::AacStereo { bit_rate },
     )?;
     tracing::info!(m4a = %output_m4a.display(), samples = n, sample_rate = info.sample_rate, gain = g,
         window_start_s = offset_s, window_s = dur_s.unwrap_or(f64::NAN), took_ms = t0.elapsed().as_millis() as u64,
@@ -1183,6 +1340,12 @@ mod foa_tests {
     /// out): per-channel rms, the in-phase correlation of X and Y with W,
     /// and the stereo pair's rms — over the second half of 0.5 s.
     fn quad_plane_wave(az_deg: f32) -> ([f32; 4], [f32; 2], [f32; 2]) {
+        quad_plane_wave_misaligned(az_deg, 0, [0; 4])
+    }
+
+    /// [`quad_plane_wave`] with channel 0 recorded `late0` samples late and
+    /// the encoder told to re-align by `delays`.
+    fn quad_plane_wave_misaligned(az_deg: f32, late0: usize, delays: QuadDelays) -> ([f32; 4], [f32; 2], [f32; 2]) {
         let rate = 48_000u32;
         let d = KANDAO_CAPSULE_SPACING_M / 2.0;
         let pos = |ch: usize| -> (f32, f32) {
@@ -1190,15 +1353,16 @@ mod foa_tests {
             else if ch == KANDAO_CAPSULE_BACK { (-d, 0.0) } else { (0.0, -d) }
         };
         let (ux, uy) = (az_deg.to_radians().cos(), az_deg.to_radians().sin());
-        let mut enc = QuadEncoder::new(rate, 1.0 / KANDAO_QUAD_GAIN);
+        let mut enc = QuadEncoder::new(rate, 1.0 / KANDAO_QUAD_GAIN).with_delays(delays);
         let (mut acc, mut lr, mut wx, mut wy, mut n) = ([0f32; 4], [0f32; 2], 0f32, 0f32, 0usize);
         for i in 0..rate as usize / 2 {
             let t = i as f32 / rate as f32;
             let mut c = [0f32; 4];
             for (ch, v) in c.iter_mut().enumerate() {
                 let (px, py) = pos(ch);
+                let tc = if ch == 0 { t - late0 as f32 / rate as f32 } else { t };
                 // the capsule along the arrival direction hears the wave first
-                *v = (std::f32::consts::TAU * 1000.0 * (t + (px * ux + py * uy) / SPEED_OF_SOUND_M_S)).sin();
+                *v = (std::f32::consts::TAU * 1000.0 * (tc + (px * ux + py * uy) / SPEED_OF_SOUND_M_S)).sin();
             }
             let o = enc.foa(c);
             let s = foa_to_stereo_sample(o);
@@ -1231,6 +1395,28 @@ mod foa_tests {
         assert!(l > 2.0 * r, "left stereo {l} {r}");
         let (_, _, [l2, r2]) = quad_plane_wave(-90.0);
         assert!((l2 - r).abs() < 0.02 * r && (r2 - l).abs() < 0.02 * l, "right stereo {l2} {r2} vs {l} {r}");
+        // Channel 0 recorded 14 samples late (the second unit): the front
+        // wave's X goes out of phase with W; re-aligning the other three by
+        // 14 restores it.
+        let (_, [cx_bad, _], _) = quad_plane_wave_misaligned(0.0, 14, [0; 4]);
+        let (_, [cx_fixed, _], _) = quad_plane_wave_misaligned(0.0, 14, [0, 14, 14, 14]);
+        assert!(cx_bad < 0.5 && cx_fixed > 0.95, "misaligned corr {cx_bad}, re-aligned {cx_fixed}");
+        // The measurement itself: broadband noise with channel 0 recorded
+        // 14 samples late (plus a little independent noise per channel)
+        // measures as "delay the other three by 14"; an aligned track → none.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; (seed >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0 };
+        let len = 48_000 * 3;
+        let src: Vec<f32> = (0..len + 14).map(|_| rnd()).collect();
+        let mut late = Vec::with_capacity(len * 4);
+        let mut aligned = Vec::with_capacity(len * 4);
+        for i in 0..len {
+            late.extend_from_slice(&[src[i] + 0.1 * rnd(), src[i + 14] + 0.1 * rnd(), src[i + 14] + 0.1 * rnd(), src[i + 14] + 0.1 * rnd()]);
+            aligned.extend_from_slice(&[src[i + 14] + 0.1 * rnd(), src[i + 14] + 0.1 * rnd(), src[i + 14] + 0.1 * rnd(), src[i + 14] + 0.1 * rnd()]);
+        }
+        let d = quad_channel_delays_from_pcm(&late, 48_000.0);
+        assert!(d[0] == 0 && (1..4).all(|k| (d[k] as i32 - 14).abs() <= 1), "measured delays {d:?}");
+        assert_eq!(quad_channel_delays_from_pcm(&aligned, 48_000.0), [0; 4]);
         // A static capsule offset (mismatch, wind) does not reach the dipoles.
         let mut enc = QuadEncoder::new(48_000, 1.0);
         let mut last = [0f32; 4];

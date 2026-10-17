@@ -274,7 +274,14 @@ fn decoder_worker(
     // The QooCam encoder runs at the device rate (it mixes after the
     // resampler) and keeps filter state across packets.
     let mut quad = match mix4 {
-        Some(StereoMix::Quad) => Some(vr180_pipeline::audio::QuadEncoder::new(device_sample_rate, 1.0)),
+        Some(StereoMix::Quad) => {
+            // The file's own channel misalignment (measured at the source
+            // rate, applied after the resampler → scaled to the device rate).
+            let d = vr180_pipeline::audio::measure_quad_channel_delays(&path, audio_idx, 0.0, None);
+            let scale = device_sample_rate as f64 / src_rate.max(1) as f64;
+            let delays: vr180_pipeline::audio::QuadDelays = std::array::from_fn(|k| (d[k] as f64 * scale).round() as usize);
+            Some(vr180_pipeline::audio::QuadEncoder::new(device_sample_rate, 1.0).with_delays(delays))
+        }
         _ => None,
     };
     // Resampler: source → device's stereo f32 packed (4-ch AmbiX stays 4-ch).

@@ -51,8 +51,11 @@ file, stills, and the camera's own colour handling.
   phase), so this camera gets the same **Audio** choices as the X6:
   **Stereo** (a front-facing pair from the sound field), **Ambisonic**
   (AmbiX + SA3D) and **APAC** (macOS). Each export window is normalized to
-  a safe peak (the capsules are recorded low and vary between clips).
-  Playback uses the same stereo pair.
+  a safe peak (the capsules are recorded low and vary between clips), and
+  a capsule channel the camera records late (one of the two test units
+  delays its front channel by 0.25–0.45 ms, differently per clip) is
+  re-aligned from a measurement on the file itself. Playback uses the
+  same stereo pair.
 - **Calibration.** The lens model form was checked against QooCam
   Studio's own VR180 export of the sample clip (0.8 px across the whole
   eye once Studio's own principal-point shift is accounted for). The app

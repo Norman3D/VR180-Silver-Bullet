@@ -1030,7 +1030,29 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      encoder in the player (`StereoMix::Quad`, state reset on seek). Export:
      Stereo (one-pass temp), Ambisonic (`quad_to_foa_aac` → mux + SA3D),
      APAC (`quad_to_foa_wav` → helper) in `finalize_kandao_audio`; the Audio
-     section shows for `quad_audio`. Level: the capsules sit 15–20 dB low
+     section shows for `quad_audio`. **Channel timing (2026-10-16)**: the
+     second unit (fw 1.1.6.6, `/Volumes/Silver/zoeqoo/`) records ch0
+     12–21 samples (0.25–0.45 ms) LATE in all nine of its clips (indoor,
+     outdoor, Jan–Apr), by a different amount per recording; the first
+     unit (fw 1.1.3.8) measures 0–2. Diagnostic: in diffuse windows ch0's
+     lag against EACH of the other three is the same (+12…+15) while the
+     other pairs sit at 0 — acoustics cannot do that. Uncorrected, the front
+     capsule hears everything after the back one and the F–B dipole flips
+     the children in front of that camera to behind it. Fix =
+     `measure_quad_channel_delays` (per file, no constants: 24 s probe,
+     300–4000 Hz, 2048-sample windows with all six pair peaks > 0.5 within
+     ±40; per pair the 3–97 % lag-range MIDPOINT — a latency shifts the
+     range, acoustics only widen it; `t_k = ¼Σ_j lag(k,j)`; applied as
+     `max − t_k` delay lines in `QuadEncoder::with_delays` when ≥ 40
+     windows, residual ≤ 3.5 and the largest ≥ 3), called by
+     `kandao_window_prep` for exports and by the player at open (scaled to
+     the device rate). Synthetic test (14-sample-late ch0 → [0,14,14,14]).
+     Verified on the kids clip 084340 (operator behind, girl centre, boy at
+     the right): measured [0, 8, 7, 12]; before: loud windows piled at
+     −60…−30° and −180…−120°; after: loudest 5 % → 177°, the children at
+     −30…0° / −60…−30°, nothing on the left; the park clip (unit 1) measures
+     [2,2,2,0] → untouched. `$SP/zoe/mic/kids/{kids,offsets,offset2..4}.py`.
+     Level: the capsules sit 15–20 dB low
      and vary by that between clips, and there is no limiter, so every
      export window is decoded once through the encoder first and scaled to
      a 0.7 peak (`kandao_window_gain`, 0.5×…16× on top of the ×3; the same
