@@ -13,6 +13,7 @@
 //! crossbeam channel. The cpal stream is started in `Pause`d state so
 //! it doesn't burn cycles until the GUI flips playback on.
 
+use vr180_pipeline::audio::StereoMix;
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::Sender;
@@ -64,12 +65,12 @@ impl AudioPlayer {
         Self::open_with_mix(path, start_paused, None)
     }
 
-    /// [`AudioPlayer::open`] with a `[L, R] × 4` mixing matrix for a
-    /// 4-channel source — the X6's AmbiX (`audio::FOA_STEREO_MATRIX`) or the
-    /// QooCam's microphone array (`audio::KANDAO_QUAD_STEREO_MATRIX`); the
-    /// caller knows the source kind, the codec does not say which it is.
-    /// `None` leaves a 4-channel track to swresample's layout downmix.
-    pub fn open_with_mix(path: PathBuf, start_paused: bool, mix: Option<[[f32; 4]; 2]>) -> Result<Option<Self>> {
+    /// [`AudioPlayer::open`] with the stereo mix of a 4-channel source — the
+    /// X6's AmbiX (`audio::FOA_STEREO_MATRIX`) or the QooCam's microphone
+    /// array (`audio::QuadEncoder`); the caller knows the source kind, the
+    /// codec does not say which it is. `None` leaves a 4-channel track to
+    /// swresample's layout downmix.
+    pub fn open_with_mix(path: PathBuf, start_paused: bool, mix: Option<StereoMix>) -> Result<Option<Self>> {
         vr180_pipeline::decode::init();
 
         // Probe the source for an audio stream before allocating anything.
@@ -234,7 +235,7 @@ fn decoder_worker(
     cap_samples: usize,
     cmd_rx: crossbeam_channel::Receiver<AudioCmd>,
     start_paused: bool,
-    mix: Option<[[f32; 4]; 2]>,
+    mix: Option<StereoMix>,
 ) -> Result<()> {
     use ffmpeg_next as ffmpeg;
     use ffmpeg::software::resampling::Context as Resampler;
@@ -270,6 +271,12 @@ fn decoder_worker(
     // channels through the resampler and mix the stereo pair ourselves.
     let mix4 = mix.filter(|_| src_ch_layout.channels() == 4);
     let foa = mix4.is_some();
+    // The QooCam encoder runs at the device rate (it mixes after the
+    // resampler) and keeps filter state across packets.
+    let mut quad = match mix4 {
+        Some(StereoMix::Quad) => Some(vr180_pipeline::audio::QuadEncoder::new(device_sample_rate, 1.0)),
+        _ => None,
+    };
     // Resampler: source → device's stereo f32 packed (4-ch AmbiX stays 4-ch).
     let dst_ch_layout = if foa {
         src_ch_layout
@@ -322,6 +329,7 @@ fn decoder_worker(
             let target_us = (t * 1_000_000.0) as i64;
             let _ = ictx.seek(target_us, ..target_us);
             decoder.flush();
+            if let Some(q) = quad.as_mut() { q.reset(); }
             packet_iter = ictx.packets();
             continue;
         }
@@ -372,9 +380,13 @@ fn decoder_worker(
             let samples: &[f32] = bytemuck::cast_slice(bytes);
 
             let mut g = buf.lock();
-            if let Some(m) = mix4 {
+            if mix4.is_some() {
                 for s in samples.chunks_exact(4) {
-                    let [l, r] = vr180_pipeline::audio::mix_sample(&m, [s[0], s[1], s[2], s[3]]);
+                    let c = [s[0], s[1], s[2], s[3]];
+                    let [l, r] = match quad.as_mut() {
+                        Some(q) => q.stereo(c),
+                        None => vr180_pipeline::audio::foa_to_stereo_sample(c),
+                    };
                     if device_channels == 1 { g.push_back(0.5 * (l + r)); } else { g.push_back(l); g.push_back(r); }
                 }
             } else {

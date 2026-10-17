@@ -495,7 +495,7 @@ fn finalize_eac_audio(
 }
 
 /// Kandao QooCam: the raw capsules never reach the output — Stereo and the
-/// spatial formats are all encoded from them (`audio::KANDAO_QUAD_*`):
+/// spatial formats are all encoded from them (`audio::QuadEncoder`):
 /// Stereo = the decoded stereo temp; Ambisonic = a first-order AmbiX AAC
 /// temp muxed and tagged SA3D; APAC = the same AmbiX as a WAV through the
 /// macOS helper. Any failure falls back to stereo.
@@ -650,7 +650,7 @@ fn one_pass_audio_eligible(cfg: &FisheyeExportConfig) -> bool {
 fn stereo_audio_source(cfg: &FisheyeExportConfig, t_in: f64, dur_s: f64) -> (PathBuf, Option<PathBuf>, f64) {
     let (src, tmp) = eac_audio_source(cfg);
     if cfg.source_kind == SourceKind::KandaoQoocam {
-        // Four raw microphone channels (`audio::KANDAO_QUAD_STEREO_MATRIX`)
+        // Four raw microphone channels (`audio::QuadEncoder::stereo`)
         // → a stereo AAC temp for the export window, like the X6 below.
         if let Ok(Some(_)) = crate::audio::probe_foa_aac(&src) {
             let out = video_only_temp_path(&cfg.output_path).with_extension("quad_stereo.m4a");

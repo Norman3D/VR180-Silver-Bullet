@@ -44,10 +44,12 @@ file, stills, and the camera's own colour handling.
 - **Audio.** The 4-channel track is the camera's four microphone capsules
   (not a sound field; Kandao's spatial audio is Fraunhofer upHear, a
   parametric process the app cannot replicate). The capsule layout was
-  measured from the recordings — front-right, back-right, back-left,
-  front-left, all in phase — and the app encodes the array to first-order
-  ambisonics itself, so this camera gets the same **Audio** choices as the
-  X6: **Stereo** (a front-facing pair from the sound field), **Ambisonic**
+  measured from the recordings — one capsule on each of the front, left,
+  back and right faces, all in phase — and the app encodes the array to
+  first-order ambisonics itself (the capsule differences are integrated
+  and phase-matched to the pressure, so directions carry level, not just
+  phase), so this camera gets the same **Audio** choices as the X6:
+  **Stereo** (a front-facing pair from the sound field), **Ambisonic**
   (AmbiX + SA3D) and **APAC** (macOS). Each export window is normalized to
   a safe peak (the capsules are recorded low and vary between clips).
   Playback uses the same stereo pair.

@@ -137,58 +137,218 @@ pub fn foa_to_stereo_sample(wyzx: [f32; 4]) -> [f32; 2] {
 /// function of the capsules above ~400 Hz and cannot be reproduced by any
 /// matrix. The app encodes the array itself.
 ///
-/// The capsule layout was measured from the recordings (pairwise arrival
-/// times on 1,180 coherent directional windows across five clips of two
-/// cameras, regressed on the sound direction Studio's own ambisonic export
-/// reports, de-rotated by the gyro yaw): every capsule is in phase (peak
-/// sign positive in 96–100 % of windows; no polarity flip, no path
-/// latency — pair offsets within ±1.6 samples), and in the stitched
-/// viewing frame (0° = front, +90° = left) they sit at the four corners:
-/// **channel 0 front-right, 1 back-right, 2 back-left, 3 front-left**
-/// (fitted azimuths −63° / −175° / +138° / +41°; the earliest-arriving
-/// capsule per direction bin agrees). Diffraction round the body makes
-/// the apparent spacings 55–80 mm.
+/// Capsule → face. The four capsules sit on the body's four faces (the user
+/// has had the camera open: strictly front / back / left / right) and the
+/// recordings say which channel is which, with no help from Studio:
+/// * Front/back: the loudest coherent windows of the walking clip — the
+///   operator, holding the camera at arm's length in front of them — reach
+///   channel 2 first and channel 0 last in every one (relative arrival
+///   +7.6 / −2.1 / −4.6 / −1.0 samples), and that pattern holds through 230°
+///   of camera yaw while everything else sweeps: channel 2 faces the
+///   operator (back), channel 0 the scene (front).
+/// * Left/right: the camera's yaw was read off the image (phase correlation
+///   of the frame centre; r = −1.00 with gyro y, positive gyro y = turning
+///   right). A world-fixed sound must keep its world angle `θ_cam − yaw`
+///   through the turns; the lag-fitted directions do so only with channel 1
+///   on the LEFT and channel 3 on the RIGHT (world-angle spread 16° vs 48°
+///   for the mirror image; both big turns agree). The operator's voice then
+///   sits ~7° left of straight behind — a right-hand grip, the hand visible
+///   at the frame's lower right.
 ///
-/// First-order ambisonics (AmbiX ACN/SN3D: `[W, Y, Z, X]`) from that
-/// square: `W` = the pressure mean, `X` (front) = front pair − back pair,
-/// `Y` (left) = left pair − right pair, `Z` = 0 (a planar array). The
-/// dipole gain `g` sets `X`/`Y` to the SN3D level of a plane wave at
-/// ~1.5 kHz for the fitted spacing (`2·sin(k·d/2)` ≈ 1.46 per unit
-/// pressure for the pair sum → 0.34 per capsule); below that the dipoles
-/// roll off (a spaced pair's limit), above ~3 kHz they alias. Whole
-/// matrix ×[`KANDAO_QUAD_GAIN`]: the capsules are recorded ~15 dB below
-/// Studio's level, and ×3 keeps every sample clip's peaks under 0.81 with
-/// no limiter.
+/// So, 0° = front, +90° = left: **channel 0 front, 1 left, 2 back, 3
+/// right**. (An earlier fit against Studio's ambisonic export read its
+/// channels in the wrong order — the file is standard AmbiX `W Y Z X`, Z the
+/// quiet one — and put the capsules on the corners. Studio's field is
+/// view-locked and puts the operator at −15°, so its "front" is the
+/// opposite face; it plays no part in the layout.) Every capsule is in
+/// phase (correlation peak positive in 96–100 % of windows — no polarity
+/// flip) and there is no path latency (pair offsets within ±1.6 samples).
+/// The apparent acoustic spacing of an opposite pair, body diffraction
+/// included, is ~12 samples ≈ 85 mm ([`KANDAO_CAPSULE_SPACING_M`]).
+///
+/// Encoding. A spaced pair's difference is the pressure GRADIENT: for a
+/// plane wave it is `j·k·d·cos θ` times the pressure — 90° out of phase
+/// with it and rising 6 dB/octave. Fed straight to an AmbiX decoder (whose
+/// virtual microphones add W and X/Y in phase) that gives every direction
+/// the same level and only a phase smear. So the difference is integrated
+/// first: a leaky integrator (first-order low-pass at
+/// [`KANDAO_GRAD_INTEGRATE_HZ`]: −90° and −6 dB/octave above it) scaled by
+/// `c / (2π·f·d)` turns `front − back` into SN3D `X = p·cos θ` from ~250 Hz
+/// up to where the pair aliases (~2 kHz; above that the dipoles fade,
+/// which a first-order field takes better than lobes). Every channel, W
+/// included, goes through the same two first-order high-passes at
+/// [`KANDAO_GRAD_HP_HZ`] — a low-cut like most camera microphones'. The
+/// dipoles get two more poles at [`KANDAO_GRAD_WIND_HZ`], because a
+/// differential pair amplifies capsule mismatch and wind by `1/(k·d)` at
+/// low frequency (measured on the park clip: without them a sub-300 Hz
+/// gust peaked 10–18 dB above W and set the export's level; an 85 mm pair
+/// resolves little below ~300 Hz anyway); W gets the matching first-order
+/// all-pass `(β − z⁻¹)/(1 − βz⁻¹)`, which has exactly the phase of that
+/// pole pair and leaves W's magnitude alone. So the dipoles stay
+/// phase-matched to W except for the integrator's own 90° − atan(f/250 Hz)
+/// (14° at 1 kHz, never inverted). `Z` = 0 (a planar array). Stereo is the
+/// usual ±45° cardioid pair
+/// of that field ([`FOA_STEREO_MATRIX`]). Everything carries
+/// ×[`KANDAO_QUAD_GAIN`] (the capsules are recorded ~15 dB low) and the
+/// exports then peak-normalise the window ([`kandao_window_gain`]).
+/// [`QuadEncoder`] is the stateful implementation (filter state per
+/// stream, sample rate given at open).
 pub const KANDAO_QUAD_GAIN: f32 = 3.0;
-const KANDAO_DIPOLE_GAIN: f32 = 0.34;
-pub const KANDAO_QUAD_FOA_MATRIX: [[f32; 4]; 4] = [
-    // W
-    [0.25 * KANDAO_QUAD_GAIN, 0.25 * KANDAO_QUAD_GAIN, 0.25 * KANDAO_QUAD_GAIN, 0.25 * KANDAO_QUAD_GAIN],
-    // Y (left): (c3 + c2) − (c0 + c1)
-    [-KANDAO_DIPOLE_GAIN * KANDAO_QUAD_GAIN, -KANDAO_DIPOLE_GAIN * KANDAO_QUAD_GAIN,
-     KANDAO_DIPOLE_GAIN * KANDAO_QUAD_GAIN, KANDAO_DIPOLE_GAIN * KANDAO_QUAD_GAIN],
-    // Z: none (planar array)
-    [0.0, 0.0, 0.0, 0.0],
-    // X (front): (c0 + c3) − (c1 + c2)
-    [KANDAO_DIPOLE_GAIN * KANDAO_QUAD_GAIN, -KANDAO_DIPOLE_GAIN * KANDAO_QUAD_GAIN,
-     -KANDAO_DIPOLE_GAIN * KANDAO_QUAD_GAIN, KANDAO_DIPOLE_GAIN * KANDAO_QUAD_GAIN],
-];
+/// Decoded channel of the capsule on each face.
+pub const KANDAO_CAPSULE_FRONT: usize = 0;
+pub const KANDAO_CAPSULE_LEFT: usize = 1;
+pub const KANDAO_CAPSULE_BACK: usize = 2;
+pub const KANDAO_CAPSULE_RIGHT: usize = 3;
+/// Apparent acoustic spacing of an opposite capsule pair (m).
+pub const KANDAO_CAPSULE_SPACING_M: f32 = 0.085;
+/// Corner of the leaky integrator that turns a pair difference into a
+/// velocity component (Hz).
+pub const KANDAO_GRAD_INTEGRATE_HZ: f32 = 250.0;
+/// Corner of the two first-order high-passes every channel goes through (Hz).
+pub const KANDAO_GRAD_HP_HZ: f32 = 150.0;
+/// Corner of the two extra poles on the dipoles against wind (Hz); W gets
+/// the all-pass with the same phase.
+pub const KANDAO_GRAD_WIND_HZ: f32 = 250.0;
+const SPEED_OF_SOUND_M_S: f32 = 343.0;
 
-/// Stereo from the QooCam's capsules: [`FOA_STEREO_MATRIX`] (virtual
-/// cardioids at ±45°) composed with [`KANDAO_QUAD_FOA_MATRIX`] — rows
-/// `[L, R]` over the decoded channel order. L leans on the front-left
-/// capsule (3) against the back-right (1), R on the front-right (0)
-/// against the back-left (2); L/R correlation 0.5–0.7 on the sample clips.
-pub const KANDAO_QUAD_STEREO_MATRIX: [[f32; 4]; 2] = [
-    [0.125 * KANDAO_QUAD_GAIN, -0.1154 * KANDAO_QUAD_GAIN, 0.125 * KANDAO_QUAD_GAIN, 0.3654 * KANDAO_QUAD_GAIN],
-    [0.3654 * KANDAO_QUAD_GAIN, 0.125 * KANDAO_QUAD_GAIN, -0.1154 * KANDAO_QUAD_GAIN, 0.125 * KANDAO_QUAD_GAIN],
-];
+/// Two cascaded first-order high-passes at `corner_hz`
+/// (`β(1 − z⁻¹)/(1 − βz⁻¹)` each).
+#[derive(Clone, Debug)]
+struct Hp2 { beta: f32, s1: [f32; 2], s2: [f32; 2] }
 
-/// One sample of the QooCam's four channels → `[L, R]` through
-/// [`KANDAO_QUAD_STEREO_MATRIX`].
-#[inline]
-pub fn quad_to_stereo_sample(ch: [f32; 4]) -> [f32; 2] {
-    mix_sample(&KANDAO_QUAD_STEREO_MATRIX, ch)
+impl Hp2 {
+    fn new(rate: f32, corner_hz: f32) -> Self {
+        Self { beta: 1.0 / (1.0 + std::f32::consts::TAU * corner_hz / rate), s1: [0.0; 2], s2: [0.0; 2] }
+    }
+    fn reset(&mut self) { self.s1 = [0.0; 2]; self.s2 = [0.0; 2]; }
+    #[inline]
+    fn run(&mut self, x: f32) -> f32 {
+        // y[n] = β·(y[n−1] + x[n] − x[n−1]); state [x[n−1], y[n−1]]
+        let y1 = self.beta * (self.s1[1] + x - self.s1[0]);
+        self.s1 = [x, y1];
+        let y2 = self.beta * (self.s2[1] + y1 - self.s2[0]);
+        self.s2 = [y1, y2];
+        y2
+    }
+}
+
+/// The first-order all-pass `(β − z⁻¹)/(1 − βz⁻¹)` sharing an [`Hp2`]'s
+/// pole: unit magnitude, and exactly the phase of that [`Hp2`].
+#[derive(Clone, Debug)]
+struct Ap1 { beta: f32, s: [f32; 2] }
+
+impl Ap1 {
+    fn new(rate: f32, corner_hz: f32) -> Self {
+        Self { beta: 1.0 / (1.0 + std::f32::consts::TAU * corner_hz / rate), s: [0.0; 2] }
+    }
+    fn reset(&mut self) { self.s = [0.0; 2]; }
+    #[inline]
+    fn run(&mut self, x: f32) -> f32 {
+        // y[n] = β·y[n−1] + β·x[n] − x[n−1]; state [x[n−1], y[n−1]]
+        let y = self.beta * self.s[1] + self.beta * x - self.s[0];
+        self.s = [x, y];
+        y
+    }
+}
+
+/// Gradient → velocity equaliser for one capsule pair (see the notes above
+/// [`KANDAO_QUAD_GAIN`]): the shared high-passes, two more poles against
+/// wind, a leaky integrator and the `c/(2π·f·d)` scale.
+#[derive(Clone, Debug)]
+struct GradEq { hp: Hp2, hp_wind: Hp2, alpha: f32, k: f32, lp: f32 }
+
+impl GradEq {
+    fn new(rate: f32) -> Self {
+        let alpha = 1.0 - (-std::f32::consts::TAU * KANDAO_GRAD_INTEGRATE_HZ / rate).exp();
+        let k = SPEED_OF_SOUND_M_S / (std::f32::consts::TAU * KANDAO_GRAD_INTEGRATE_HZ * KANDAO_CAPSULE_SPACING_M);
+        Self { hp: Hp2::new(rate, KANDAO_GRAD_HP_HZ), hp_wind: Hp2::new(rate, KANDAO_GRAD_WIND_HZ), alpha, k, lp: 0.0 }
+    }
+    fn reset(&mut self) { self.hp.reset(); self.hp_wind.reset(); self.lp = 0.0; }
+    #[inline]
+    fn run(&mut self, x: f32) -> f32 {
+        let h = self.hp_wind.run(self.hp.run(x));
+        self.lp += self.alpha * (h - self.lp);
+        self.k * self.lp
+    }
+}
+
+/// The QooCam capsule array → first-order AmbiX `[W, Y, Z, X]` (and the
+/// stereo pair of it), carrying the filters' state — one per decoded
+/// stream. `gain` multiplies the built-in ×[`KANDAO_QUAD_GAIN`].
+#[derive(Clone, Debug)]
+pub struct QuadEncoder { gain: f32, hp_w: Hp2, ap_w: Ap1, eq_x: GradEq, eq_y: GradEq }
+
+impl QuadEncoder {
+    pub fn new(sample_rate: u32, gain: f32) -> Self {
+        let r = sample_rate.max(1) as f32;
+        Self {
+            gain: gain * KANDAO_QUAD_GAIN, hp_w: Hp2::new(r, KANDAO_GRAD_HP_HZ), ap_w: Ap1::new(r, KANDAO_GRAD_WIND_HZ),
+            eq_x: GradEq::new(r), eq_y: GradEq::new(r),
+        }
+    }
+    /// Forget the filter history (after a seek).
+    pub fn reset(&mut self) { self.hp_w.reset(); self.ap_w.reset(); self.eq_x.reset(); self.eq_y.reset(); }
+    /// One sample of the four capsules (decoded channel order) → `[W, Y, Z, X]`.
+    #[inline]
+    pub fn foa(&mut self, c: [f32; 4]) -> [f32; 4] {
+        let w = self.ap_w.run(self.hp_w.run(0.25 * (c[0] + c[1] + c[2] + c[3])));
+        let x = self.eq_x.run(c[KANDAO_CAPSULE_FRONT] - c[KANDAO_CAPSULE_BACK]);
+        let y = self.eq_y.run(c[KANDAO_CAPSULE_LEFT] - c[KANDAO_CAPSULE_RIGHT]);
+        [self.gain * w, self.gain * y, 0.0, self.gain * x]
+    }
+    /// One sample → `[L, R]` (the ±45° cardioids of [`FOA_STEREO_MATRIX`]).
+    #[inline]
+    pub fn stereo(&mut self, c: [f32; 4]) -> [f32; 2] { foa_to_stereo_sample(self.foa(c)) }
+}
+
+/// Which stereo pair a 4-channel source gets in the player: the codec
+/// alone cannot tell the X6's AmbiX from the QooCam's capsules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StereoMix {
+    /// First-order AmbiX through [`FOA_STEREO_MATRIX`].
+    Foa,
+    /// The QooCam's capsules through [`QuadEncoder`].
+    Quad,
+}
+
+/// How a 4-channel track is mixed on the way out of [`transcode_audio_window`].
+#[derive(Clone, Copy, Debug)]
+pub enum Mix<'a> {
+    /// A fixed matrix, one row per output channel (the X6's AmbiX → stereo).
+    Matrix(&'a [[f32; 4]]),
+    /// The QooCam capsules → AmbiX `[W, Y, Z, X]` through [`QuadEncoder`].
+    QuadFoa { gain: f32 },
+    /// The QooCam capsules → the stereo pair through [`QuadEncoder`].
+    QuadStereo { gain: f32 },
+}
+
+impl Mix<'_> {
+    fn out_channels(&self) -> usize {
+        match self { Mix::Matrix(m) => m.len(), Mix::QuadFoa { .. } => 4, Mix::QuadStereo { .. } => 2 }
+    }
+}
+
+/// A [`Mix`] in flight: the matrix, or the encoder with its state.
+enum MixState<'a> { Matrix(&'a [[f32; 4]]), QuadFoa(QuadEncoder), QuadStereo(QuadEncoder) }
+
+impl<'a> MixState<'a> {
+    fn new(mix: Mix<'a>, rate: u32) -> Self {
+        match mix {
+            Mix::Matrix(m) => MixState::Matrix(m),
+            Mix::QuadFoa { gain } => MixState::QuadFoa(QuadEncoder::new(rate, gain)),
+            Mix::QuadStereo { gain } => MixState::QuadStereo(QuadEncoder::new(rate, gain)),
+        }
+    }
+    #[inline]
+    fn apply(&mut self, s: [f32; 4], out: &mut Vec<f32>) {
+        match self {
+            MixState::Matrix(m) => for row in m.iter() {
+                out.push(row[0] * s[0] + row[1] * s[1] + row[2] * s[2] + row[3] * s[3]);
+            },
+            MixState::QuadFoa(e) => out.extend_from_slice(&e.foa(s)),
+            MixState::QuadStereo(e) => out.extend_from_slice(&e.stereo(s)),
+        }
+    }
 }
 
 /// One sample through a `[L, R] × 4` mixing matrix.
@@ -375,7 +535,7 @@ fn transcode_audio_window(
     out_path: &Path,
     offset_s: f64,
     dur_s: Option<f64>,
-    mix: Option<&[[f32; 4]]>,
+    mix: Option<Mix<'_>>,
     out: AudioOut,
 ) -> Result<u64> {
     use ffmpeg::format::sample::{Sample, Type};
@@ -428,10 +588,11 @@ fn transcode_audio_window(
         return Err(Error::Ffmpeg(format!("channel count {in_ch} → {out_ch} without a mix")));
     }
     if let Some(m) = mix {
-        if m.len() != out_ch {
-            return Err(Error::Ffmpeg(format!("mix has {} rows for {out_ch} output channels", m.len())));
+        if m.out_channels() != out_ch {
+            return Err(Error::Ffmpeg(format!("mix has {} rows for {out_ch} output channels", m.out_channels())));
         }
     }
+    let mut mix_state = mix.map(|m| MixState::new(m, rate));
     let codec = ffmpeg::encoder::find(codec_id)
         .ok_or_else(|| Error::Ffmpeg(format!("no encoder for {codec_id:?}")))?;
     let mut octx = ffmpeg::format::output_as(&out_path, muxer)
@@ -528,7 +689,7 @@ fn transcode_audio_window(
     // Samples still to drop so the output starts exactly at `offset_s`
     // (set from the first kept packet's timestamp).
     let mut drop_left: Option<usize> = None;
-    let push = |f: &ffmpeg::frame::Audio, pending: &mut Vec<f32>, drop_left: &mut Option<usize>| {
+    let mut push = |f: &ffmpeg::frame::Audio, pending: &mut Vec<f32>, drop_left: &mut Option<usize>| {
         let n = f.samples();
         let bytes = &f.data(0)[..n * in_ch * 4];
         let mut src: &[f32] = bytemuck::cast_slice(bytes);
@@ -537,12 +698,8 @@ fn transcode_audio_window(
             src = &src[take * in_ch..];
             *d -= take;
         }
-        match mix {
-            Some(m) => for s in src.chunks_exact(4) {
-                for row in m.iter() {
-                    pending.push(row[0] * s[0] + row[1] * s[1] + row[2] * s[2] + row[3] * s[3]);
-                }
-            },
+        match mix_state.as_mut() {
+            Some(m) => for s in src.chunks_exact(4) { m.apply([s[0], s[1], s[2], s[3]], pending); },
             None => pending.extend_from_slice(src),
         }
     };
@@ -589,7 +746,7 @@ pub fn foa_to_stereo_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: 
     let t0 = std::time::Instant::now();
     let n = transcode_audio_window(
         input, info.stream_index, output_m4a, offset_s, dur_s,
-        Some(&FOA_STEREO_MATRIX[..]), AudioOut::AacStereo { bit_rate },
+        Some(Mix::Matrix(&FOA_STEREO_MATRIX[..])), AudioOut::AacStereo { bit_rate },
     )?;
     tracing::info!(m4a = %output_m4a.display(), samples = n, sample_rate = info.sample_rate,
         window_start_s = offset_s, window_s = dur_s.unwrap_or(f64::NAN), took_ms = t0.elapsed().as_millis() as u64,
@@ -602,30 +759,25 @@ pub fn foa_to_stereo_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: 
 /// a normal level and vary by that much between clips, and the app has no
 /// limiter. The window is decoded once through the AmbiX matrix (W carries
 /// the pressure; the stereo pair is derived from the same field, so one
-/// gain serves every format) and the mix is scaled so that peak lands at
-/// [`KANDAO_PEAK_TARGET`], within `0.5×…8×` of the matrices' built-in ×3.
+/// gain serves every format) and the encoder is scaled so that peak lands at
+/// [`KANDAO_PEAK_TARGET`], within `0.5×…16×` of the encoder's built-in ×3
+/// (the park clip needs ~12× to reach Studio's own output level).
 pub const KANDAO_PEAK_TARGET: f32 = 0.7;
 
 /// Gain the Kandao window gets on top of the matrices (see
 /// [`KANDAO_PEAK_TARGET`]); 1.0 when the window is silent or cannot be read.
 pub fn kandao_window_gain(input: &Path, stream_index: usize, offset_s: f64, dur_s: Option<f64>) -> f32 {
-    match mixed_window_peak(input, stream_index, offset_s, dur_s, &KANDAO_QUAD_FOA_MATRIX[..]) {
-        Ok(peak) if peak > 1e-5 => (KANDAO_PEAK_TARGET / peak).clamp(0.5, 8.0),
+    match mixed_window_peak(input, stream_index, offset_s, dur_s, Mix::QuadFoa { gain: 1.0 }) {
+        Ok(peak) if peak > 1e-5 => (KANDAO_PEAK_TARGET / peak).clamp(0.5, 16.0),
         Ok(_) => 1.0,
         Err(e) => { tracing::warn!("kandao audio: peak pre-pass failed ({e}) — unity gain"); 1.0 }
     }
 }
 
-fn scaled_mix<const R: usize>(m: &[[f32; 4]; R], g: f32) -> [[f32; 4]; R] {
-    let mut out = *m;
-    for row in out.iter_mut() { for v in row.iter_mut() { *v *= g; } }
-    out
-}
-
 /// Largest |sample| of the window `[offset_s, offset_s + dur_s)` of stream
 /// `stream_index` after the mix (same window rule as
 /// [`transcode_audio_window`], decode only).
-fn mixed_window_peak(input: &Path, stream_index: usize, offset_s: f64, dur_s: Option<f64>, mix: &[[f32; 4]]) -> Result<f32> {
+fn mixed_window_peak(input: &Path, stream_index: usize, offset_s: f64, dur_s: Option<f64>, mix: Mix<'_>) -> Result<f32> {
     use ffmpeg::format::sample::{Sample, Type};
     crate::decode::init();
     let mut ictx = open_input_concat_aware(input)
@@ -658,14 +810,15 @@ fn mixed_window_peak(input: &Path, stream_index: usize, offset_s: f64, dur_s: Op
     let mut decoded = ffmpeg::frame::Audio::empty();
     let mut f32_frame = ffmpeg::frame::Audio::empty();
     let mut peak = 0f32;
+    let mut state = MixState::new(mix, rate);
+    let mut tmp: Vec<f32> = Vec::with_capacity(4);
     let mut scan = |f: &ffmpeg::frame::Audio, peak: &mut f32| {
         let n = f.samples();
         let src: &[f32] = bytemuck::cast_slice(&f.data(0)[..n * in_ch * 4]);
         for s4 in src.chunks_exact(4) {
-            for row in mix.iter() {
-                let v = (row[0] * s4[0] + row[1] * s4[1] + row[2] * s4[2] + row[3] * s4[3]).abs();
-                if v > *peak { *peak = v; }
-            }
+            tmp.clear();
+            state.apply([s4[0], s4[1], s4[2], s4[3]], &mut tmp);
+            for v in &tmp { let v = v.abs(); if v > *peak { *peak = v; } }
         }
     };
     for (stream, pkt) in ictx.packets() {
@@ -684,7 +837,7 @@ fn mixed_window_peak(input: &Path, stream_index: usize, offset_s: f64, dur_s: Op
 }
 
 /// Encode the QooCam's four capsules to a first-order AmbiX 4-channel AAC
-/// `.m4a` through [`KANDAO_QUAD_FOA_MATRIX`] (peak-normalised, see
+/// `.m4a` through [`QuadEncoder`] (peak-normalised, see
 /// [`kandao_window_gain`]) — the export window, starting at its own 0 like
 /// [`quad_to_stereo_aac`]. The mux then tags it SA3D.
 pub fn quad_to_foa_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Option<f64>, bit_rate: usize) -> Result<u64> {
@@ -692,10 +845,9 @@ pub fn quad_to_foa_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Op
         .ok_or_else(|| Error::Ffmpeg(format!("no 4-channel AAC track in {input:?}")))?;
     let t0 = std::time::Instant::now();
     let g = kandao_window_gain(input, info.stream_index, offset_s, dur_s);
-    let m = scaled_mix(&KANDAO_QUAD_FOA_MATRIX, g);
     let n = transcode_audio_window(
         input, info.stream_index, output_m4a, offset_s, dur_s,
-        Some(&m[..]), AudioOut::Aac4 { bit_rate },
+        Some(Mix::QuadFoa { gain: g }), AudioOut::Aac4 { bit_rate },
     )?;
     tracing::info!(m4a = %output_m4a.display(), samples = n, gain = g, took_ms = t0.elapsed().as_millis() as u64,
         "QooCam 4-channel audio: encoded first-order AmbiX AAC");
@@ -708,15 +860,14 @@ pub fn quad_to_foa_wav(input: &Path, output_wav: &Path, offset_s: f64, dur_s: Op
     let info = probe_foa_aac(input)?
         .ok_or_else(|| Error::Ffmpeg(format!("no 4-channel AAC track in {input:?}")))?;
     let g = kandao_window_gain(input, info.stream_index, offset_s, dur_s);
-    let m = scaled_mix(&KANDAO_QUAD_FOA_MATRIX, g);
     transcode_audio_window(
         input, info.stream_index, output_wav, offset_s, dur_s,
-        Some(&m[..]), AudioOut::Pcm24 { channels: 4 },
+        Some(Mix::QuadFoa { gain: g }), AudioOut::Pcm24 { channels: 4 },
     )
 }
 
 /// Decode the Kandao QooCam's 4-channel microphone track to a stereo AAC
-/// `.m4a` through [`KANDAO_QUAD_STEREO_MATRIX`] — the window
+/// `.m4a` through [`QuadEncoder::stereo`] — the window
 /// `[offset_s, offset_s + dur_s)` (whole track when `None`), starting at
 /// its own 0 like [`foa_to_stereo_aac`]. Returns the samples written.
 pub fn quad_to_stereo_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Option<f64>, bit_rate: usize) -> Result<u64> {
@@ -726,10 +877,9 @@ pub fn quad_to_stereo_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s:
     // The same gain the ambisonic export of this window would get, so the
     // formats agree in level.
     let g = kandao_window_gain(input, info.stream_index, offset_s, dur_s);
-    let m = scaled_mix(&KANDAO_QUAD_STEREO_MATRIX, g);
     let n = transcode_audio_window(
         input, info.stream_index, output_m4a, offset_s, dur_s,
-        Some(&m[..]), AudioOut::AacStereo { bit_rate },
+        Some(Mix::QuadStereo { gain: g }), AudioOut::AacStereo { bit_rate },
     )?;
     tracing::info!(m4a = %output_m4a.display(), samples = n, sample_rate = info.sample_rate, gain = g,
         window_start_s = offset_s, window_s = dur_s.unwrap_or(f64::NAN), took_ms = t0.elapsed().as_millis() as u64,
@@ -1028,27 +1178,63 @@ mod foa_tests {
         assert!((l - r).abs() < 1e-6 && l < 0.2, "{l} {r}");
     }
 
-    #[test]
-    fn kandao_quad_matrices_encode_the_measured_square() {
-        // capsules: 0 front-right, 1 back-right, 2 back-left, 3 front-left.
-        let foa = |c: [f32; 4]| -> [f32; 4] {
-            let m = &KANDAO_QUAD_FOA_MATRIX;
-            let row = |r: &[f32; 4]| r[0] * c[0] + r[1] * c[1] + r[2] * c[2] + r[3] * c[3];
-            [row(&m[0]), row(&m[1]), row(&m[2]), row(&m[3])]
+    /// A 1 kHz plane wave crossing the capsule cross from azimuth `az`
+    /// (0 = front, +90 = left) through [`QuadEncoder`] (built-in ×3 taken
+    /// out): per-channel rms, the in-phase correlation of X and Y with W,
+    /// and the stereo pair's rms — over the second half of 0.5 s.
+    fn quad_plane_wave(az_deg: f32) -> ([f32; 4], [f32; 2], [f32; 2]) {
+        let rate = 48_000u32;
+        let d = KANDAO_CAPSULE_SPACING_M / 2.0;
+        let pos = |ch: usize| -> (f32, f32) {
+            if ch == KANDAO_CAPSULE_FRONT { (d, 0.0) } else if ch == KANDAO_CAPSULE_LEFT { (0.0, d) }
+            else if ch == KANDAO_CAPSULE_BACK { (-d, 0.0) } else { (0.0, -d) }
         };
-        // A source straight ahead reaches the two front capsules louder.
-        let [w, y, z, x] = foa([1.0, 0.5, 0.5, 1.0]);
-        assert!(w > 0.0 && x > 0.0 && y.abs() < 1e-6 && z == 0.0, "{w} {y} {z} {x}");
-        // A source on the left: Y positive, X zero.
-        let [_, y, _, x] = foa([0.5, 0.5, 1.0, 1.0]);
-        assert!(y > 0.0 && x.abs() < 1e-6);
-        // Stereo: a front-left source lands louder in L than R, and the
-        // mirror image swaps them exactly.
-        let [l, r] = quad_to_stereo_sample([0.6, 0.4, 0.6, 1.0]);
-        let [l2, r2] = quad_to_stereo_sample([1.0, 0.6, 0.4, 0.6]);
-        assert!(l > r && (l - r2).abs() < 1e-6 && (r - l2).abs() < 1e-6, "{l} {r} {l2} {r2}");
-        // Every capsule carries the same weight in W (in phase, no flip).
-        let m = &KANDAO_QUAD_FOA_MATRIX[0];
-        assert!(m.iter().all(|v| (v - m[0]).abs() < 1e-6 && *v > 0.0));
+        let (ux, uy) = (az_deg.to_radians().cos(), az_deg.to_radians().sin());
+        let mut enc = QuadEncoder::new(rate, 1.0 / KANDAO_QUAD_GAIN);
+        let (mut acc, mut lr, mut wx, mut wy, mut n) = ([0f32; 4], [0f32; 2], 0f32, 0f32, 0usize);
+        for i in 0..rate as usize / 2 {
+            let t = i as f32 / rate as f32;
+            let mut c = [0f32; 4];
+            for (ch, v) in c.iter_mut().enumerate() {
+                let (px, py) = pos(ch);
+                // the capsule along the arrival direction hears the wave first
+                *v = (std::f32::consts::TAU * 1000.0 * (t + (px * ux + py * uy) / SPEED_OF_SOUND_M_S)).sin();
+            }
+            let o = enc.foa(c);
+            let s = foa_to_stereo_sample(o);
+            if i >= rate as usize / 4 {
+                for k in 0..4 { acc[k] += o[k] * o[k]; }
+                lr[0] += s[0] * s[0]; lr[1] += s[1] * s[1];
+                wx += o[0] * o[3]; wy += o[0] * o[1]; n += 1;
+            }
+        }
+        let rms = |v: f32| (v / n as f32).sqrt();
+        let r = [rms(acc[0]), rms(acc[1]), rms(acc[2]), rms(acc[3])];
+        let corr = |p: f32, a: f32, b: f32| if a * b > 0.0 { p / n as f32 / (a * b) } else { 0.0 };
+        (r, [corr(wx, r[0], r[3]), corr(wy, r[0], r[1])], [rms(lr[0]), rms(lr[1])])
+    }
+
+    #[test]
+    fn kandao_quad_encoder_places_a_plane_wave() {
+        // Front: X at the SN3D level and in phase with W, Y silent, stereo centred.
+        let ([w, y, z, x], [cx, _], [l, r]) = quad_plane_wave(0.0);
+        assert!(z == 0.0 && y < 0.02 * w, "front: w {w} y {y}");
+        assert!((x / w - 1.0).abs() < 0.25 && cx > 0.95, "front: x/w {} corr {cx}", x / w);
+        assert!((l - r).abs() < 0.02 * l, "front stereo {l} {r}");
+        // Back: X in anti-phase, still centred.
+        let (_, [cx, _], [l, r]) = quad_plane_wave(180.0);
+        assert!(cx < -0.95 && (l - r).abs() < 0.02 * l, "back: corr {cx} stereo {l} {r}");
+        // Left: Y in phase with W at the SN3D level, X silent, L well above R;
+        // the right mirrors it.
+        let ([w, y, _, x], [_, cy], [l, r]) = quad_plane_wave(90.0);
+        assert!(x < 0.02 * w && (y / w - 1.0).abs() < 0.25 && cy > 0.95, "left: x {x} y/w {} corr {cy}", y / w);
+        assert!(l > 2.0 * r, "left stereo {l} {r}");
+        let (_, _, [l2, r2]) = quad_plane_wave(-90.0);
+        assert!((l2 - r).abs() < 0.02 * r && (r2 - l).abs() < 0.02 * l, "right stereo {l2} {r2} vs {l} {r}");
+        // A static capsule offset (mismatch, wind) does not reach the dipoles.
+        let mut enc = QuadEncoder::new(48_000, 1.0);
+        let mut last = [0f32; 4];
+        for _ in 0..48_000 { last = enc.foa([1.0, 0.0, 0.0, 0.0]); }
+        assert!(last[0].abs() < 1e-3 && last[3].abs() < 1e-3 && last[1].abs() < 1e-3, "dc leak {last:?}");
     }
 }

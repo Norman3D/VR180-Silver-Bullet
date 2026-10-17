@@ -1090,7 +1090,7 @@ struct ClipInfo {
     /// 4-channel first-order AmbiX track (so the Audio section applies).
     foa_audio: bool,
     /// Kandao QooCam with its 4-channel microphone track (mixed to stereo
-    /// for playback and export — `audio::KANDAO_QUAD_STEREO_MATRIX`).
+    /// for playback and export — `audio::QuadEncoder`).
     quad_audio: bool,
 }
 
@@ -3536,8 +3536,8 @@ impl App {
             // 4-channel sources need the caller's mixing matrix: the codec
             // alone cannot tell the X6's AmbiX from the QooCam's microphones.
             let mix = self.clip.as_ref().and_then(|c| {
-                if c.foa_audio { Some(vr180_pipeline::audio::FOA_STEREO_MATRIX) }
-                else if c.quad_audio { Some(vr180_pipeline::audio::KANDAO_QUAD_STEREO_MATRIX) }
+                if c.foa_audio { Some(vr180_pipeline::audio::StereoMix::Foa) }
+                else if c.quad_audio { Some(vr180_pipeline::audio::StereoMix::Quad) }
                 else { None }
             });
             self.audio_player = match crate::audio_player::AudioPlayer::open_with_mix(
@@ -5699,7 +5699,7 @@ impl App {
             )).small().color(Color32::GRAY));
         } else if quad {
             ui.label(RichText::new(tr(
-                "Four microphone capsules (front-right, back-right, back-left, front-left). \
+                "Four microphone capsules (front, left, back, right). \
                  The app encodes them to first-order ambisonics; Stereo is a front-facing pair from that."
             )).small().color(Color32::GRAY));
         }
