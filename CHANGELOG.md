@@ -16,9 +16,12 @@ file, stills, and the camera's own colour handling.
   Studio's own stitcher runs (a 4-coefficient Kannala-Brandt lens per eye
   from the record, scaled to the stream); the top half is the left eye
   after the mod (measured on near-field parallax). Stabilization fuses the
-  gyro exactly as the X6 path does; the readout (24.4 ms, top row first)
-  and the frame content time (`PTS + readout/2 + shutter/2`) were measured
-  from image motion against the gyro on two clips, both sensors. Decoding
+  gyro exactly as the X6 path does; the readout (19.4 ms with HDR off,
+  24.6 ms with HDR on, top row first) and the frame content time
+  (`PTS + readout/2 − shutter/2` plus a per-mode delay) were measured from
+  image motion against the gyro on two cameras and both sensors, over
+  shutters from 0.2 to 10 ms — indoor clips, where the camera holds a
+  10 ms shutter, depend on getting the shutter term right. Decoding
   takes the zero-copy VideoToolbox path (each eye sampled in place from the
   stacked frame).
 - **HDR (HLG) clips.** The camera's HDR mode records HLG BT.2020, full

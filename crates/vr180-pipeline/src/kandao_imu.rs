@@ -18,16 +18,28 @@
 //!
 //! ## Motion
 //!
-//! The raw 1 kHz gyro + accelerometer stream is fused exactly as the X6's
-//! (`integrate_orientation_samples`: trapezoid gyro integration with a
+//! The raw gyro + accelerometer stream (1 kHz on the sh3001 units, ~788 Hz
+//! on the bmi260 ones — the sample timestamps rule) is fused exactly as the
+//! X6's (`integrate_orientation_samples`: trapezoid gyro integration with a
 //! whole-clip VQF bias estimate, batch gravity alignment, the slow
 //! inclination trim). The per-frame content time is the centre row's
 //! mid-exposure, from the file:
-//! `PTS + readout / 2 + shutter / 2` — the frame's `PTS` entry is where
-//! the first row's exposure starts, `shutter` is the frame's `EXP` record.
-//! Image motion against the gyro on two clips places the content time at
-//! `PTS + 18 ± 2 ms` for 24 ms readout and 3–7 ms shutters, which is that
-//! rule (15–16 ms) within the measurement; no sync constant is added.
+//! `PTS + readout / 2 − shutter / 2 + latency` — the frame's `PTS` entry is
+//! where the first row's READOUT starts (the end of its exposure),
+//! `shutter` the frame's `EXP` record, and `readout` / `latency` depend on
+//! the recording mode: the `kfix` **HDR** flag ([`kandao_readout_ms`],
+//! [`kandao_gyro_latency_ms`]). Measured on two cameras (sh3001 / bmi260
+//! IMUs, firmware 1.1.3 / 1.1.6), image motion vs gyro:
+//! - HDR off (every indoor clip, most outdoor ones): the offset is
+//!   +14.0…+15.0 ms at 0.2–0.6 ms shutters, +12.0 at 5.7 ms, +7.5…+9.25 at
+//!   9.1–10 ms — i.e. `14.5 − shutter/2`; readout 19.4 ms (the app's own
+//!   RS-scale probe: residual crosses zero at 0.79 × 24.4; raw stretch
+//!   regressions 17.8–19.3; the two IMUs agree within 0.7 ms).
+//! - HDR on (one clip): offset +17.25…+18 at 3.6–6.6 ms shutters, readout
+//!   24.3–25.5 — the sensor reads slower and stamps later.
+//! The sign of the shutter term is the measured one; the first reading of
+//! the HDR clip alone (`+shutter/2`) put indoor 10 ms-shutter clips ~9 ms
+//! off — visibly worse stabilization indoors.
 //!
 //! The IMU → camera basis (rows = the camera's x right / y up / z axes in
 //! IMU coordinates, the X6 convention) was settled the way the X6's was:
@@ -61,9 +73,28 @@ pub const KANDAO_IMU_TO_CAM: [[f32; 3]; 3] = [
 ];
 
 /// Sensor readout (rolling-shutter sweep) time of the 3840×7680 @ 30 fps
-/// video, ms — measured, the file states none: 24.3 / 23.6 / 25.2 ms on
-/// three windows of two clips (top and bottom sensors), top row first.
-pub const KANDAO_READOUT_MS: f32 = 24.4;
+/// video with HDR off, ms — measured (the file states none), top row first:
+/// the app's RS-scale probe on a bmi260 clip puts the zero crossing at
+/// 0.79 × 24.4 = 19.3 ms; raw stretch regressions on both cameras give
+/// 17.8–19.3 (r up to −0.91). The default when no IMU block says otherwise.
+pub const KANDAO_READOUT_MS: f32 = 19.4;
+/// Readout with the camera's HDR mode on: 24.3 / 23.6 / 25.2 / 24.5 / 25.5 ms
+/// on five windows of the one HDR clip (both sensors).
+pub const KANDAO_READOUT_HDR_MS: f32 = 24.6;
+
+/// Readout by recording mode (`kfix` `HDR` flag).
+pub fn kandao_readout_ms(hdr: bool) -> f32 {
+    if hdr { KANDAO_READOUT_HDR_MS } else { KANDAO_READOUT_MS }
+}
+
+/// The residual between the measured content time and
+/// `PTS + readout/2 − shutter/2`, ms, by recording mode — the gyro's own
+/// delay plus whatever the sensor's frame timestamp hides: HDR off
+/// 14.5 − 9.7 → **4.6 ms** (both cameras, 0.2–10 ms shutters, seven clips);
+/// HDR on 18 + 2.3 − 12.3 → **8.0 ms** (one clip).
+pub fn kandao_gyro_latency_ms(hdr: bool) -> f32 {
+    if hdr { 8.0 } else { 4.6 }
+}
 
 /// `VR180_KANDAO_BASIS="r00,r01,…,r22"` (row-major) overrides the basis for
 /// headless A/B tests, like `VR180_INSV_BASIS`.
@@ -181,7 +212,7 @@ pub fn kandao_calib_only(meta: &KandaoMeta, stream_w: u32, stream_h: u32) -> Dji
         lens_b,
         camera_model: Some(if meta.product.is_empty() { "Kandao QooCam".to_string() } else { meta.product.clone() }),
         imu_to_cam: Some(kandao_imu_to_cam()),
-        readout_ms: Some(KANDAO_READOUT_MS),
+        readout_ms: Some(kandao_readout_ms(meta.hdr)),
         sample_anchor: vr180_fisheye::SampleAnchor::BlockMid,
         ..Default::default()
     }
@@ -226,16 +257,21 @@ pub fn build_kandao_imu(meta: &KandaoMeta, fps: f32, n_frames_hint: usize, strea
         t_s: samples.iter().map(|s| s.t_us as f64 * 1e-6).collect(),
         quats: &quats,
     };
-    let readout_s = KANDAO_READOUT_MS as f64 * 1e-3;
+    let readout_s = kandao_readout_ms(meta.hdr) as f64 * 1e-3;
+    let latency_s = kandao_gyro_latency_ms(meta.hdr) as f64 * 1e-3;
     let frame_dur = 1.0 / fps as f64;
     let pts = &meta.frame_pts_us;
     let last = pts.len() - 1;
+    // Centre row mid-exposure: PTS is the first row's readout start, the
+    // centre row reads out readout/2 later and its exposure ended shutter/2
+    // before its own readout; the gyro reports that much late.
     let content_time = |i: usize| -> f64 {
         let shutter = meta.shutter_s(i).unwrap_or(0.0);
+        let base = readout_s * 0.5 - shutter * 0.5 + latency_s;
         if i < pts.len() {
-            pts[i] as f64 * 1e-6 + readout_s * 0.5 + shutter * 0.5
+            pts[i] as f64 * 1e-6 + base
         } else {
-            pts[last] as f64 * 1e-6 + readout_s * 0.5 + shutter * 0.5 + (i - last) as f64 * frame_dur
+            pts[last] as f64 * 1e-6 + base + (i - last) as f64 * frame_dur
         }
     };
     let n_frames = n_frames_hint.max(pts.len());
@@ -257,8 +293,9 @@ pub fn build_kandao_imu(meta: &KandaoMeta, fps: f32, n_frames_hint: usize, strea
     }
     out.exposure_ms = (0..n_frames).map(|i| meta.shutter_s(i).map(|s| (s * 1e3) as f32).unwrap_or(f32::NAN)).collect();
     tracing::info!(
-        "kandao_imu: {} frames ({} stamped), content t0 = {:.3} s, imu span {:.3}..{:.3} s",
-        n_frames, pts.len(), content_time(0), timeline.t_s[0], timeline.t_s[timeline.t_s.len() - 1]
+        "kandao_imu: {} frames ({} stamped), content t0 = {:.3} s (HDR {}: readout {:.1} ms, latency {:.1} ms; IMU {:?}), imu span {:.3}..{:.3} s",
+        n_frames, pts.len(), content_time(0), meta.hdr, readout_s * 1e3, latency_s * 1e3, meta.imu_model,
+        timeline.t_s[0], timeline.t_s[timeline.t_s.len() - 1]
     );
     out
 }
@@ -323,8 +360,15 @@ mod tests {
         meta.imu = (0..3000).map(|k| vr180_fisheye::kandao::KandaoImuSample {
             t_us: t0 - 500_000 + k * 1000, gyr_dps: [0.0, 0.0, 0.0], acc_g: [0.0, -1.0, 0.0],
         }).collect();
+        meta.imu_model = "bmi260".into();
         let imu = build_kandao_imu(&meta, 30.0, 32, 3840, 3840);
         assert_eq!(imu.frame_quats.len(), 32);
+        assert_eq!(kandao_readout_ms(false), KANDAO_READOUT_MS);
+        assert_eq!(kandao_readout_ms(true), KANDAO_READOUT_HDR_MS);
+        assert!(kandao_gyro_latency_ms(true) > kandao_gyro_latency_ms(false));
+        meta.hdr = true;
+        let imu_hdr = build_kandao_imu(&meta, 30.0, 32, 3840, 3840);
+        assert_eq!(imu_hdr.readout_ms, Some(KANDAO_READOUT_HDR_MS));
         assert_eq!(imu.high_rate_quats[0].len(), HR_PER_FRAME);
         assert_eq!(imu.readout_ms, Some(KANDAO_READOUT_MS));
         assert_eq!(imu.sample_anchor, vr180_fisheye::SampleAnchor::BlockMid);

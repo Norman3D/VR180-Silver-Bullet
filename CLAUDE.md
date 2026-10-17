@@ -890,7 +890,12 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      Proprietary `kfix` / `kvar` boxes AFTER `moov` in a key-value layout
      (`name[32] type[8] count u32 data`; `vr180-fisheye/src/kandao.rs`):
      lens record (`LENS`, a hex string of two 132-byte blocks behind a
-     ONE-digit index — nibble-misaligned, scan both alignments), `INFO`
+     ONE-digit index — nibble-misaligned, scan both alignments; a flags
+     byte 0xff on fw 1.1.3 / 0xfe on 1.1.6 follows the magic; the canvas
+     is whatever the record says: 13888×6944 on fw 1.1.3, 3840×1920 on
+     1.1.6 — every consumer scales the half to its frame; a `.kdat`
+     sidecar carries the same boxes and is read when the MP4 lacks them),
+     `INFO`
      (fps, IMU ranges, `V_CROP_SCALE` identity), per-frame `PTS` (µs),
      1 kHz `IMU` (`u64 t_us, i16 gyr[3], i16 acc[3]`, full scale =
      range/32768), `EXP` (`pts_ms, shutter_us`), `GAINMAP0/1` (17×13×3 f32,
@@ -929,12 +934,23 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      in `lens_b` = the left output with the swap off, and
      `dual_stream_iter_swap` passes the user toggle through (the stacked
      iterator emits left = top).
-   - **Timing (measured, no sync constant)**: image motion vs gyro on two
-     clips, both sensors: content time = PTS + 18 ± 2 ms = `PTS +
-     readout/2 + shutter/2` (15–16 ms with 3–7 ms shutters); readout
-     **24.4 ms** (24.3 / 23.6 / 25.2), top row first (`KANDAO_READOUT_MS`;
-     the file states none). IMU axes: image x ↔ −ω_y, image y ↔ −ω_x, roll
-     ↔ +ω_z, gravity −1 g on IMU y when upright. `KANDAO_IMU_TO_CAM` =
+   - **Timing (measured)**: content time = `PTS + readout/2 − shutter/2 +
+     latency`, PTS = the first row's READOUT start, readout and latency by
+     the **kfix `HDR` flag** (`kandao_readout_ms` / `kandao_gyro_latency_ms`):
+     HDR off → readout **19.4 ms**, latency 4.6 ms; HDR on → **24.6 ms**,
+     8.0 ms. Measured on two cameras (sh3001 fw 1.1.3 / bmi260 fw 1.1.6,
+     `/Volumes/Silver/zoeqoo`), image motion vs gyro: HDR-off offsets
+     +14…15 ms at 0.2–0.6 ms shutters, +12 at 5.7, +7.5…9.25 at 9.1–10 ms
+     (= 14.5 − shutter/2, seven clips, IMUs agree to 0.7 ms); the one HDR
+     clip +17.25…18 at 3.6–6.6 ms. Readout HDR-off from the app's own
+     RS-scale probe (zero crossing at 0.79 × 24.4) + raw stretch
+     regressions (17.8–19.3, r to −0.91); HDR-on 24.3–25.5 on five windows.
+     The first reading (one HDR clip, `+shutter/2`, 24.4 ms for all) put
+     indoor 10 ms-shutter clips ~9 ms off plus a 25 % RS overshoot — the
+     "indoor stabilization" complaint. The file states no readout (kfix /
+     kvar / INFO of both firmwares searched; EXP / ISP / FRAME_ISP
+     timestamps are all `PTS/1000`). IMU axes on both units: image x ↔ −ω_y,
+     image y ↔ −ω_x, roll ↔ +ω_z, gravity −1 g on IMU y when upright. `KANDAO_IMU_TO_CAM` =
      the **identity** (rows = cam x, y, z in IMU coords, the X6 convention;
      `VR180_KANDAO_BASIS` overrides for A/B) — settled empirically, not
      derived: `examples/rs_probe_export.rs` (kind-aware;

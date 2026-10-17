@@ -26,9 +26,12 @@
 //! ## Lens record
 //!
 //! `LENS` is a hex string of two 134-byte blocks, one per lens:
-//! `KaNDaOC@mERa` magic, `0xff`, `"13"`, the lens index byte, then
-//! little-endian `u32` canvas size `(13888, 6944)` — the photo-resolution
-//! dual-fisheye canvas, lens 0 in the left half and lens 1 in the right —
+//! `KaNDaOC@mERa` magic, a flags byte (`0xff` on firmware 1.1.3, `0xfe` on
+//! 1.1.6), `"13"`, the lens index byte, then little-endian `u32` canvas
+//! size — `(13888, 6944)` on 1.1.3 (the photo-resolution dual-fisheye
+//! canvas), `(3840, 1920)` on 1.1.6 — lens 0 in the left half and lens 1
+//! in the right; every consumer scales the half to its own frame, so the
+//! canvas size is whatever the record says —
 //! `f32` focal (px/rad), principal point `(cx, cy)` in canvas pixels, four
 //! Kannala-Brandt coefficients, 16 reserved bytes, a row-major 3×3 rotation
 //! and a translation (the stock back-to-back extrinsics), a `u32`, 8 bytes
@@ -236,7 +239,9 @@ pub fn parse_lens_hex(hex: &str) -> Vec<KandaoLens> {
 /// `body` starts right after the magic: `ff`, `'1' '3'`, index, then the
 /// little-endian fields.
 fn parse_lens_block(body: &[u8]) -> Option<KandaoLens> {
-    if body.len() < LENS_BLOCK_LEN || body[0] != 0xff {
+    // body[0] is a flags byte (0xff on firmware 1.1.3, 0xfe on 1.1.6 — the
+    // 1.1.6 record also moves to a 3840×1920 canvas), body[1..3] = "13".
+    if body.len() < LENS_BLOCK_LEN || &body[1..3] != b"13" {
         return None;
     }
     let index = body[3];
@@ -444,10 +449,25 @@ fn top_level_boxes(f: &mut File) -> Result<Vec<([u8; 4], u64, u64)>> {
     Ok(out)
 }
 
-/// True when the file has a Kandao `kfix` box (a QooCam MP4).
+/// True when the file has a Kandao `kfix` box (a QooCam MP4), or a `.kdat`
+/// sidecar next to it does (see [`kdat_sidecar`]).
 pub fn has_kandao_boxes(path: &Path) -> bool {
-    let Ok(mut f) = File::open(path) else { return false };
-    top_level_boxes(&mut f).map(|b| b.iter().any(|(t, _, _)| t == b"kfix")).unwrap_or(false)
+    let has = |p: &Path| -> bool {
+        let Ok(mut f) = File::open(p) else { return false };
+        top_level_boxes(&mut f).map(|b| b.iter().any(|(t, _, _)| t == b"kfix")).unwrap_or(false)
+    };
+    has(path) || kdat_sidecar(path).map_or(false, |k| has(&k))
+}
+
+/// The camera also writes the two boxes as a `<name>.kdat` sidecar (the
+/// same `kfix` + `kvar` byte for byte, QooCam Studio reads it too) — the
+/// copy that survives when a recording is cut short before `moov`. The
+/// path when such a file exists.
+pub fn kdat_sidecar(path: &Path) -> Option<std::path::PathBuf> {
+    let k = path.with_extension("kdat");
+    if k.is_file() { return Some(k); }
+    let k2 = path.with_extension("KDAT");
+    if k2.is_file() { Some(k2) } else { None }
 }
 
 fn read_box(f: &mut File, off: u64, len: u64) -> Result<Vec<u8>> {
@@ -464,9 +484,17 @@ fn read_box(f: &mut File, off: u64, len: u64) -> Result<Vec<u8>> {
 /// the IMU / PTS / exposure tables (identity + lenses only).
 pub fn read_kandao_meta(path: &Path, with_motion: bool) -> Result<KandaoMeta> {
     let mut f = File::open(path)?;
-    let boxes = top_level_boxes(&mut f)?;
+    let mut boxes = top_level_boxes(&mut f)?;
+    if !boxes.iter().any(|(t, _, _)| t == b"kfix") {
+        // Fall back to the sidecar copy.
+        if let Some(k) = kdat_sidecar(path) {
+            tracing::info!("kandao: no kfix box in {} — reading the {} sidecar", path.display(), k.display());
+            f = File::open(&k)?;
+            boxes = top_level_boxes(&mut f)?;
+        }
+    }
     let find = |name: &[u8; 4]| boxes.iter().find(|(t, _, _)| t == name).copied();
-    let (_, fix_off, fix_len) = find(b"kfix").ok_or_else(|| Error::Kandao("no kfix box".into()))?;
+    let (_, fix_off, fix_len) = find(b"kfix").ok_or_else(|| Error::Kandao("no kfix box (nor a .kdat sidecar)".into()))?;
     let fixed = parse_kv_box(&read_box(&mut f, fix_off, fix_len)?)?;
     let var = match find(b"kvar") {
         Some((_, o, l)) => parse_kv_box(&read_box(&mut f, o, l)?)?,
@@ -609,6 +637,40 @@ mod tests {
         // rim: θ = 95° lands inside the 6944 half.
         let r = l[0].project_radius(95f64.to_radians());
         assert!(r > 3200.0 && r < 3472.0, "{r}");
+    }
+
+    /// Firmware 1.1.6.6 (a second camera): flags byte 0xfe, 3840×1920 canvas.
+    const LENS_HEX_116: &str = "14b614e44614f43406d455261fe313300000f000080070000e000154418e96c4460bb6e448d6239bcaed7f43aacc868bb40da7f3900000000000000000000000000000000e4f57f3fecb0003b47f88e3ce8ab00bbdfff7f3ff4bd0fb859f88ebc0000000005f67f3f000000000000000000000000f00000000000000000000000ffffffff0a24b614e44614f43406d455261fe313301000f000080070000e0001544688f3345e36370448d6239bcaed7f43aacc868bb40da7f390000000000000000000000000000000057eb7f3f4ef5b93c0923303cd1a2babc10ed7f3f8987fa3ba43d2dbc4e3d01bc49fa7f3f1ad6cfc0ecb07e3e611d8b3df00000000000000000000000ffffffff5a";
+
+    #[test]
+    fn lens_hex_firmware_116_record_decodes() {
+        let l = parse_lens_hex(LENS_HEX_116);
+        assert_eq!(l.len(), 2, "{l:?}");
+        assert_eq!((l[0].canvas_w, l[0].canvas_h), (3840, 1920));
+        assert!((l[0].focal - 596.01).abs() < 0.01, "{}", l[0].focal);
+        assert!((l[0].cx - 947.64).abs() < 0.01 && (l[0].cy - 954.93).abs() < 0.01);
+        assert!((l[1].cx - 2872.96).abs() < 0.01 && (l[1].cy - 961.56).abs() < 0.01);
+        assert_eq!(l[0].half_w(), 1920);
+        assert_eq!(l[1].half_origin_x(), 1920.0);
+        assert_eq!(l[0].k, l[1].k);
+    }
+
+    #[test]
+    fn kdat_sidecar_serves_the_boxes() {
+        let dir = std::env::temp_dir().join(format!("vr180_kandao_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mp4 = dir.join("clip.MP4");
+        std::fs::write(&mp4, b"\0\0\0\x10ftypisom\0\0\0\0").unwrap(); // ftyp only, no boxes
+        assert!(!has_kandao_boxes(&mp4));
+        let payload = kv_box(&[entry("PRODUCT", "CHAR", 16, b"QooCam 3 Ultra\0\0"), entry("HDR", "U8", 1, &[1])]);
+        let mut kfix = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+        kfix.extend_from_slice(b"kfix"); kfix.extend_from_slice(&payload);
+        std::fs::write(dir.join("clip.kdat"), &kfix).unwrap();
+        assert!(has_kandao_boxes(&mp4));
+        let m = read_kandao_meta(&mp4, false).unwrap();
+        assert_eq!(m.product, "QooCam 3 Ultra");
+        assert!(m.hdr);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
